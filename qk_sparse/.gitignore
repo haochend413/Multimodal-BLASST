@@ -1,0 +1,7 @@
+results/
+assets/
+*.json
+!package.json
+__pycache__/
+*.pyc
+report.md

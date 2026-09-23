@@ -1,0 +1,18 @@
+# Core (required)
+torch>=2.1
+numpy
+
+# Model adapters (required for anything but the synthetic control)
+transformers>=4.45
+datasets>=2.18          # streaming inputs for text / image / audio
+pillow                  # image adapter
+torchvision             # image/video processors in transformers
+soundfile               # audio adapter (local .wav)
+librosa                 # audio resampling inside WhisperProcessor
+av                      # video decoding
+huggingface_hub         # demo video download
+
+# Large multimodal adapters (optional; only for `vlm` and `video-dit`)
+diffusers>=0.33        # video-dit adapter (Wan T2V)
+accelerate             # device placement for the pipeline
+ftfy                   # text encoder tokenisation in Wan
