@@ -95,6 +95,76 @@ For CPU smoke testing without weights:
 python attention_study.py --demo --decode-tokens 4 --output demo.json
 ```
 
+## Public benchmark workflow: Video-MME
+
+Use the original Video-MME benchmark to match the historical experiments:
+[official project](https://github.com/MME-Benchmarks/Video-MME) and
+[public data](https://huggingface.co/datasets/lmms-eval/Video-MME).
+The original `lmms-lab/Video-MME` location now redirects to `lmms-eval/Video-MME`.
+This is v1, not Video-MME-v2. Annotations contain 900 videos and 2,700 questions,
+with short, medium and long duration categories. The adapter pins revision
+`ead1408f75b618502df9a1d8e0950166bf0a2a0b` for downloads.
+
+From the project `code` directory, prepare a one-video pilot:
+
+```bash
+python prepare_videomme_study.py \
+  --data-root /scratch/videomme \
+  --download --chunks 01 \
+  --durations short --videos-per-duration 1 --questions-per-video 1 \
+  --layout C --seed 98 \
+  --output /scratch/blasst/videomme-C.json
+```
+
+Archive 01 is about 5.18 GB compressed; extraction requires additional disk space.
+Only requested chunks are fetched. Model weights are separate. The prepare command
+runs on CPU and does not run a model. If your existing Video-MME folder already has
+`videomme/test-00000-of-00001.parquet` and extracted MP4s, omit `--download` and point
+`--data-root` there. Existing local annotations are marked `local_unverified` rather
+than falsely claiming their revision has been checked.
+
+On a CUDA machine, collect the selected benchmark sample:
+
+```bash
+python attention_study.py \
+  --manifest /scratch/blasst/videomme-C.json --sample-index 0 \
+  --frames 8 --layers 0,14 --heads 0 --decode-tokens 4 \
+  --output /scratch/blasst/videomme-C-0-dense.json
+```
+
+Load the resulting attention JSON into the website, **not** the preparation manifest.
+The question, four choices, video ID, question ID, ground-truth answer, duration, source
+revision, seed and prompt-layout tag are preserved in metadata. The ground-truth answer
+is never appended to the model prompt. To record another sample, change `--sample-index`
+and use a different output filename. Each invocation loads the model again; this simple
+pilot workflow is not optimized for large batch throughput.
+
+For a larger attention study, set `--durations short,medium,long`, increase
+`--videos-per-duration`, and optionally request all three questions per video with
+`--questions-per-video 3`. Add chunks such as `--chunks 01,02,03` when the available
+local subset does not contain enough videos. Sampling is seeded and stratified by
+requested duration among **available local videos**; it is not a globally representative
+random sample of all 900 videos. The manifest fails rather than silently reducing a stratum.
+
+Compare these prompt layouts on the same downloaded video pool and seed:
+
+- **C**: `[video][benchmark question and choices]`, no subtitles.
+- **B**: `[video][truncated subtitles][benchmark question and choices]`.
+- **A**: `[first subtitle half][video][second subtitle half][benchmark question and choices]`.
+
+Prepare A/B with `--download --layout A` or `--download --layout B`; that also fetches
+`subtitle.zip` (about 7.5 MB). Subtitles are limited to `--subtitle-chars` (default 4,000)
+and split by characters for A. These are explicitly **diagnostic layouts**: no frame-aligned
+subtitle selection or token/tile alignment is claimed, and they do not replicate the
+original report's A/B prompts exactly. A/B require available subtitles, so their candidate
+pool may differ from C; match video IDs explicitly for paired comparisons.
+
+Low frame counts, sampled questions and fixed-length decode are attention diagnostics,
+not official Video-MME leaderboard scores. No new Video-MME inference results have been
+collected on this machine. The website demonstration remains synthetic until real exports
+are loaded. Do not upload benchmark media or question text to the hosted site; the static
+explorer analyzes loaded files locally. Follow Video-MME's academic-use data terms.
+
 ## Decode parity
 
 ```bash

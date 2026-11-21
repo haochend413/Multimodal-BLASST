@@ -139,7 +139,24 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=16)
     parser.add_argument("--raw-dir", type=Path)
     parser.add_argument("--demo", action="store_true", help="synthetic CPU Q/K; no model downloads")
+    parser.add_argument("--manifest", type=Path, help="Video-MME manifest from prepare_videomme_study.py")
+    parser.add_argument("--sample-index", type=int, default=0)
     args = parser.parse_args()
+    benchmark = None
+    sample_id = None
+    if args.manifest is not None:
+        if args.demo or args.video is not None:
+            parser.error("--manifest cannot be combined with --demo or --video")
+        manifest = json.loads(args.manifest.read_text())
+        if manifest.get("schema") != "blasst-benchmark-manifest-v1":
+            parser.error("unsupported benchmark manifest schema")
+        samples = manifest["samples"]
+        if not 0 <= args.sample_index < len(samples):
+            parser.error(f"sample-index must be between 0 and {len(samples) - 1}")
+        sample = samples[args.sample_index]
+        args.video = Path(sample["video"])
+        args.text_before, args.question = sample["text_before"], sample["question"]
+        benchmark, sample_id = sample["benchmark"], sample["id"]
     if args.decode_tokens < 1 or args.max_tokens < 1:
         parser.error("decode-tokens and max-tokens must be positive")
     if args.frames < 2 or args.frames % 2 or args.max_tiles < 1:
@@ -176,9 +193,12 @@ def main() -> None:
         resized_h, resized_w = smart_resize(height, width)
         frames, _ = read_frames(str(args.video), args.frames, resized_h, resized_w)
         processor = AutoProcessor.from_pretrained(args.model)
-        text = processor.apply_chat_template([{"role": "user", "content": [
-            {"type": "text", "text": args.text_before}, {"type": "video"},
-            {"type": "text", "text": args.question}]}], tokenize=False, add_generation_prompt=True)
+        content = []
+        if args.text_before:
+            content.append({"type": "text", "text": args.text_before})
+        content.extend([{"type": "video"}, {"type": "text", "text": args.question}])
+        text = processor.apply_chat_template([{"role": "user", "content": content}],
+                                            tokenize=False, add_generation_prompt=True)
         inputs = processor(text=[text], videos=[frames], fps=[args.frames / duration],
                            return_tensors="pt").to("cuda")
         length = inputs.input_ids.shape[1]
@@ -204,6 +224,8 @@ def main() -> None:
                     "video": args.video.name, "frames": args.frames,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
     ba.STATE["observer"] = None
+    if benchmark is not None:
+        metadata.update(benchmark=benchmark, sample_id=sample_id)
     metadata.update(lambda_prefill=args.lam, lambda_decode=args.decode_lambda,
                     recorded_trajectory="dense" if not args.lam and not args.decode_lambda else "live_sparse",
                     score_definition="QK^T / sqrt(head_dim), causal-masked, before softmax",

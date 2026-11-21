@@ -39,7 +39,8 @@ remain the record of the original runs.
   tile max - running max). A tile is skipped at lambda iff margin < ln(lambda), so one dense pass gives the skip
   set for every lambda (`masks_from_margins`). `STATE["dump_qk_layers"]` also saves Q and K.
 
-The new `attention_study.py`, `compare_decode_modelopt.py`, and `test_decode_study.py` are documented
+The new `attention_study.py`, `prepare_videomme_study.py`, `compare_decode_modelopt.py`,
+and their tests are documented
 in [Attention Lab](../attention-lab/README.md).
 
 **`blasst_regions.py`**: the region-aware version for the VLM study (`attn_implementation="blasst_regions"`;
