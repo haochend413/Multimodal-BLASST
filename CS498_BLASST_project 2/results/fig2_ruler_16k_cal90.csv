@@ -1,0 +1,351 @@
+length,task,row,index,n_tokens,config,a,lambda,pct_skipped,score,seconds,prediction,answers
+16k,niah_multikey_1,0,0,16205,cal90,2934.2968318316275,0.18107354716640714,80.399,100.0,13.58,: 6596150.,"[""6596150""]"
+16k,niah_multikey_1,1,1,16198,cal90,2934.2968318316275,0.18115179848324656,80.339,100.0,12.00,: 1604451.,"[""1604451""]"
+16k,niah_multikey_1,2,2,16200,cal90,2934.2968318316275,0.1811294340636807,80.279,100.0,11.40,: 7117837.,"[""7117837""]"
+16k,niah_multikey_1,3,3,16206,cal90,2934.2968318316275,0.1810623739251899,80.345,100.0,11.63,: 7907400.,"[""7907400""]"
+16k,niah_multikey_1,4,4,16201,cal90,2934.2968318316275,0.18111825392454955,80.459,100.0,12.92,: 6866294.,"[""6866294""]"
+16k,niah_multikey_1,5,5,16203,cal90,2934.2968318316275,0.18109589778631288,80.424,100.0,12.91,: 6891254.,"[""6891254""]"
+16k,niah_multikey_1,6,6,16205,cal90,2934.2968318316275,0.18107354716640714,80.329,100.0,12.91,: 6262632.,"[""6262632""]"
+16k,niah_multikey_1,7,7,16202,cal90,2934.2968318316275,0.18110707516551214,80.412,100.0,11.60,: 4188992.,"[""4188992""]"
+16k,niah_multikey_1,8,8,16204,cal90,2934.2968318316275,0.18108472178669635,80.243,100.0,11.58,: 6038571.,"[""6038571""]"
+16k,niah_multikey_1,9,9,16200,cal90,2934.2968318316275,0.1811294340636807,80.527,100.0,11.26,: 7361002.,"[""7361002""]"
+16k,niah_multikey_1,10,10,16204,cal90,2934.2968318316275,0.18108472178669635,80.355,100.0,11.58,: 6406444.,"[""6406444""]"
+16k,niah_multikey_1,11,11,16201,cal90,2934.2968318316275,0.18111825392454955,80.496,100.0,12.95,: 2422633.,"[""2422633""]"
+16k,niah_multikey_1,12,12,16205,cal90,2934.2968318316275,0.18107354716640714,80.342,100.0,12.97,: 7953166.,"[""7953166""]"
+16k,niah_multikey_1,13,13,16202,cal90,2934.2968318316275,0.18110707516551214,80.330,100.0,11.65,: 1093026.,"[""1093026""]"
+16k,niah_multikey_1,14,14,16210,cal90,2934.2968318316275,0.18101769474593632,80.409,100.0,11.79,: 6323376.,"[""6323376""]"
+16k,niah_multikey_1,15,15,16198,cal90,2934.2968318316275,0.18115179848324656,80.378,100.0,11.62,: 5652512.,"[""5652512""]"
+16k,niah_multikey_1,16,16,16202,cal90,2934.2968318316275,0.18110707516551214,80.335,100.0,11.63,: 5558623.,"[""5558623""]"
+16k,niah_multikey_1,17,17,16201,cal90,2934.2968318316275,0.18111825392454955,80.332,100.0,12.97,: 8048838.,"[""8048838""]"
+16k,niah_multikey_1,18,18,16203,cal90,2934.2968318316275,0.18109589778631288,80.474,100.0,12.95,: 4700025.,"[""4700025""]"
+16k,niah_multikey_1,19,19,16199,cal90,2934.2968318316275,0.18114061558316116,80.451,100.0,12.95,: 7523941.,"[""7523941""]"
+16k,niah_multikey_1,20,20,16200,cal90,2934.2968318316275,0.1811294340636807,80.312,100.0,11.27,: 7360307.,"[""7360307""]"
+16k,niah_multikey_1,21,21,16198,cal90,2934.2968318316275,0.18115179848324656,80.325,100.0,11.61,: 8072684.,"[""8072684""]"
+16k,niah_multikey_1,22,22,16204,cal90,2934.2968318316275,0.18108472178669635,80.374,100.0,11.60,: 3117636.,"[""3117636""]"
+16k,niah_multikey_1,23,23,16205,cal90,2934.2968318316275,0.18107354716640714,80.412,100.0,12.94,: 6218367.,"[""6218367""]"
+16k,niah_multikey_1,24,24,16200,cal90,2934.2968318316275,0.1811294340636807,80.257,100.0,11.28,: 1689025.,"[""1689025""]"
+16k,niah_multikey_1,25,25,16202,cal90,2934.2968318316275,0.18110707516551214,80.440,100.0,11.62,: 7076506.,"[""7076506""]"
+16k,niah_multikey_1,26,26,16200,cal90,2934.2968318316275,0.1811294340636807,80.454,100.0,11.27,: 5118725.,"[""5118725""]"
+16k,niah_multikey_1,27,27,16205,cal90,2934.2968318316275,0.18107354716640714,80.337,100.0,12.93,: 6452832.,"[""6452832""]"
+16k,niah_multikey_1,28,28,16203,cal90,2934.2968318316275,0.18109589778631288,80.331,100.0,12.95,: 5049282.,"[""5049282""]"
+16k,niah_multikey_1,29,29,16202,cal90,2934.2968318316275,0.18110707516551214,80.504,100.0,11.61,: 7784725.,"[""7784725""]"
+16k,niah_multikey_1,30,30,16207,cal90,2934.2968318316275,0.18105120206278938,80.363,100.0,12.96,: 9907391.,"[""9907391""]"
+16k,niah_multikey_1,31,31,16206,cal90,2934.2968318316275,0.1810623739251899,80.405,100.0,11.62,: 4106298.,"[""4106298""]"
+16k,niah_multikey_1,32,32,16207,cal90,2934.2968318316275,0.18105120206278938,80.321,100.0,12.96,: 4256752.,"[""4256752""]"
+16k,niah_multikey_1,33,33,16201,cal90,2934.2968318316275,0.18111825392454955,80.334,100.0,12.93,: 9235577.,"[""9235577""]"
+16k,niah_multikey_1,34,34,16201,cal90,2934.2968318316275,0.18111825392454955,80.224,100.0,12.95,: 9014965.,"[""9014965""]"
+16k,niah_multikey_1,35,35,16206,cal90,2934.2968318316275,0.1810623739251899,80.362,100.0,11.63,: 4786401.,"[""4786401""]"
+16k,niah_multikey_1,36,36,16202,cal90,2934.2968318316275,0.18110707516551214,80.367,100.0,11.62,: 2010496.,"[""2010496""]"
+16k,niah_multikey_1,37,37,16207,cal90,2934.2968318316275,0.18105120206278938,80.335,100.0,12.94,: 8558197.,"[""8558197""]"
+16k,niah_multikey_1,38,38,16204,cal90,2934.2968318316275,0.18108472178669635,80.293,100.0,11.59,: 2925626.,"[""2925626""]"
+16k,niah_multikey_1,39,39,16207,cal90,2934.2968318316275,0.18105120206278938,80.378,100.0,12.95,: 7752972.,"[""7752972""]"
+16k,niah_multikey_1,40,40,16212,cal90,2934.2968318316275,0.1809953634241073,80.432,100.0,11.68,: 5200476.,"[""5200476""]"
+16k,niah_multikey_1,41,41,16199,cal90,2934.2968318316275,0.18114061558316116,80.268,100.0,12.93,: 4044882.,"[""4044882""]"
+16k,niah_multikey_1,42,42,16207,cal90,2934.2968318316275,0.18105120206278938,80.287,100.0,12.97,: 7850944.,"[""7850944""]"
+16k,niah_multikey_1,43,43,16206,cal90,2934.2968318316275,0.1810623739251899,80.245,100.0,11.62,: 2477398.,"[""2477398""]"
+16k,niah_multikey_1,44,44,16198,cal90,2934.2968318316275,0.18115179848324656,80.431,100.0,11.62,: 4415140.,"[""4415140""]"
+16k,niah_multikey_1,45,45,16198,cal90,2934.2968318316275,0.18115179848324656,80.382,100.0,11.61,: 9132114.,"[""9132114""]"
+16k,niah_multikey_1,46,46,16199,cal90,2934.2968318316275,0.18114061558316116,80.359,100.0,12.93,: 5896624.,"[""5896624""]"
+16k,niah_multikey_1,47,47,16203,cal90,2934.2968318316275,0.18109589778631288,80.384,100.0,12.95,: 4197911.,"[""4197911""]"
+16k,niah_multikey_1,48,48,16201,cal90,2934.2968318316275,0.18111825392454955,80.352,100.0,12.94,: 6008935.,"[""6008935""]"
+16k,niah_multikey_1,49,49,16206,cal90,2934.2968318316275,0.1810623739251899,80.280,100.0,11.61,: 7425184.,"[""7425184""]"
+16k,vt,0,0,16114,cal90,2934.2968318316275,0.18209611715474913,84.864,100.0,12.30, DZGXO PUVGW ZNKHO PTERO BIQJN,"[""DZGXO"", ""PUVGW"", ""ZNKHO"", ""PTERO"", ""BIQJN""]"
+16k,vt,1,1,16109,cal90,2934.2968318316275,0.18215263714889984,85.042,100.0,13.14, ENGFW DMBKK NKGIC LJNVB JPBBU,"[""ENGFW"", ""DMBKK"", ""NKGIC"", ""LJNVB"", ""JPBBU""]"
+16k,vt,2,2,16113,cal90,2934.2968318316275,0.18210741834739821,84.629,100.0,13.03, WIYAY ZDZMG PFXOU JNJGN MCZMV,"[""WIYAY"", ""ZDZMG"", ""PFXOU"", ""JNJGN"", ""MCZMV""]"
+16k,vt,3,3,16113,cal90,2934.2968318316275,0.18210741834739821,84.833,100.0,13.02, UESMX VZQME VMRRG PKDIJ OFDGY,"[""OFDGY"", ""PKDIJ"", ""VMRRG"", ""VZQME"", ""UESMX""]"
+16k,vt,4,4,16111,cal90,2934.2968318316275,0.18213002494144545,84.685,60.0,12.82, YRTKV AOANH ZAVRU,"[""YRTKV"", ""GSANJ"", ""QRQMM"", ""AOANH"", ""ZAVRU""]"
+16k,vt,5,5,16118,cal90,2934.2968318316275,0.18205092640722345,84.540,100.0,11.98, GQGJU CYLGS HVCZQ AKJMQ SCVQI,"[""GQGJU"", ""CYLGS"", ""HVCZQ"", ""AKJMQ"", ""SCVQI""]"
+16k,vt,6,6,16111,cal90,2934.2968318316275,0.18213002494144545,84.681,40.0,12.77, VYHOO WROJT,"[""XROHY"", ""RHORE"", ""WAFDV"", ""VYHOO"", ""WROJT""]"
+16k,vt,7,7,16108,cal90,2934.2968318316275,0.18216394535830813,84.623,40.0,11.39, LVITY CESQT,"[""LVITY"", ""KUAHZ"", ""MJYLR"", ""RCQUS"", ""CESQT""]"
+16k,vt,8,8,16112,cal90,2934.2968318316275,0.1821187209428766,84.598,100.0,11.38, YLTCC LONCC GNREG KUSOZ OPUWA,"[""YLTCC"", ""LONCC"", ""OPUWA"", ""KUSOZ"", ""GNREG""]"
+16k,vt,9,9,16114,cal90,2934.2968318316275,0.18209611715474913,85.096,100.0,11.70, LKMBG GQPFC HYIQU IIVWZ DIYFI,"[""LKMBG"", ""GQPFC"", ""HYIQU"", ""IIVWZ"", ""DIYFI""]"
+16k,vt,10,10,16113,cal90,2934.2968318316275,0.18210741834739821,85.006,100.0,13.02, ZUIHU JYFZE TASYF UVBWU RDHGE,"[""ZUIHU"", ""JYFZE"", ""TASYF"", ""UVBWU"", ""RDHGE""]"
+16k,vt,11,11,16112,cal90,2934.2968318316275,0.1821187209428766,85.425,100.0,11.38, MKNXR OUJXN QCTRJ QBZRK TZLAG,"[""MKNXR"", ""OUJXN"", ""QCTRJ"", ""QBZRK"", ""TZLAG""]"
+16k,vt,12,12,16111,cal90,2934.2968318316275,0.18213002494144545,84.587,100.0,12.99, LBBSA UNJCS CVSJI DZMHX FJMRR,"[""FJMRR"", ""DZMHX"", ""CVSJI"", ""UNJCS"", ""LBBSA""]"
+16k,vt,13,13,16111,cal90,2934.2968318316275,0.18213002494144545,85.207,100.0,12.98, EEOYG KEQLA PFPKS FTVBC WEILG,"[""EEOYG"", ""KEQLA"", ""PFPKS"", ""FTVBC"", ""WEILG""]"
+16k,vt,14,14,16111,cal90,2934.2968318316275,0.18213002494144545,84.618,0.0,12.87, QPE SEJ ZQO RVU FAI,"[""PPJVQ"", ""VSHPC"", ""DDHES"", ""NKDJE"", ""QSQZO""]"
+16k,vt,15,15,16116,cal90,2934.2968318316275,0.18207351897689425,84.784,100.0,11.75, VQWYM FJOQK MSLEO UFAFH UOUMN,"[""VQWYM"", ""FJOQK"", ""MSLEO"", ""UFAFH"", ""UOUMN""]"
+16k,vt,16,16,16111,cal90,2934.2968318316275,0.18213002494144545,84.739,80.0,12.90, OTTLF AGWCW DVFTR WPLQU,"[""OTTLF"", ""LTQGW"", ""AGWCW"", ""DVFTR"", ""WPLQU""]"
+16k,vt,17,17,16109,cal90,2934.2968318316275,0.18215263714889984,85.240,100.0,12.95, HOISH GWZRC ZUXZW DWGSV TRMPG,"[""HOISH"", ""GWZRC"", ""ZUXZW"", ""DWGSV"", ""TRMPG""]"
+16k,vt,18,18,16113,cal90,2934.2968318316275,0.18210741834739821,84.767,100.0,13.02, UTKTS WLMPW WCZQS WUKZV MIHOD,"[""UTKTS"", ""WLMPW"", ""WCZQS"", ""WUKZV"", ""MIHOD""]"
+16k,vt,19,19,16113,cal90,2934.2968318316275,0.18210741834739821,84.785,60.0,12.84, QVAYE JCRQB QSTLC,"[""QVAYE"", ""LZLZX"", ""WHWWC"", ""JCRQB"", ""QSTLC""]"
+16k,vt,20,20,16114,cal90,2934.2968318316275,0.18209611715474913,84.762,100.0,11.71, DFRAS VZKDB JSCIW DUTDZ DNAQL,"[""DFRAS"", ""VZKDB"", ""JSCIW"", ""DUTDZ"", ""DNAQL""]"
+16k,vt,21,21,16111,cal90,2934.2968318316275,0.18213002494144545,84.845,100.0,12.98, RWCCT PJZID HCOPP URWRH NNTHB,"[""RWCCT"", ""PJZID"", ""HCOPP"", ""URWRH"", ""NNTHB""]"
+16k,vt,22,22,16113,cal90,2934.2968318316275,0.18210741834739821,84.809,100.0,13.02, MPNZZ YDWOJ RTYUA BGBBU NQNKS,"[""MPNZZ"", ""YDWOJ"", ""RTYUA"", ""BGBBU"", ""NQNKS""]"
+16k,vt,23,23,16109,cal90,2934.2968318316275,0.18215263714889984,84.980,100.0,12.95, HINFV NKQVR BSSWB CLLPI TTDSS,"[""HINFV"", ""NKQVR"", ""BSSWB"", ""CLLPI"", ""TTDSS""]"
+16k,vt,24,24,16109,cal90,2934.2968318316275,0.18215263714889984,84.792,40.0,12.69, USEDU GCOSF,"[""USEDU"", ""GXUAU"", ""HBSOC"", ""LJMOJ"", ""GCOSF""]"
+16k,vt,25,25,16109,cal90,2934.2968318316275,0.18215263714889984,84.831,100.0,12.95, BJXEY AUSRF GXIVO DRBFN BKWWU,"[""BJXEY"", ""AUSRF"", ""GXIVO"", ""DRBFN"", ""BKWWU""]"
+16k,vt,26,26,16112,cal90,2934.2968318316275,0.1821187209428766,84.790,100.0,11.37, AFOHQ MPMUF XTGAK GJVWY ARWSC,"[""AFOHQ"", ""MPMUF"", ""XTGAK"", ""GJVWY"", ""ARWSC""]"
+16k,vt,27,27,16113,cal90,2934.2968318316275,0.18210741834739821,84.812,40.0,12.74, BRDHW YKVIL,"[""ZDHBG"", ""VKXLT"", ""PNQKP"", ""BRDHW"", ""YKVIL""]"
+16k,vt,28,28,16109,cal90,2934.2968318316275,0.18215263714889984,85.105,100.0,12.94, CCLID JULMW KBHVE FWDSZ CUHSP,"[""CCLID"", ""JULMW"", ""CUHSP"", ""FWDSZ"", ""KBHVE""]"
+16k,vt,29,29,16114,cal90,2934.2968318316275,0.18209611715474913,85.135,100.0,11.72, CCUDB UFFKR YCPXB ZFQVC WVDYB,"[""CCUDB"", ""UFFKR"", ""YCPXB"", ""ZFQVC"", ""WVDYB""]"
+16k,vt,30,30,16113,cal90,2934.2968318316275,0.18210741834739821,85.160,100.0,13.01, JLJXH LDPQQ MWMCJ KQUGZ OAJSM,"[""JLJXH"", ""LDPQQ"", ""MWMCJ"", ""KQUGZ"", ""OAJSM""]"
+16k,vt,31,31,16112,cal90,2934.2968318316275,0.1821187209428766,84.781,100.0,11.41, KEIFX UBZNT VXBZF ZZCRG WUJVV,"[""KEIFX"", ""UBZNT"", ""ZZCRG"", ""VXBZF"", ""WUJVV""]"
+16k,vt,32,32,16111,cal90,2934.2968318316275,0.18213002494144545,84.876,100.0,12.99, XASYO OEZWM IMCGF NAXFD SXVIA,"[""XASYO"", ""OEZWM"", ""IMCGF"", ""NAXFD"", ""SXVIA""]"
+16k,vt,33,33,16117,cal90,2934.2968318316275,0.1820622219911663,84.931,100.0,13.07, YJYKC HDEYU YQEZS YUFPE HRDSY,"[""YJYKC"", ""HDEYU"", ""YQEZS"", ""YUFPE"", ""HRDSY""]"
+16k,vt,34,34,16113,cal90,2934.2968318316275,0.18210741834739821,84.917,100.0,13.02, PXZFO YDTGZ EXCSQ XLGGB GCAKT,"[""PXZFO"", ""YDTGZ"", ""EXCSQ"", ""XLGGB"", ""GCAKT""]"
+16k,vt,35,35,16115,cal90,2934.2968318316275,0.18208481736466817,84.468,100.0,13.04, OCMWQ REBVH IYBEJ TOXCP PMAYE,"[""OCMWQ"", ""REBVH"", ""IYBEJ"", ""TOXCP"", ""PMAYE""]"
+16k,vt,36,36,16113,cal90,2934.2968318316275,0.18210741834739821,84.831,100.0,13.01, FESSS GHGBO VDJLH RPFAE HCVIK,"[""FESSS"", ""GHGBO"", ""VDJLH"", ""RPFAE"", ""HCVIK""]"
+16k,vt,37,37,16107,cal90,2934.2968318316275,0.18217525497185247,84.967,80.0,12.89, MFGBT RCIOZ POVVK NWMWM,"[""EXJLG"", ""MFGBT"", ""RCIOZ"", ""POVVK"", ""NWMWM""]"
+16k,vt,38,38,16115,cal90,2934.2968318316275,0.18208481736466817,85.240,100.0,13.04, XURQD TEZZV DLZLZ QVGXX BKKIH,"[""XURQD"", ""TEZZV"", ""DLZLZ"", ""QVGXX"", ""BKKIH""]"
+16k,vt,39,39,16111,cal90,2934.2968318316275,0.18213002494144545,84.589,40.0,12.76, UCDOP RKKWR,"[""UCDOP"", ""ZCCUU"", ""WWWGR"", ""OMEKQ"", ""RKKWR""]"
+16k,vt,40,40,16111,cal90,2934.2968318316275,0.18213002494144545,84.809,100.0,12.99, IUIVW RZFHT UISPC LXKMN JBUBS,"[""IUIVW"", ""RZFHT"", ""UISPC"", ""LXKMN"", ""JBUBS""]"
+16k,vt,41,41,16111,cal90,2934.2968318316275,0.18213002494144545,84.671,100.0,13.00, EWFBA BJFJM KXRGM LYMOI VGVCA,"[""EWFBA"", ""BJFJM"", ""KXRGM"", ""LYMOI"", ""VGVCA""]"
+16k,vt,42,42,16113,cal90,2934.2968318316275,0.18210741834739821,84.879,100.0,13.04, QRGKA UTAXQ PAGUH ZQLJJ GMRVK,"[""QRGKA"", ""UTAXQ"", ""PAGUH"", ""ZQLJJ"", ""GMRVK""]"
+16k,vt,43,43,16116,cal90,2934.2968318316275,0.18207351897689425,84.606,80.0,11.65, QPHCB XHDTX UUPRR SRZGK,"[""QPHCB"", ""ZQWGS"", ""XHDTX"", ""UUPRR"", ""SRZGK""]"
+16k,vt,44,44,16110,cal90,2934.2968318316275,0.18214133034336608,85.003,100.0,11.69, ISRQM YJHER OHMTS OXYXR FFWKX,"[""ISRQM"", ""YJHER"", ""OHMTS"", ""OXYXR"", ""FFWKX""]"
+16k,vt,45,45,16110,cal90,2934.2968318316275,0.18214133034336608,84.776,80.0,11.57, WMWPY HBWDF KOXLI SUMQE,"[""WMWPY"", ""BXNWJ"", ""HBWDF"", ""KOXLI"", ""SUMQE""]"
+16k,vt,46,46,16111,cal90,2934.2968318316275,0.18213002494144545,84.636,80.0,12.92, FUOEU MANSY XTNAA TFWIC,"[""FUOEU"", ""UDLLL"", ""MANSY"", ""XTNAA"", ""TFWIC""]"
+16k,vt,47,47,16114,cal90,2934.2968318316275,0.18209611715474913,84.871,100.0,11.74, VHHSP IXZIX JEYXK FSDTP EJQAW,"[""VHHSP"", ""IXZIX"", ""JEYXK"", ""FSDTP"", ""EJQAW""]"
+16k,vt,48,48,16115,cal90,2934.2968318316275,0.18208481736466817,84.816,80.0,12.95, ZRQAR KJOMD SDCCF HPDVC,"[""ZRQAR"", ""KJOMD"", ""SQHRR"", ""HPDVC"", ""SDCCF""]"
+16k,vt,49,49,16113,cal90,2934.2968318316275,0.18210741834739821,84.704,40.0,12.74, SHBMF HMCEB,"[""SHBMF"", ""YIARX"", ""VRDCN"", ""SCGGZ"", ""HMCEB""]"
+16k,fwe,0,0,15985,cal90,2934.2968318316275,0.18356564478145934,83.665,100.0,14.59," 
+
+1. mmlsih (appeared 73 times)
+2. nfryjb (appeared 64 times)
+3. lrjbnf (appeared 59 times)","[""mmlsih"", ""nfryjb"", ""lrjbnf""]"
+16k,fwe,1,1,15357,cal90,2934.2968318316275,0.1910722687915366,83.666,100.0,13.75," 
+
+1. mqxniu (appeared 73 times)
+2. nkkqoz (appeared 69 times)
+3. lkdsqz (appeared 64 times)","[""mqxniu"", ""nkkqoz"", ""lkdsqz""]"
+16k,fwe,2,2,15560,cal90,2934.2968318316275,0.18857948790691695,83.759,100.0,12.33," 
+
+1. lsshpv (appeared 83 times)
+2. mrwzpm (appeared 73 times)
+3. kostde (appeared 69 times)","[""lsshpv"", ""mrwzpm"", ""kostde""]"
+16k,fwe,3,3,13631,cal90,2934.2968318316275,0.21526643913371193,84.443,100.0,11.34," 
+
+1. lgxsnm (appears 43 times)
+2. moleie (appears 42 times)
+3. nwsqlk (appears 41 times)","[""moleie"", ""nwsqlk"", ""lgxsnm""]"
+16k,fwe,4,4,15122,cal90,2934.2968318316275,0.19404158390633697,84.642,66.66666666666667,12.12," 
+
+1. lhlwtq (appeared 73 times)
+2. lyuivr (appeared 69 times)
+3. mptiez (appeared 64 times)","[""lhlwtq"", ""lyuivr"", ""jpneax""]"
+16k,fwe,5,5,14567,cal90,2934.2968318316275,0.20143453228747357,84.060,100.0,12.42," 
+
+1. minqgg (appeared 73 times)
+2. lbttlc (appeared 64 times)
+3. ndzunm (appeared 63 times)","[""minqgg"", ""ndzunm"", ""lbttlc""]"
+16k,fwe,6,6,16059,cal90,2934.2968318316275,0.1827197728271765,83.969,66.66666666666667,14.67," 
+
+1. ktcnvf (appeared 83 times)
+2. lvxslj (appeared 77 times)
+3. mlorcx (appeared 74 times)","[""ktcnvf"", ""lvxslj"", ""kegksj""]"
+16k,fwe,7,7,15054,cal90,2934.2968318316275,0.19491808368750016,83.873,100.0,12.09," 
+
+1. lpnexr (appeared 73 times)
+2. kejvyy (appeared 54 times)
+3. nbmktw (appeared 53 times)","[""lpnexr"", ""nbmktw"", ""kejvyy""]"
+16k,fwe,8,8,15258,cal90,2934.2968318316275,0.19231202201019973,83.712,100.0,12.21," 
+
+1. mggbxv (appeared 73 times)
+2. nhybef (appeared 64 times)
+3. ktjdcc (appeared 59 times)","[""mggbxv"", ""nhybef"", ""ktjdcc""]"
+16k,fwe,9,9,13878,cal90,2934.2968318316275,0.21143513703931602,83.636,100.0,10.82," 
+
+1. ljlbdg (appears 83 times)
+2. ktizia (appears 77 times)
+3. jtnjuy (appears 74 times)","[""ktizia"", ""ljlbdg"", ""jtnjuy""]"
+16k,fwe,10,10,15310,cal90,2934.2968318316275,0.19165883944034146,83.608,100.0,12.42," 
+
+1. ksohpt (appeared 73 times)
+2. lnpibw (appeared 69 times)
+3. jshmnj (appeared 64 times)","[""ksohpt"", ""lnpibw"", ""jshmnj""]"
+16k,fwe,11,11,15911,cal90,2934.2968318316275,0.1844193848175242,83.346,66.66666666666667,14.43," 
+
+1. kvlthz (appeared 83 times)
+2. luspis (appeared 76 times)
+3. mhpqbe (appeared 73 times)","[""kvlthz"", ""luspis"", ""jxayqa""]"
+16k,fwe,12,12,14102,cal90,2934.2968318316275,0.20807664386836106,84.500,100.0,10.97," 
+
+1. lwxiss (appears 73 times)
+2. mmpejc (appears 69 times)
+3. kwqhlm (appears 64 times)","[""lwxiss"", ""mmpejc"", ""kwqhlm""]"
+16k,fwe,13,13,16346,cal90,2934.2968318316275,0.1795116133507664,83.743,100.0,13.81," 
+
+1. lsqswa (appeared 73 times)
+2. kxedzq (appeared 44 times)
+3. mjwufi (appeared 43 times)","[""lsqswa"", ""mjwufi"", ""kxedzq""]"
+16k,fwe,14,14,14331,cal90,2934.2968318316275,0.20475171529074226,84.632,100.0,12.09," 
+
+1. lfinlh (appeared 73 times)
+2. mjjycz (appeared 64 times)
+3. kfmjcz (appeared 56 times)","[""lfinlh"", ""mjjycz"", ""kfmjcz""]"
+16k,fwe,15,15,14198,cal90,2934.2968318316275,0.2066697303727023,83.932,100.0,10.86," 
+
+1. mjddcs (appeared 83 times)
+2. njppte (appeared 73 times)
+3. llmfio (appeared 69 times)","[""mjddcs"", ""njppte"", ""llmfio""]"
+16k,fwe,16,16,16214,cal90,2934.2968318316275,0.18097303761142391,83.696,66.66666666666667,13.53," 
+
+1. kwnnjt (appeared 134 times)
+2. lmtosz (appeared 93 times)
+3. magvfg (appeared 73 times)","[""kwnnjt"", ""lmtosz"", ""jmmpqg""]"
+16k,fwe,17,17,15577,cal90,2934.2968318316275,0.188373681185827,83.737,100.0,13.38," 
+
+1. mokuql (appeared 83 times)
+2. lrgzbd (appeared 44 times)
+3. nmjxjx (appeared 43 times)","[""mokuql"", ""nmjxjx"", ""lrgzbd""]"
+16k,fwe,18,18,14457,cal90,2934.2968318316275,0.20296720148243946,83.989,100.0,12.35," 
+
+1. lnvfod (appeared 83 times)
+2. mpbvio (appeared 64 times)
+3. koqnhw (appeared 57 times)","[""lnvfod"", ""mpbvio"", ""koqnhw""]"
+16k,fwe,19,19,15666,cal90,2934.2968318316275,0.18730351281958557,84.205,100.0,12.79," 
+
+1. mquwgp (appeared 83 times)
+2. nkoxzb (appeared 64 times)
+3. lhuowa (appeared 59 times)","[""mquwgp"", ""nkoxzb"", ""lhuowa""]"
+16k,fwe,20,20,14350,cal90,2934.2968318316275,0.20448061545865,84.466,66.66666666666667,10.56," 
+
+1. mehmhk (appeared 73 times)
+2. mzctuz (appeared 69 times)
+3. njliuo (appeared 64 times)","[""mehmhk"", ""mzctuz"", ""kzojor""]"
+16k,fwe,21,21,13375,cal90,2934.2968318316275,0.21938667901544878,84.787,100.0,10.97," 
+
+1. luzlal (appeared 73 times)
+2. kxmfcw (appeared 54 times)
+3. mqjiyk (appeared 53 times)","[""luzlal"", ""mqjiyk"", ""kxmfcw""]"
+16k,fwe,22,22,14040,cal90,2934.2968318316275,0.20899550084270851,84.613,100.0,10.51," 
+
+1. leefnj (appeared 73 times)
+2. khaeng (appeared 54 times)
+3. mjvvbl (appeared 53 times)","[""leefnj"", ""mjvvbl"", ""khaeng""]"
+16k,fwe,23,23,15681,cal90,2934.2968318316275,0.18712434358979832,84.096,100.0,13.51," 
+
+1. lvtddp (appeared 83 times)
+2. kmgwuq (appeared 64 times)
+3. mxlowr (appeared 59 times)","[""lvtddp"", ""mxlowr"", ""kmgwuq""]"
+16k,fwe,24,24,14555,cal90,2934.2968318316275,0.20160060679021832,84.514,100.0,11.68," 
+
+1. jxklgx (appeared 34 times)
+2. lgihpj (appeared 33 times)
+3. mdfcbd (appeared 32 times)","[""lgihpj"", ""mdfcbd"", ""jxklgx""]"
+16k,fwe,25,25,14720,cal90,2934.2968318316275,0.199340817379866,83.824,100.0,9.71," 
+
+1. lergdl (appeared 83 times)
+2. mkgaqz (appeared 63 times)
+3. jgtihn (appeared 59 times)","[""lergdl"", ""mkgaqz"", ""jgtihn""]"
+16k,fwe,26,26,14934,cal90,2934.2968318316275,0.19648431979587702,84.155,66.66666666666667,11.92," 
+
+1. mealxk (appeared 73 times)
+2. njohmv (appeared 44 times)
+3. lajzvn (appeared 43 times)","[""mealxk"", ""mqxzqf"", ""lajzvn""]"
+16k,fwe,27,27,14322,cal90,2934.2968318316275,0.20488038205778714,84.348,100.0,10.34," 
+
+1. lauzmo (appeared 73 times)
+2. mbqlwk (appeared 64 times)
+3. kdktaq (appeared 59 times)","[""lauzmo"", ""mbqlwk"", ""kdktaq""]"
+16k,fwe,28,28,15464,cal90,2934.2968318316275,0.18975018312413525,83.664,100.0,12.28," 
+
+1. mtylbb (appeared 83 times)
+2. nvarhe (appeared 73 times)
+3. lrhxyk (appeared 69 times)","[""mtylbb"", ""nvarhe"", ""lrhxyk""]"
+16k,fwe,29,29,13959,cal90,2934.2968318316275,0.21020824069285962,84.798,100.0,11.67," 
+
+1. mnzuwe (appeared 73 times)
+2. ljkora (appeared 64 times)
+3. nokxtq (appeared 59 times)","[""mnzuwe"", ""nokxtq"", ""ljkora""]"
+16k,fwe,30,30,15014,cal90,2934.2968318316275,0.1954373805669127,83.809,100.0,12.12," 
+
+1. lgfxxt (appeared 73 times)
+2. jrqboe (appeared 64 times)
+3. mehlyo (appeared 59 times)","[""lgfxxt"", ""mehlyo"", ""jrqboe""]"
+16k,fwe,31,31,15516,cal90,2934.2968318316275,0.1891142583031469,83.554,100.0,12.67," 
+
+1. kttvta (appeared 73 times)
+2. lhirrw (appeared 64 times)
+3. jljuiq (appeared 59 times)","[""kttvta"", ""lhirrw"", ""jljuiq""]"
+16k,fwe,32,32,14616,cal90,2934.2968318316275,0.20075922494742937,83.839,66.66666666666667,11.22," 
+
+1. mohbld (appeared 73 times)
+2. ncajvs (appeared 64 times)
+3. nwiprk (appeared 59 times)","[""mohbld"", ""ncajvs"", ""ljyujs""]"
+16k,fwe,33,33,13146,cal90,2934.2968318316275,0.22320833955816427,84.634,66.66666666666667,9.97," 
+
+1. llevug (appeared 73 times)
+2. mpkzia (appeared 54 times)
+3. ncrpmu (appeared 44 times)","[""llevug"", ""mpkzia"", ""kfedzl""]"
+16k,fwe,34,34,14494,cal90,2934.2968318316275,0.20244907077629554,83.823,66.66666666666667,11.55," 
+
+1. kxerxl (appears 43 times)
+2. mhvoes (appears 42 times)
+3. oflonf (appears 38 times)","[""mhvoes"", ""nmassr"", ""kxerxl""]"
+16k,fwe,35,35,14845,cal90,2934.2968318316275,0.19766229921398637,83.681,100.0,13.07," 
+
+1. marrup (appears 83 times)
+2. lhaqlv (appears 64 times)
+3. nevncp (appears 63 times)","[""marrup"", ""nevncp"", ""lhaqlv""]"
+16k,fwe,36,36,15470,cal90,2934.2968318316275,0.1896765890001052,83.194,100.0,11.68," 
+
+1. lqqyfw (appeared 83 times)
+2. mevxqu (appeared 64 times)
+3. kpcvym (appeared 56 times)","[""lqqyfw"", ""mevxqu"", ""kpcvym""]"
+16k,fwe,37,37,15677,cal90,2934.2968318316275,0.1871720885266076,83.449,100.0,12.95," 
+
+1. kqelrt (appeared 73 times)
+2. mdkkbk (appeared 69 times)
+3. ixvbws (appeared 64 times)","[""kqelrt"", ""mdkkbk"", ""ixvbws""]"
+16k,fwe,38,38,14528,cal90,2934.2968318316275,0.20197527752145014,84.441,66.66666666666667,10.69," 
+
+1. macyyl (appeared 73 times)
+2. mvcmpj (appeared 69 times)
+3. nqeihn (appeared 64 times)","[""macyyl"", ""mvcmpj"", ""kixjsj""]"
+16k,fwe,39,39,14649,cal90,2934.2968318316275,0.20030697193198357,84.075,100.0,12.57," 
+
+1. lnijpl (appeared 134 times)
+2. mcnbgy (appeared 124 times)
+3. kfaphm (appeared 93 times)","[""lnijpl"", ""mcnbgy"", ""kfaphm""]"
+16k,fwe,40,40,15688,cal90,2934.2968318316275,0.1870408485359273,83.677,100.0,11.67," 
+
+1. lighjz (appeared 83 times)
+2. mfsgdz (appeared 73 times)
+3. khbevq (appeared 69 times)","[""lighjz"", ""mfsgdz"", ""khbevq""]"
+16k,fwe,41,41,14603,cal90,2934.2968318316275,0.20093794643782972,84.401,66.66666666666667,11.88," 
+
+1. mxswbm (appeared 73 times)
+2. nqghey (appeared 64 times)
+3. ometbo (appeared 56 times)","[""mxswbm"", ""nqghey"", ""libiin""]"
+16k,fwe,42,42,15848,cal90,2934.2968318316275,0.18515250074656914,83.115,100.0,12.82," 
+
+1. mkxuey (appeared 73 times)
+2. ndoqlt (appeared 69 times)
+3. kznikn (appeared 64 times)","[""mkxuey"", ""ndoqlt"", ""kznikn""]"
+16k,fwe,43,43,16175,cal90,2934.2968318316275,0.1814093868211207,84.019,100.0,14.67," 
+
+1. kubdwr (appears 134 times)
+2. lqnyqv (appears 127 times)
+3. joxxtw (appears 124 times)","[""kubdwr"", ""lqnyqv"", ""joxxtw""]"
+16k,fwe,44,44,16149,cal90,2934.2968318316275,0.18170145716958497,84.582,66.66666666666667,14.54," 
+
+1. jxqhmv (appeared 73 times)
+2. ksyfgb (appeared 64 times)
+3. lgedxr (appeared 56 times)","[""jxqhmv"", ""ksyfgb"", ""jcdfdc""]"
+16k,fwe,45,45,15058,cal90,2934.2968318316275,0.19486630573991418,83.898,100.0,11.08," 
+
+1. mbftmr (appeared 83 times)
+2. kqwsnb (appeared 64 times)
+3. nmtnxu (appeared 63 times)","[""mbftmr"", ""nmtnxu"", ""kqwsnb""]"
+16k,fwe,46,46,14275,cal90,2934.2968318316275,0.20555494443654132,83.938,100.0,12.22," 
+
+1. kemrce (appears 34 times)
+2. limnlq (appears 33 times)
+3. mdbmvz (appears 32 times)","[""limnlq"", ""mdbmvz"", ""kemrce""]"
+16k,fwe,47,47,13706,cal90,2934.2968318316275,0.21408848911656408,84.420,66.66666666666667,10.46," 
+
+1. lzrsmt (appeared 134 times)
+2. muevjz (appeared 93 times)
+3. nsecwd (appeared 73 times)","[""lzrsmt"", ""muevjz"", ""lesbiz""]"
+16k,fwe,48,48,15662,cal90,2934.2968318316275,0.18735134924221858,83.998,100.0,11.81," 
+
+1. mktzhb (appeared 83 times)
+2. nblbxu (appeared 64 times)
+3. kyjhdl (appeared 56 times)","[""mktzhb"", ""nblbxu"", ""kyjhdl""]"
+16k,fwe,49,49,14643,cal90,2934.2968318316275,0.20038904813437325,84.036,66.66666666666667,11.44," 
+
+1. mbwjyl (appeared 83 times)
+2. mxxvwy (appeared 73 times)
+3. nikoau (appeared 64 times)","[""mbwjyl"", ""mxxvwy"", ""ksymbw""]"

@@ -1,0 +1,10 @@
+videos,setting,correct,N,pct_skipped_live_mean,pct_skipped_TV_live_mean,pct_skipped_VV_live_mean
+all,dense,65,90,,,
+all,one50,61,90,45.8,60.2,45.5
+all,protect,64,90,45.7,0,46.5
+short,dense,36,45,,,
+short,one50,33,45,46,60,45.7
+short,protect,35,45,45.9,0,46.6
+medium,dense,29,45,,,
+medium,one50,28,45,45.6,60.5,45.3
+medium,protect,29,45,45.4,0,46.3

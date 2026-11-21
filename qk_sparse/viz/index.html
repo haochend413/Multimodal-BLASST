@@ -1,0 +1,479 @@
+<title>Where a Row of QK Comes From</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    --ground: #FBFAF8;
+    --panel: #FFFFFF;
+    --panel-2: #F4F2ED;
+    --ink: #1A1C1F;
+    --ink-2: #5A6069;
+    --ink-3: #8B9199;
+    --rule: #E4E2DC;
+    --rule-2: #EFEDE7;
+
+    /* sequential ramp — one hue, light to dark: attention magnitude */
+    --s1: #EAF1FA;
+    --s2: #BBD3EE;
+    --s3: #7FAADD;
+    --s4: #3D82CE;
+    --s5: #1F6FCC;
+    --s6: #143E77;
+
+    /* status — validated pair (CVD ΔE 26.3 protan, 30.9 normal) */
+    --kept: #C0700C;
+    --kept-soft: #F3E3CC;
+    --focus: #1F6FCC;
+
+    --shadow: 0 1px 2px rgba(26,28,31,.06), 0 8px 24px rgba(26,28,31,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #121417;
+      --panel: #191C20;
+      --panel-2: #22262B;
+      --ink: #ECEEF1;
+      --ink-2: #A3ABB4;
+      --ink-3: #757D86;
+      --rule: #2C3138;
+      --rule-2: #23272C;
+      --s1: #16243A;
+      --s2: #1E3A5F;
+      --s3: #2E5F96;
+      --s4: #4C92DC;
+      --s5: #6FA9E6;
+      --s6: #A9CBF2;
+      --kept: #C88318;
+      --kept-soft: #3A2C16;
+      --focus: #4C92DC;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.3);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #121417; --panel: #191C20; --panel-2: #22262B;
+    --ink: #ECEEF1; --ink-2: #A3ABB4; --ink-3: #757D86;
+    --rule: #2C3138; --rule-2: #23272C;
+    --s1: #16243A; --s2: #1E3A5F; --s3: #2E5F96; --s4: #4C92DC; --s5: #6FA9E6; --s6: #A9CBF2;
+    --kept: #C88318; --kept-soft: #3A2C16; --focus: #4C92DC;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.3);
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding-inline: 20px; padding-block: 32px 56px; }
+  .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+  header { border-bottom: 1px solid var(--rule); padding-bottom: 20px; margin-bottom: 22px; }
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace; font-size: 11px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-3); margin: 0 0 8px;
+  }
+  h1 { font-size: clamp(26px, 4vw, 38px); line-height: 1.12; margin: 0 0 10px; letter-spacing: -.02em; text-wrap: balance; font-weight: 600; }
+  .lede { margin: 0; max-width: 64ch; color: var(--ink-2); font-size: 15px; }
+  .lede b { color: var(--ink); font-weight: 600; }
+
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 18px 26px; align-items: flex-end;
+    padding: 14px 16px; background: var(--panel); border: 1px solid var(--rule);
+    border-radius: 10px; margin-bottom: 20px; box-shadow: var(--shadow);
+  }
+  .ctl-label {
+    display: block; font-family: "IBM Plex Mono", monospace; font-size: 10.5px;
+    letter-spacing: .09em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 7px;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font: 500 12px/1 "IBM Plex Mono", monospace; padding: 7px 10px; border-radius: 6px;
+    border: 1px solid var(--rule); background: var(--panel-2); color: var(--ink-2);
+    cursor: pointer; display: flex; align-items: center; gap: 7px;
+  }
+  .chip:hover { border-color: var(--ink-3); color: var(--ink); }
+  .chip[aria-pressed="true"] { background: var(--s5); border-color: var(--s5); color: var(--ground); }
+  .chip .conc { width: 26px; height: 4px; border-radius: 2px; background: var(--rule); overflow: hidden; }
+  .chip .conc i { display: block; height: 100%; background: var(--s4); }
+  .chip[aria-pressed="true"] .conc { background: rgba(255,255,255,.35); }
+  .chip[aria-pressed="true"] .conc i { background: #fff; }
+
+  .slider-row { display: flex; align-items: center; gap: 12px; }
+  input[type=range] { width: 190px; accent-color: var(--kept); }
+  .gapval { font: 600 13px/1 "IBM Plex Mono", monospace; color: var(--kept); min-width: 108px; }
+
+  .grid { display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: 20px; align-items: start; }
+  @media (max-width: 860px) { .grid { grid-template-columns: minmax(0,1fr); } }
+
+  .panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; box-shadow: var(--shadow); }
+  .panel h2 {
+    font-size: 12px; margin: 0 0 3px; letter-spacing: .07em; text-transform: uppercase;
+    font-family: "IBM Plex Mono", monospace; color: var(--ink-2); font-weight: 500;
+  }
+  .panel p.note { margin: 0 0 12px; font-size: 12.5px; color: var(--ink-3); }
+
+  #map { width: 100%; height: auto; display: block; border-radius: 4px; cursor: crosshair; }
+  .maplegend { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 11px; color: var(--ink-3); }
+  .ramp { height: 8px; flex: 1; border-radius: 2px; background: linear-gradient(90deg, var(--s1), var(--s2), var(--s3), var(--s4), var(--s6)); }
+
+  .statgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 1px; background: var(--rule-2); border: 1px solid var(--rule-2); border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
+  .stat { background: var(--panel); padding: 11px 13px; }
+  .stat dt { font: 500 10px/1.3 "IBM Plex Mono", monospace; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-3); margin: 0 0 5px; }
+  .stat dd { margin: 0; font: 600 19px/1.1 "IBM Plex Mono", monospace; letter-spacing: -.01em; }
+  .stat dd small { font-size: 11.5px; font-weight: 400; color: var(--ink-3); letter-spacing: 0; }
+  .stat.hot dd { color: var(--kept); }
+
+  figure { margin: 0 0 18px; }
+  figcaption { font-size: 12px; color: var(--ink-3); margin-top: 7px; }
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .axis { font: 400 10px "IBM Plex Mono", monospace; fill: var(--ink-3); }
+  .axis-line { stroke: var(--rule); stroke-width: 1; }
+  .barlabel { font: 500 10.5px "IBM Plex Mono", monospace; fill: var(--ink-2); }
+
+  #tip {
+    position: fixed; pointer-events: none; z-index: 20; opacity: 0; transition: opacity .1s;
+    background: var(--ink); color: var(--ground); font: 500 11.5px/1.45 "IBM Plex Mono", monospace;
+    padding: 7px 9px; border-radius: 6px; white-space: nowrap; box-shadow: 0 4px 14px rgba(0,0,0,.25);
+  }
+
+  .legendrow { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 8px; font-size: 11.5px; color: var(--ink-2); }
+  .key { display: flex; align-items: center; gap: 6px; }
+  .swatch { width: 11px; height: 11px; border-radius: 2px; }
+  .swatch.kept { background: var(--kept); }
+  .swatch.skip { background: transparent; border: 1.5px dashed var(--ink-3); }
+
+  footer { margin-top: 30px; padding-top: 18px; border-top: 1px solid var(--rule); font-size: 12.5px; color: var(--ink-3); }
+  footer code { font-family: "IBM Plex Mono", monospace; color: var(--ink-2); }
+  footer p { margin: 0 0 8px; max-width: 78ch; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">SmolLM2-135M · prefill · post-RoPE Q·Kᵀ</p>
+    <h1>Where a row of QKᵀ comes from</h1>
+    <p class="lede">One query attends to every key before it. This shows <b>which key columns actually carry that row</b> — in a real forward pass, for 40 consecutive queries across six attention heads. Move the threshold to see which 64-key tiles a FlashAttention kernel could skip entirely.</p>
+  </header>
+
+  <div class="controls">
+    <div>
+      <span class="ctl-label" id="headlabel">Head — bar shows concentration</span>
+      <div class="chips" id="chips" role="group" aria-labelledby="headlabel"></div>
+    </div>
+    <div>
+      <label class="ctl-label" for="gap">Skip threshold (gap)</label>
+      <div class="slider-row">
+        <input type="range" id="gap" min="0.5" max="8" step="0.5" value="1">
+        <span class="gapval mono" id="gapval"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>40 consecutive rows</h2>
+      <p class="note">Each strip is one query row. Click to inspect.</p>
+      <canvas id="map" width="760" height="520"></canvas>
+      <div class="maplegend"><span>low</span><span class="ramp"></span><span>high</span></div>
+      <p class="note" style="margin-top:10px">Each row is scaled to its own maximum, so structure stays visible in both peaked and flat heads.</p>
+    </section>
+
+    <section class="panel">
+      <h2 id="rowtitle">Row</h2>
+      <p class="note" id="rowsub"></p>
+
+      <dl class="statgrid" id="stats"></dl>
+
+      <figure>
+        <svg id="profile" viewBox="0 0 760 190" role="img" aria-labelledby="profcap"></svg>
+        <figcaption id="profcap">Attention weight by key position, square-root scale. Vertical rules mark 64-key tile boundaries.</figcaption>
+      </figure>
+
+      <figure>
+        <svg id="tiles" viewBox="0 0 760 120" role="img" aria-labelledby="tilecap"></svg>
+        <figcaption id="tilecap">Each 64-key tile, by its strongest entry relative to the row maximum.</figcaption>
+        <div class="legendrow">
+          <span class="key"><i class="swatch kept"></i> kept — must be computed</span>
+          <span class="key"><i class="swatch skip"></i> skippable — every entry below the threshold</span>
+        </div>
+      </figure>
+
+      <figure>
+        <svg id="topk" viewBox="0 0 760 250" role="img" aria-labelledby="topcap"></svg>
+        <figcaption id="topcap">The 16 strongest keys for this row, by position in the sequence.</figcaption>
+      </figure>
+    </section>
+  </div>
+
+  <footer>
+    <p><b>How the skip rule works.</b> A tile can be dropped for a row when its best score sits more than <code>gap</code> below the row's maximum, because every entry in it then carries at most <code>e^−gap</code> of the top entry's softmax weight. At gap 1 that is 36.8%; at gap 4, 1.8%. The gap is not free — it follows from BLASST's calibrated threshold as <code>gap = ln(L / threshold_scale_factor)</code>, which puts its aggressive settings between 0.6 and 3.4.</p>
+    <p>Rows are causal, so row <span class="mono">i</span> sees only keys <span class="mono">0…i</span>. Captured post-RoPE from <code>scaled_dot_product_attention</code>; weights are the exact softmax, tile maxima the exact scores. Generated by <code>scripts/export_rows.py</code>.</p>
+  </footer>
+</div>
+<div id="tip" role="status" aria-live="polite"></div>
+
+<script src="rows-data.js"></script>
+<script>
+(function () {
+  "use strict";
+  var D = window.QK_DATA;
+  var tip = document.getElementById("tip");
+  if (!D || !D.heads || !D.heads.length) {
+    document.getElementById("rowsub").textContent = "Data file failed to load.";
+    return;
+  }
+
+  var RAMP = ["--s1","--s2","--s3","--s4","--s5","--s6"];
+  function tok(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  function rampColor(t) {           // t in 0..1, square-root eased for visibility
+    var e = Math.sqrt(Math.max(0, Math.min(1, t)));
+    var x = e * (RAMP.length - 1), i = Math.floor(x);
+    return tok(RAMP[Math.min(RAMP.length - 1, i)]);
+  }
+
+  var state = { head: D.heads.length > 2 ? 2 : 0, row: 0, gap: 1 };
+
+  /* ---------- head chips ---------- */
+  var chips = document.getElementById("chips");
+  D.heads.forEach(function (h, idx) {
+    var meanEff = h.rows.reduce(function (a, r) { return a + r.eff_key_frac; }, 0) / h.rows.length;
+    var conc = 1 - meanEff;                       // 1 = highly concentrated
+    var b = document.createElement("button");
+    b.className = "chip";
+    b.type = "button";
+    b.setAttribute("aria-pressed", idx === state.head);
+    b.innerHTML = "L" + h.depth + "·H" + h.head +
+      '<span class="conc" title="concentration"><i style="width:' + (conc * 100).toFixed(0) + '%"></i></span>';
+    b.addEventListener("click", function () {
+      state.head = idx; state.row = 0;
+      Array.prototype.forEach.call(chips.children, function (c, i) {
+        c.setAttribute("aria-pressed", i === idx);
+      });
+      drawAll();
+    });
+    chips.appendChild(b);
+  });
+
+  /* ---------- gap slider ---------- */
+  var gapEl = document.getElementById("gap"), gapVal = document.getElementById("gapval");
+  function gapText() {
+    var pct = Math.exp(-state.gap) * 100;
+    return "gap " + state.gap.toFixed(1) + " · drops <" + (pct < 1 ? pct.toFixed(2) : pct.toFixed(1)) + "%";
+  }
+  gapEl.addEventListener("input", function () {
+    state.gap = parseFloat(gapEl.value);
+    gapVal.textContent = gapText();
+    drawAll();
+  });
+
+  /* ---------- row map ---------- */
+  var cv = document.getElementById("map"), ctx = cv.getContext("2d");
+  function drawMap() {
+    var h = D.heads[state.head], rows = h.rows, n = rows.length;
+    var W = cv.width, H = cv.height, rowH = H / n, nb = rows[0].bins.length;
+    ctx.clearRect(0, 0, W, H);
+    rows.forEach(function (r, ri) {
+      var max = r.top_w[0] || 1, bw = W / nb;
+      for (var b = 0; b < nb; b++) {
+        ctx.fillStyle = rampColor(r.bins[b] / max);
+        ctx.fillRect(b * bw, ri * rowH, bw + 0.6, rowH - 0.6);
+      }
+      if (ri === state.row) {
+        ctx.strokeStyle = tok("--kept"); ctx.lineWidth = 2;
+        ctx.strokeRect(1, ri * rowH + 1, W - 2, rowH - 2);
+      }
+    });
+  }
+  function rowFromEvent(e) {
+    var rect = cv.getBoundingClientRect();
+    var rows = D.heads[state.head].rows;
+    var ri = Math.floor((e.clientY - rect.top) / rect.height * rows.length);
+    return Math.max(0, Math.min(rows.length - 1, ri));
+  }
+  cv.addEventListener("click", function (e) { state.row = rowFromEvent(e); drawAll(); });
+  cv.addEventListener("mousemove", function (e) {
+    var r = D.heads[state.head].rows[rowFromEvent(e)];
+    showTip(e, "query " + r.i + " · " + r.n_allowed + " keys · top key " + r.top_idx[0]);
+  });
+  cv.addEventListener("mouseleave", hideTip);
+
+  /* ---------- tooltip ---------- */
+  function showTip(e, text) {
+    tip.textContent = text; tip.style.opacity = "1";
+    var x = e.clientX + 14, y = e.clientY + 14;
+    if (x + tip.offsetWidth > innerWidth - 8) x = e.clientX - tip.offsetWidth - 12;
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  }
+  function hideTip() { tip.style.opacity = "0"; }
+
+  /* ---------- helpers ---------- */
+  function svgEl(name, attrs) {
+    var e = document.createElementNS("http://www.w3.org/2000/svg", name);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function currentRow() { return D.heads[state.head].rows[state.row]; }
+
+  /* ---------- stats ---------- */
+  function drawStats() {
+    var r = currentRow(), gap = state.gap;
+    var tiles = r.tile_max, kept = tiles.filter(function (t) { return r.global_max - t <= gap; }).length;
+    var top1 = r.top_w[0], top16 = r.top_w.slice(0, 16).reduce(function (a, b) { return a + b; }, 0);
+    var items = [
+      ["Effective keys", r.eff_keys.toFixed(0), "of " + r.n_allowed + " · " + (r.eff_key_frac * 100).toFixed(1) + "%"],
+      ["Top key holds", (top1 * 100).toFixed(1) + "%", "key " + r.top_idx[0]],
+      ["Top 16 hold", (top16 * 100).toFixed(1) + "%", "of the row"],
+      ["Tiles to compute", kept + " / " + tiles.length, (100 * kept / tiles.length).toFixed(0) + "% of the work", true]
+    ];
+    var dl = document.getElementById("stats");
+    dl.innerHTML = "";
+    items.forEach(function (it) {
+      var d = document.createElement("div");
+      d.className = "stat" + (it[3] ? " hot" : "");
+      d.innerHTML = "<dt>" + it[0] + "</dt><dd>" + it[1] + "<br><small>" + it[2] + "</small></dd>";
+      dl.appendChild(d);
+    });
+    document.getElementById("rowtitle").textContent = "Query row " + r.i;
+    document.getElementById("rowsub").textContent =
+      "Layer " + D.heads[state.head].depth + ", head " + D.heads[state.head].head +
+      " — attending over " + r.n_allowed + " preceding keys.";
+  }
+
+  /* ---------- profile ---------- */
+  function drawProfile() {
+    var r = currentRow(), svg = document.getElementById("profile");
+    svg.innerHTML = "";
+    var W = 760, H = 190, padL = 34, padB = 22, plotW = W - padL - 6, plotH = H - padB - 8;
+    var bins = r.bins, nb = bins.length, max = r.top_w[0] || 1;
+    var bw = plotW / nb;
+
+    svg.appendChild(svgEl("line", { x1: padL, y1: H - padB, x2: W - 6, y2: H - padB, class: "axis-line" }));
+
+    // tile boundaries
+    var nTiles = Math.floor(r.n_allowed / D.key_tile);
+    var step = Math.max(1, Math.round(nTiles / 12));
+    for (var t = 0; t <= nTiles; t += step) {
+      var x = padL + (t * D.key_tile / r.n_allowed) * plotW;
+      svg.appendChild(svgEl("line", { x1: x, y1: 8, x2: x, y2: H - padB, stroke: tok("--rule-2"), "stroke-width": 1 }));
+    }
+
+    for (var b = 0; b < nb; b++) {
+      var v = Math.sqrt(bins[b] / max) * plotH;
+      if (v < 0.4) continue;
+      var rect = svgEl("rect", {
+        x: (padL + b * bw).toFixed(2), y: (H - padB - v).toFixed(2),
+        width: Math.max(0.8, bw - 0.25).toFixed(2), height: v.toFixed(2),
+        fill: rampColor(bins[b] / max), rx: 0.5
+      });
+      (function (bi) {
+        rect.addEventListener("mousemove", function (e) {
+          var k0 = Math.floor(bi * r.n_allowed / nb), k1 = Math.floor((bi + 1) * r.n_allowed / nb);
+          showTip(e, "keys " + k0 + "–" + k1 + " · peak " + (bins[bi] * 100).toFixed(2) + "%");
+        });
+        rect.addEventListener("mouseleave", hideTip);
+      })(b);
+      svg.appendChild(rect);
+    }
+
+    [0, 0.25, 0.5, 0.75, 1].forEach(function (f) {
+      var lab = svgEl("text", { x: padL + f * plotW, y: H - padB + 13, class: "axis", "text-anchor": f === 0 ? "start" : (f === 1 ? "end" : "middle") });
+      lab.textContent = Math.round(f * r.n_allowed);
+      svg.appendChild(lab);
+    });
+    var yl = svgEl("text", { x: 0, y: 14, class: "axis" });
+    yl.textContent = "peak " + (max * 100).toFixed(1) + "%";
+    svg.appendChild(yl);
+  }
+
+  /* ---------- tile strip ---------- */
+  function drawTiles() {
+    var r = currentRow(), svg = document.getElementById("tiles");
+    svg.innerHTML = "";
+    var W = 760, H = 120, padL = 34, padB = 22, plotW = W - padL - 6, plotH = H - padB - 8;
+    var tiles = r.tile_max, n = tiles.length, bw = plotW / n;
+
+    svg.appendChild(svgEl("line", { x1: padL, y1: H - padB, x2: W - 6, y2: H - padB, class: "axis-line" }));
+
+    // threshold line: relative weight e^-gap
+    var thrY = H - padB - Math.sqrt(Math.exp(-state.gap)) * plotH;
+    svg.appendChild(svgEl("line", {
+      x1: padL, y1: thrY, x2: W - 6, y2: thrY,
+      stroke: tok("--kept"), "stroke-width": 1.5, "stroke-dasharray": "4 3"
+    }));
+    var tl = svgEl("text", { x: W - 6, y: thrY - 5, class: "axis", "text-anchor": "end", fill: tok("--kept") });
+    tl.textContent = "threshold";
+    svg.appendChild(tl);
+
+    tiles.forEach(function (tm, i) {
+      var rel = Math.exp(tm - r.global_max);            // best entry, relative to row max
+      var v = Math.max(1, Math.sqrt(rel) * plotH);
+      var keep = (r.global_max - tm) <= state.gap;
+      var rect = svgEl("rect", {
+        x: (padL + i * bw + 0.8).toFixed(2), y: (H - padB - v).toFixed(2),
+        width: Math.max(1.2, bw - 1.6).toFixed(2), height: v.toFixed(2), rx: 1.5,
+        fill: keep ? tok("--kept") : "none",
+        stroke: keep ? "none" : tok("--ink-3"),
+        "stroke-width": keep ? 0 : 1, "stroke-dasharray": keep ? "none" : "2 2"
+      });
+      rect.addEventListener("mousemove", function (e) {
+        showTip(e, "tile " + i + " · keys " + (i * D.key_tile) + "–" + ((i + 1) * D.key_tile - 1) +
+          " · " + (keep ? "compute" : "skip") + " · best entry " + (rel * 100).toFixed(2) + "% of max");
+      });
+      rect.addEventListener("mouseleave", hideTip);
+      svg.appendChild(rect);
+    });
+
+    var lab = svgEl("text", { x: padL, y: H - padB + 13, class: "axis" });
+    lab.textContent = "tile 0";
+    svg.appendChild(lab);
+    var lab2 = svgEl("text", { x: W - 6, y: H - padB + 13, class: "axis", "text-anchor": "end" });
+    lab2.textContent = "tile " + (n - 1) + " (nearest the query)";
+    svg.appendChild(lab2);
+  }
+
+  /* ---------- top-k bars ---------- */
+  function drawTopK() {
+    var r = currentRow(), svg = document.getElementById("topk");
+    svg.innerHTML = "";
+    var N = 16, W = 760, rowH = 14, gapY = 1.5, padL = 62, padR = 54;
+    var H = N * (rowH + gapY) + 8;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    var max = r.top_w[0] || 1, plotW = W - padL - padR;
+
+    for (var i = 0; i < N && i < r.top_idx.length; i++) {
+      var y = i * (rowH + gapY) + 4, w = Math.max(1, (r.top_w[i] / max) * plotW);
+      var idxLab = svgEl("text", { x: padL - 8, y: y + rowH - 3, class: "barlabel", "text-anchor": "end" });
+      idxLab.textContent = r.top_idx[i];
+      svg.appendChild(idxLab);
+      var bar = svgEl("rect", {
+        x: padL, y: y, width: w.toFixed(2), height: rowH, rx: 2,
+        fill: rampColor(r.top_w[i] / max)
+      });
+      (function (ii) {
+        bar.addEventListener("mousemove", function (e) {
+          var dist = r.i - r.top_idx[ii];
+          showTip(e, "key " + r.top_idx[ii] + " · " + (r.top_w[ii] * 100).toFixed(2) + "% · " + dist + " before the query");
+        });
+        bar.addEventListener("mouseleave", hideTip);
+      })(i);
+      svg.appendChild(bar);
+      var val = svgEl("text", { x: padL + w + 7, y: y + rowH - 3, class: "barlabel" });
+      val.textContent = (r.top_w[i] * 100).toFixed(1) + "%";
+      svg.appendChild(val);
+    }
+    var cap = svgEl("text", { x: 0, y: H - 1, class: "axis" });
+    cap.textContent = "key index";
+    svg.appendChild(cap);
+  }
+
+  function drawAll() { drawMap(); drawStats(); drawProfile(); drawTiles(); drawTopK(); }
+
+  gapVal.textContent = gapText();
+  drawAll();
+  window.addEventListener("resize", drawMap);
+  var mq = window.matchMedia("(prefers-color-scheme: dark)");
+  (mq.addEventListener ? mq.addEventListener.bind(mq, "change") : mq.addListener.bind(mq))(drawAll);
+})();
+</script>

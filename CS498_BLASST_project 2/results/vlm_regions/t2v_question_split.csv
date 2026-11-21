@@ -1,0 +1,27 @@
+prompt,length_name,part,tiles,skipped,pct_skipped_at_overall_50
+068rdc75mHM_16k,16k,question blocks,172480,154596,89.63
+068rdc75mHM_16k,16k,transcript blocks,603680,496454,82.24
+068rdc75mHM_8k,8k,question blocks,70560,63476,89.96
+068rdc75mHM_8k,8k,transcript blocks,246960,204735,82.9
+0Jbc3Ah4EIc_16k,16k,question blocks,86240,70851,82.16
+0Jbc3Ah4EIc_16k,16k,transcript blocks,603680,502808,83.29
+0Jbc3Ah4EIc_8k,8k,question blocks,36848,30517,82.82
+0Jbc3Ah4EIc_8k,8k,transcript blocks,257936,217620,84.37
+0bwyCF0HteE_16k,16k,question blocks,86240,68231,79.12
+0bwyCF0HteE_16k,16k,transcript blocks,603680,490549,81.26
+0bwyCF0HteE_8k,8k,question blocks,36848,29237,79.34
+0bwyCF0HteE_8k,8k,transcript blocks,257936,212647,82.44
+0iED5BojTMI_16k,16k,question blocks,178752,158535,88.69
+0iED5BojTMI_16k,16k,transcript blocks,268128,222785,83.09
+0iED5BojTMI_8k,8k,question blocks,76832,68496,89.15
+0iED5BojTMI_8k,8k,transcript blocks,115248,98303,85.3
+0kRsiSdDFYg_16k,16k,question blocks,86240,71935,83.41
+0kRsiSdDFYg_16k,16k,transcript blocks,603680,513983,85.14
+0kRsiSdDFYg_8k,8k,question blocks,36848,30670,83.23
+0kRsiSdDFYg_8k,8k,transcript blocks,257936,228017,88.4
+pooled_16k,16k,question blocks,609952,524148,85.93
+pooled_16k,16k,transcript blocks,2682848,2226579,82.99
+pooled_8k,8k,question blocks,257936,222396,86.22
+pooled_8k,8k,transcript blocks,1136016,961322,84.62
+pooled_all,all,question blocks,867888,746544,86.02
+pooled_all,all,transcript blocks,3818864,3187901,83.48

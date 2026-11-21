@@ -1,0 +1,1321 @@
+set,length_name,prompt,row_group,keys,lambda_name,lambda,values,dense_weight_sum,lost_weight_sum
+llama_16k,16k,fwe_row100_16k,all rows,video keys,exact50,0.0044308,15561728,0,0
+llama_16k,16k,fwe_row100_16k,all rows,other keys,exact50,0.0044308,15561728,1.5562e+07,3.8841e+05
+llama_16k,16k,fwe_row100_16k,all rows,all keys,exact50,0.0044308,15561728,1.5562e+07,3.8841e+05
+llama_16k,16k,fwe_row100_16k,all rows,video keys,exact75,0.042842,15561728,0,0
+llama_16k,16k,fwe_row100_16k,all rows,other keys,exact75,0.042842,15561728,1.5562e+07,1.3972e+06
+llama_16k,16k,fwe_row100_16k,all rows,all keys,exact75,0.042842,15561728,1.5562e+07,1.3972e+06
+llama_16k,16k,fwe_row100_16k,all rows,video keys,cal50,0.007008,15561728,0,0
+llama_16k,16k,fwe_row100_16k,all rows,other keys,cal50,0.007008,15561728,1.5562e+07,5.262e+05
+llama_16k,16k,fwe_row100_16k,all rows,all keys,cal50,0.007008,15561728,1.5562e+07,5.262e+05
+llama_16k,16k,fwe_row100_16k,all rows,video keys,cal75,0.055669,15561728,0,0
+llama_16k,16k,fwe_row100_16k,all rows,other keys,cal75,0.055669,15561728,1.5562e+07,1.5683e+06
+llama_16k,16k,fwe_row100_16k,all rows,all keys,cal75,0.055669,15561728,1.5562e+07,1.5683e+06
+llama_16k,16k,fwe_row100_16k,answer position,video keys,exact50,0.0044308,1024,0,0
+llama_16k,16k,fwe_row100_16k,answer position,other keys,exact50,0.0044308,1024,1024,28.382
+llama_16k,16k,fwe_row100_16k,answer position,all keys,exact50,0.0044308,1024,1024,28.382
+llama_16k,16k,fwe_row100_16k,answer position,video keys,exact75,0.042842,1024,0,0
+llama_16k,16k,fwe_row100_16k,answer position,other keys,exact75,0.042842,1024,1024,83.117
+llama_16k,16k,fwe_row100_16k,answer position,all keys,exact75,0.042842,1024,1024,83.117
+llama_16k,16k,fwe_row100_16k,answer position,video keys,cal50,0.007008,1024,0,0
+llama_16k,16k,fwe_row100_16k,answer position,other keys,cal50,0.007008,1024,1024,36.966
+llama_16k,16k,fwe_row100_16k,answer position,all keys,cal50,0.007008,1024,1024,36.966
+llama_16k,16k,fwe_row100_16k,answer position,video keys,cal75,0.055669,1024,0,0
+llama_16k,16k,fwe_row100_16k,answer position,other keys,cal75,0.055669,1024,1024,90.199
+llama_16k,16k,fwe_row100_16k,answer position,all keys,cal75,0.055669,1024,1024,90.199
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,video keys,exact50,0.0055638,16598016,0,0
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,other keys,exact50,0.0055638,16598016,1.6598e+07,3.0453e+05
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,all keys,exact50,0.0055638,16598016,1.6598e+07,3.0453e+05
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,video keys,exact75,0.036977,16598016,0,0
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,other keys,exact75,0.036977,16598016,1.6598e+07,9.6373e+05
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,all keys,exact75,0.036977,16598016,1.6598e+07,9.6373e+05
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,video keys,cal50,0.0065704,16598016,0,0
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,other keys,cal50,0.0065704,16598016,1.6598e+07,3.4452e+05
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,all keys,cal50,0.0065704,16598016,1.6598e+07,3.4452e+05
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,video keys,cal75,0.052193,16598016,0,0
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,other keys,cal75,0.052193,16598016,1.6598e+07,1.1321e+06
+llama_16k,16k,niah_multikey_1_row100_16k,all rows,all keys,cal75,0.052193,16598016,1.6598e+07,1.1321e+06
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,video keys,exact50,0.0055638,1024,0,0
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,other keys,exact50,0.0055638,1024,1024,29.648
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,all keys,exact50,0.0055638,1024,1024,29.648
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,video keys,exact75,0.036977,1024,0,0
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,other keys,exact75,0.036977,1024,1024,65.319
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,all keys,exact75,0.036977,1024,1024,65.319
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,video keys,cal50,0.0065704,1024,0,0
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,other keys,cal50,0.0065704,1024,1024,32.51
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,all keys,cal50,0.0065704,1024,1024,32.51
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,video keys,cal75,0.052193,1024,0,0
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,other keys,cal75,0.052193,1024,1024,71.679
+llama_16k,16k,niah_multikey_1_row100_16k,answer position,all keys,cal75,0.052193,1024,1024,71.679
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,video keys,exact50,0.0061852,16537600,0,0
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,other keys,exact50,0.0061852,16537600,1.6538e+07,4.6123e+05
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,all keys,exact50,0.0061852,16537600,1.6538e+07,4.6123e+05
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,video keys,exact75,0.043666,16537600,0,0
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,other keys,exact75,0.043666,16537600,1.6538e+07,1.4162e+06
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,all keys,exact75,0.043666,16537600,1.6538e+07,1.4162e+06
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,video keys,cal50,0.0065944,16537600,0,0
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,other keys,cal50,0.0065944,16537600,1.6538e+07,4.8207e+05
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,all keys,cal50,0.0065944,16537600,1.6538e+07,4.8207e+05
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,video keys,cal75,0.052384,16537600,0,0
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,other keys,cal75,0.052384,16537600,1.6538e+07,1.5367e+06
+llama_16k,16k,niah_multikey_2_row100_16k,all rows,all keys,cal75,0.052384,16537600,1.6538e+07,1.5367e+06
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,video keys,exact50,0.0061852,1024,0,0
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,other keys,exact50,0.0061852,1024,1024,63.637
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,all keys,exact50,0.0061852,1024,1024,63.637
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,video keys,exact75,0.043666,1024,0,0
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,other keys,exact75,0.043666,1024,1024,124.98
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,all keys,exact75,0.043666,1024,1024,124.98
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,video keys,cal50,0.0065944,1024,0,0
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,other keys,cal50,0.0065944,1024,1024,65.412
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,all keys,cal50,0.0065944,1024,1024,65.412
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,video keys,cal75,0.052384,1024,0,0
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,other keys,cal75,0.052384,1024,1024,130.17
+llama_16k,16k,niah_multikey_2_row100_16k,answer position,all keys,cal75,0.052384,1024,1024,130.17
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,video keys,exact50,0.0051908,16477184,0,0
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,other keys,exact50,0.0051908,16477184,1.6477e+07,2.7998e+05
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,all keys,exact50,0.0051908,16477184,1.6477e+07,2.7998e+05
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,video keys,exact75,0.033417,16477184,0,0
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,other keys,exact75,0.033417,16477184,1.6477e+07,8.7313e+05
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,all keys,exact75,0.033417,16477184,1.6477e+07,8.7313e+05
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,video keys,cal50,0.0066186,16477184,0,0
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,other keys,cal50,0.0066186,16477184,1.6477e+07,3.3384e+05
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,all keys,cal50,0.0066186,16477184,1.6477e+07,3.3384e+05
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,video keys,cal75,0.052576,16477184,0,0
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,other keys,cal75,0.052576,16477184,1.6477e+07,1.0816e+06
+llama_16k,16k,niah_multikey_3_row100_16k,all rows,all keys,cal75,0.052576,16477184,1.6477e+07,1.0816e+06
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,video keys,exact50,0.0051908,1024,0,0
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,other keys,exact50,0.0051908,1024,1024,31.19
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,all keys,exact50,0.0051908,1024,1024,31.19
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,video keys,exact75,0.033417,1024,0,0
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,other keys,exact75,0.033417,1024,1024,77.147
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,all keys,exact75,0.033417,1024,1024,77.147
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,video keys,cal50,0.0066186,1024,0,0
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,other keys,cal50,0.0066186,1024,1024,36.019
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,all keys,cal50,0.0066186,1024,1024,36.019
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,video keys,cal75,0.052576,1024,0,0
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,other keys,cal75,0.052576,1024,1024,91.013
+llama_16k,16k,niah_multikey_3_row100_16k,answer position,all keys,cal75,0.052576,1024,1024,91.013
+llama_16k,16k,vt_row100_16k,all rows,video keys,exact50,0.0048124,16499712,0,0
+llama_16k,16k,vt_row100_16k,all rows,other keys,exact50,0.0048124,16499712,1.65e+07,4.3944e+05
+llama_16k,16k,vt_row100_16k,all rows,all keys,exact50,0.0048124,16499712,1.65e+07,4.3944e+05
+llama_16k,16k,vt_row100_16k,all rows,video keys,exact75,0.036716,16499712,0,0
+llama_16k,16k,vt_row100_16k,all rows,other keys,exact75,0.036716,16499712,1.65e+07,1.4495e+06
+llama_16k,16k,vt_row100_16k,all rows,all keys,exact75,0.036716,16499712,1.65e+07,1.4495e+06
+llama_16k,16k,vt_row100_16k,all rows,video keys,cal50,0.0066096,16499712,0,0
+llama_16k,16k,vt_row100_16k,all rows,other keys,cal50,0.0066096,16499712,1.65e+07,5.4927e+05
+llama_16k,16k,vt_row100_16k,all rows,all keys,cal50,0.0066096,16499712,1.65e+07,5.4927e+05
+llama_16k,16k,vt_row100_16k,all rows,video keys,cal75,0.052504,16499712,0,0
+llama_16k,16k,vt_row100_16k,all rows,other keys,cal75,0.052504,16499712,1.65e+07,1.716e+06
+llama_16k,16k,vt_row100_16k,all rows,all keys,cal75,0.052504,16499712,1.65e+07,1.716e+06
+llama_16k,16k,vt_row100_16k,answer position,video keys,exact50,0.0048124,1024,0,0
+llama_16k,16k,vt_row100_16k,answer position,other keys,exact50,0.0048124,1024,1024,19.019
+llama_16k,16k,vt_row100_16k,answer position,all keys,exact50,0.0048124,1024,1024,19.019
+llama_16k,16k,vt_row100_16k,answer position,video keys,exact75,0.036716,1024,0,0
+llama_16k,16k,vt_row100_16k,answer position,other keys,exact75,0.036716,1024,1024,50.685
+llama_16k,16k,vt_row100_16k,answer position,all keys,exact75,0.036716,1024,1024,50.685
+llama_16k,16k,vt_row100_16k,answer position,video keys,cal50,0.0066096,1024,0,0
+llama_16k,16k,vt_row100_16k,answer position,other keys,cal50,0.0066096,1024,1024,22.438
+llama_16k,16k,vt_row100_16k,answer position,all keys,cal50,0.0066096,1024,1024,22.438
+llama_16k,16k,vt_row100_16k,answer position,video keys,cal75,0.052504,1024,0,0
+llama_16k,16k,vt_row100_16k,answer position,other keys,cal75,0.052504,1024,1024,59.178
+llama_16k,16k,vt_row100_16k,answer position,all keys,cal75,0.052504,1024,1024,59.178
+llama_8k,8k,fwe_row100_8k,all rows,video keys,exact50,0.011993,8252416,0,0
+llama_8k,8k,fwe_row100_8k,all rows,other keys,exact50,0.011993,8252416,8.2524e+06,2.633e+05
+llama_8k,8k,fwe_row100_8k,all rows,all keys,exact50,0.011993,8252416,8.2524e+06,2.633e+05
+llama_8k,8k,fwe_row100_8k,all rows,video keys,exact75,0.10513,8252416,0,0
+llama_8k,8k,fwe_row100_8k,all rows,other keys,exact75,0.10513,8252416,8.2524e+06,9.0001e+05
+llama_8k,8k,fwe_row100_8k,all rows,all keys,exact75,0.10513,8252416,8.2524e+06,9.0001e+05
+llama_8k,8k,fwe_row100_8k,all rows,video keys,cal50,0.013215,8252416,0,0
+llama_8k,8k,fwe_row100_8k,all rows,other keys,cal50,0.013215,8252416,8.2524e+06,2.8123e+05
+llama_8k,8k,fwe_row100_8k,all rows,all keys,cal50,0.013215,8252416,8.2524e+06,2.8123e+05
+llama_8k,8k,fwe_row100_8k,all rows,video keys,cal75,0.10498,8252416,0,0
+llama_8k,8k,fwe_row100_8k,all rows,other keys,cal75,0.10498,8252416,8.2524e+06,8.9946e+05
+llama_8k,8k,fwe_row100_8k,all rows,all keys,cal75,0.10498,8252416,8.2524e+06,8.9946e+05
+llama_8k,8k,fwe_row100_8k,answer position,video keys,exact50,0.011993,1024,0,0
+llama_8k,8k,fwe_row100_8k,answer position,other keys,exact50,0.011993,1024,1024,27.93
+llama_8k,8k,fwe_row100_8k,answer position,all keys,exact50,0.011993,1024,1024,27.93
+llama_8k,8k,fwe_row100_8k,answer position,video keys,exact75,0.10513,1024,0,0
+llama_8k,8k,fwe_row100_8k,answer position,other keys,exact75,0.10513,1024,1024,77.636
+llama_8k,8k,fwe_row100_8k,answer position,all keys,exact75,0.10513,1024,1024,77.636
+llama_8k,8k,fwe_row100_8k,answer position,video keys,cal50,0.013215,1024,0,0
+llama_8k,8k,fwe_row100_8k,answer position,other keys,cal50,0.013215,1024,1024,29.427
+llama_8k,8k,fwe_row100_8k,answer position,all keys,cal50,0.013215,1024,1024,29.427
+llama_8k,8k,fwe_row100_8k,answer position,video keys,cal75,0.10498,1024,0,0
+llama_8k,8k,fwe_row100_8k,answer position,other keys,cal75,0.10498,1024,1024,77.614
+llama_8k,8k,fwe_row100_8k,answer position,all keys,cal75,0.10498,1024,1024,77.614
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,video keys,exact50,0.015132,7719936,0,0
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,other keys,exact50,0.015132,7719936,7.7199e+06,1.8494e+05
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,all keys,exact50,0.015132,7719936,7.7199e+06,1.8494e+05
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,video keys,exact75,0.10975,7719936,0,0
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,other keys,exact75,0.10975,7719936,7.7199e+06,5.6136e+05
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,all keys,exact75,0.10975,7719936,7.7199e+06,5.6136e+05
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,video keys,cal50,0.014127,7719936,0,0
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,other keys,cal50,0.014127,7719936,7.7199e+06,1.7623e+05
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,all keys,cal50,0.014127,7719936,7.7199e+06,1.7623e+05
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,video keys,cal75,0.11222,7719936,0,0
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,other keys,cal75,0.11222,7719936,7.7199e+06,5.6741e+05
+llama_8k,8k,niah_multikey_1_row100_8k,all rows,all keys,cal75,0.11222,7719936,7.7199e+06,5.6741e+05
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,video keys,exact50,0.015132,1024,0,0
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,other keys,exact50,0.015132,1024,1024,27.445
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,all keys,exact50,0.015132,1024,1024,27.445
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,video keys,exact75,0.10975,1024,0,0
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,other keys,exact75,0.10975,1024,1024,64.548
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,all keys,exact75,0.10975,1024,1024,64.548
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,video keys,cal50,0.014127,1024,0,0
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,other keys,cal50,0.014127,1024,1024,26.472
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,all keys,cal50,0.014127,1024,1024,26.472
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,video keys,cal75,0.11222,1024,0,0
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,other keys,cal75,0.11222,1024,1024,64.946
+llama_8k,8k,niah_multikey_1_row100_8k,answer position,all keys,cal75,0.11222,1024,1024,64.946
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,video keys,exact50,0.013592,7871488,0,0
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,other keys,exact50,0.013592,7871488,7.8715e+06,2.3839e+05
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,all keys,exact50,0.013592,7871488,7.8715e+06,2.3839e+05
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,video keys,exact75,0.093524,7871488,0,0
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,other keys,exact75,0.093524,7871488,7.8715e+06,7.2766e+05
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,all keys,exact75,0.093524,7871488,7.8715e+06,7.2766e+05
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,video keys,cal50,0.013855,7871488,0,0
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,other keys,cal50,0.013855,7871488,7.8715e+06,2.4163e+05
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,all keys,cal50,0.013855,7871488,7.8715e+06,2.4163e+05
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,video keys,cal75,0.11006,7871488,0,0
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,other keys,cal75,0.11006,7871488,7.8715e+06,7.8116e+05
+llama_8k,8k,niah_multikey_2_row100_8k,all rows,all keys,cal75,0.11006,7871488,7.8715e+06,7.8116e+05
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,video keys,exact50,0.013592,1024,0,0
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,other keys,exact50,0.013592,1024,1024,93.515
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,all keys,exact50,0.013592,1024,1024,93.515
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,video keys,exact75,0.093524,1024,0,0
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,other keys,exact75,0.093524,1024,1024,159.32
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,all keys,exact75,0.093524,1024,1024,159.32
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,video keys,cal50,0.013855,1024,0,0
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,other keys,cal50,0.013855,1024,1024,94.095
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,all keys,cal50,0.013855,1024,1024,94.095
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,video keys,cal75,0.11006,1024,0,0
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,other keys,cal75,0.11006,1024,1024,165.86
+llama_8k,8k,niah_multikey_2_row100_8k,answer position,all keys,cal75,0.11006,1024,1024,165.86
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,video keys,exact50,0.012959,7576576,0,0
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,other keys,exact50,0.012959,7576576,7.5766e+06,1.5112e+05
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,all keys,exact50,0.012959,7576576,7.5766e+06,1.5112e+05
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,video keys,exact75,0.087687,7576576,0,0
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,other keys,exact75,0.087687,7576576,7.5766e+06,4.7807e+05
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,all keys,exact75,0.087687,7576576,7.5766e+06,4.7807e+05
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,video keys,cal50,0.014394,7576576,0,0
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,other keys,cal50,0.014394,7576576,7.5766e+06,1.6238e+05
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,all keys,cal50,0.014394,7576576,7.5766e+06,1.6238e+05
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,video keys,cal75,0.11434,7576576,0,0
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,other keys,cal75,0.11434,7576576,7.5766e+06,5.467e+05
+llama_8k,8k,niah_multikey_3_row100_8k,all rows,all keys,cal75,0.11434,7576576,7.5766e+06,5.467e+05
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,video keys,exact50,0.012959,1024,0,0
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,other keys,exact50,0.012959,1024,1024,35.284
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,all keys,exact50,0.012959,1024,1024,35.284
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,video keys,exact75,0.087687,1024,0,0
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,other keys,exact75,0.087687,1024,1024,86.618
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,all keys,exact75,0.087687,1024,1024,86.618
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,video keys,cal50,0.014394,1024,0,0
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,other keys,cal50,0.014394,1024,1024,37.39
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,all keys,cal50,0.014394,1024,1024,37.39
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,video keys,cal75,0.11434,1024,0,0
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,other keys,cal75,0.11434,1024,1024,94.99
+llama_8k,8k,niah_multikey_3_row100_8k,answer position,all keys,cal75,0.11434,1024,1024,94.99
+llama_8k,8k,vt_row100_8k,all rows,video keys,exact50,0.011991,8141824,0,0
+llama_8k,8k,vt_row100_8k,all rows,other keys,exact50,0.011991,8141824,8.1418e+06,2.4415e+05
+llama_8k,8k,vt_row100_8k,all rows,all keys,exact50,0.011991,8141824,8.1418e+06,2.4415e+05
+llama_8k,8k,vt_row100_8k,all rows,video keys,exact75,0.099034,8141824,0,0
+llama_8k,8k,vt_row100_8k,all rows,other keys,exact75,0.099034,8141824,8.1418e+06,8.2398e+05
+llama_8k,8k,vt_row100_8k,all rows,all keys,exact75,0.099034,8141824,8.1418e+06,8.2398e+05
+llama_8k,8k,vt_row100_8k,all rows,video keys,cal50,0.013395,8141824,0,0
+llama_8k,8k,vt_row100_8k,all rows,other keys,cal50,0.013395,8141824,8.1418e+06,2.6293e+05
+llama_8k,8k,vt_row100_8k,all rows,all keys,cal50,0.013395,8141824,8.1418e+06,2.6293e+05
+llama_8k,8k,vt_row100_8k,all rows,video keys,cal75,0.1064,8141824,0,0
+llama_8k,8k,vt_row100_8k,all rows,other keys,cal75,0.1064,8141824,8.1418e+06,8.5282e+05
+llama_8k,8k,vt_row100_8k,all rows,all keys,cal75,0.1064,8141824,8.1418e+06,8.5282e+05
+llama_8k,8k,vt_row100_8k,answer position,video keys,exact50,0.011991,1024,0,0
+llama_8k,8k,vt_row100_8k,answer position,other keys,exact50,0.011991,1024,1024,43.013
+llama_8k,8k,vt_row100_8k,answer position,all keys,exact50,0.011991,1024,1024,43.013
+llama_8k,8k,vt_row100_8k,answer position,video keys,exact75,0.099034,1024,0,0
+llama_8k,8k,vt_row100_8k,answer position,other keys,exact75,0.099034,1024,1024,116.58
+llama_8k,8k,vt_row100_8k,answer position,all keys,exact75,0.099034,1024,1024,116.58
+llama_8k,8k,vt_row100_8k,answer position,video keys,cal50,0.013395,1024,0,0
+llama_8k,8k,vt_row100_8k,answer position,other keys,cal50,0.013395,1024,1024,45.137
+llama_8k,8k,vt_row100_8k,answer position,all keys,cal50,0.013395,1024,1024,45.137
+llama_8k,8k,vt_row100_8k,answer position,video keys,cal75,0.1064,1024,0,0
+llama_8k,8k,vt_row100_8k,answer position,other keys,cal75,0.1064,1024,1024,120.94
+llama_8k,8k,vt_row100_8k,answer position,all keys,cal75,0.1064,1024,1024,120.94
+qwen_A,16k,068rdc75mHM_16k,all rows,video keys,exact50,0.080413,12758816,5.1911e+06,6.5043e+05
+qwen_A,16k,068rdc75mHM_16k,all rows,other keys,exact50,0.080413,12758816,7.5677e+06,92981
+qwen_A,16k,068rdc75mHM_16k,all rows,all keys,exact50,0.080413,12758816,1.2759e+07,7.4341e+05
+qwen_A,16k,068rdc75mHM_16k,all rows,video keys,exact75,0.41993,12758816,5.1911e+06,1.7034e+06
+qwen_A,16k,068rdc75mHM_16k,all rows,other keys,exact75,0.41993,12758816,7.5677e+06,2.8226e+05
+qwen_A,16k,068rdc75mHM_16k,all rows,all keys,exact75,0.41993,12758816,1.2759e+07,1.9857e+06
+qwen_A,16k,068rdc75mHM_16k,text before video,video keys,exact50,0.080413,802816,0,0
+qwen_A,16k,068rdc75mHM_16k,text before video,other keys,exact50,0.080413,802816,8.0282e+05,2610.2
+qwen_A,16k,068rdc75mHM_16k,text before video,all keys,exact50,0.080413,802816,8.0282e+05,2610.2
+qwen_A,16k,068rdc75mHM_16k,text before video,video keys,exact75,0.41993,802816,0,0
+qwen_A,16k,068rdc75mHM_16k,text before video,other keys,exact75,0.41993,802816,8.0282e+05,15972
+qwen_A,16k,068rdc75mHM_16k,text before video,all keys,exact75,0.41993,802816,8.0282e+05,15972
+qwen_A,16k,068rdc75mHM_16k,video,video keys,exact50,0.080413,11063808,5.1448e+06,6.2519e+05
+qwen_A,16k,068rdc75mHM_16k,video,other keys,exact50,0.080413,11063808,5.919e+06,80816
+qwen_A,16k,068rdc75mHM_16k,video,all keys,exact50,0.080413,11063808,1.1064e+07,7.0601e+05
+qwen_A,16k,068rdc75mHM_16k,video,video keys,exact75,0.41993,11063808,5.1448e+06,1.6651e+06
+qwen_A,16k,068rdc75mHM_16k,video,other keys,exact75,0.41993,11063808,5.919e+06,2.3103e+05
+qwen_A,16k,068rdc75mHM_16k,video,all keys,exact75,0.41993,11063808,1.1064e+07,1.8961e+06
+qwen_A,16k,068rdc75mHM_16k,text after video,video keys,exact50,0.080413,892192,46333,25236
+qwen_A,16k,068rdc75mHM_16k,text after video,other keys,exact50,0.080413,892192,8.4586e+05,9554.8
+qwen_A,16k,068rdc75mHM_16k,text after video,all keys,exact50,0.080413,892192,8.9219e+05,34791
+qwen_A,16k,068rdc75mHM_16k,text after video,video keys,exact75,0.41993,892192,46333,38310
+qwen_A,16k,068rdc75mHM_16k,text after video,other keys,exact75,0.41993,892192,8.4586e+05,35257
+qwen_A,16k,068rdc75mHM_16k,text after video,all keys,exact75,0.41993,892192,8.9219e+05,73567
+qwen_A,16k,068rdc75mHM_16k,question,video keys,exact50,0.080413,80752,2891.5,1717.4
+qwen_A,16k,068rdc75mHM_16k,question,other keys,exact50,0.080413,80752,77861,1215.6
+qwen_A,16k,068rdc75mHM_16k,question,all keys,exact50,0.080413,80752,80752,2933
+qwen_A,16k,068rdc75mHM_16k,question,video keys,exact75,0.41993,80752,2891.5,2370.4
+qwen_A,16k,068rdc75mHM_16k,question,other keys,exact75,0.41993,80752,77861,3740.8
+qwen_A,16k,068rdc75mHM_16k,question,all keys,exact75,0.41993,80752,80752,6111.2
+qwen_A,16k,068rdc75mHM_16k,answer position,video keys,exact50,0.080413,784,18.776,15.336
+qwen_A,16k,068rdc75mHM_16k,answer position,other keys,exact50,0.080413,784,765.22,21.133
+qwen_A,16k,068rdc75mHM_16k,answer position,all keys,exact50,0.080413,784,784,36.469
+qwen_A,16k,068rdc75mHM_16k,answer position,video keys,exact75,0.41993,784,18.776,17.812
+qwen_A,16k,068rdc75mHM_16k,answer position,other keys,exact75,0.41993,784,765.22,55.022
+qwen_A,16k,068rdc75mHM_16k,answer position,all keys,exact75,0.41993,784,784,72.835
+qwen_A,8k,068rdc75mHM_8k,all rows,video keys,exact50,0.12299,6239072,1.9874e+06,2.2608e+05
+qwen_A,8k,068rdc75mHM_8k,all rows,other keys,exact50,0.12299,6239072,4.2517e+06,73922
+qwen_A,8k,068rdc75mHM_8k,all rows,all keys,exact50,0.12299,6239072,6.2391e+06,3e+05
+qwen_A,8k,068rdc75mHM_8k,all rows,video keys,exact75,0.76332,6239072,1.9874e+06,6.718e+05
+qwen_A,8k,068rdc75mHM_8k,all rows,other keys,exact75,0.76332,6239072,4.2517e+06,2.5539e+05
+qwen_A,8k,068rdc75mHM_8k,all rows,all keys,exact75,0.76332,6239072,6.2391e+06,9.2719e+05
+qwen_A,8k,068rdc75mHM_8k,text before video,video keys,exact50,0.12299,802816,0,0
+qwen_A,8k,068rdc75mHM_8k,text before video,other keys,exact50,0.12299,802816,8.0282e+05,4184.6
+qwen_A,8k,068rdc75mHM_8k,text before video,all keys,exact50,0.12299,802816,8.0282e+05,4184.6
+qwen_A,8k,068rdc75mHM_8k,text before video,video keys,exact75,0.76332,802816,0,0
+qwen_A,8k,068rdc75mHM_8k,text before video,other keys,exact75,0.76332,802816,8.0282e+05,29117
+qwen_A,8k,068rdc75mHM_8k,text before video,all keys,exact75,0.76332,802816,8.0282e+05,29117
+qwen_A,8k,068rdc75mHM_8k,video,video keys,exact50,0.12299,4544064,1.9499e+06,2.061e+05
+qwen_A,8k,068rdc75mHM_8k,video,other keys,exact50,0.12299,4544064,2.5941e+06,55469
+qwen_A,8k,068rdc75mHM_8k,video,all keys,exact50,0.12299,4544064,4.5441e+06,2.6157e+05
+qwen_A,8k,068rdc75mHM_8k,video,video keys,exact75,0.76332,4544064,1.9499e+06,6.3996e+05
+qwen_A,8k,068rdc75mHM_8k,video,other keys,exact75,0.76332,4544064,2.5941e+06,1.6965e+05
+qwen_A,8k,068rdc75mHM_8k,video,all keys,exact75,0.76332,4544064,4.5441e+06,8.0961e+05
+qwen_A,8k,068rdc75mHM_8k,text after video,video keys,exact50,0.12299,892192,37442,19977
+qwen_A,8k,068rdc75mHM_8k,text after video,other keys,exact50,0.12299,892192,8.5475e+05,14268
+qwen_A,8k,068rdc75mHM_8k,text after video,all keys,exact50,0.12299,892192,8.9219e+05,34245
+qwen_A,8k,068rdc75mHM_8k,text after video,video keys,exact75,0.76332,892192,37442,31838
+qwen_A,8k,068rdc75mHM_8k,text after video,other keys,exact75,0.76332,892192,8.5475e+05,56627
+qwen_A,8k,068rdc75mHM_8k,text after video,all keys,exact75,0.76332,892192,8.9219e+05,88466
+qwen_A,8k,068rdc75mHM_8k,question,video keys,exact50,0.12299,80752,2174.1,1346.8
+qwen_A,8k,068rdc75mHM_8k,question,other keys,exact50,0.12299,80752,78578,1768.3
+qwen_A,8k,068rdc75mHM_8k,question,all keys,exact50,0.12299,80752,80752,3115
+qwen_A,8k,068rdc75mHM_8k,question,video keys,exact75,0.76332,80752,2174.1,1890.5
+qwen_A,8k,068rdc75mHM_8k,question,other keys,exact75,0.76332,80752,78578,5928.3
+qwen_A,8k,068rdc75mHM_8k,question,all keys,exact75,0.76332,80752,80752,7818.8
+qwen_A,8k,068rdc75mHM_8k,answer position,video keys,exact50,0.12299,784,12.675,10.453
+qwen_A,8k,068rdc75mHM_8k,answer position,other keys,exact50,0.12299,784,771.32,23.425
+qwen_A,8k,068rdc75mHM_8k,answer position,all keys,exact50,0.12299,784,784,33.878
+qwen_A,8k,068rdc75mHM_8k,answer position,video keys,exact75,0.76332,784,12.675,12.229
+qwen_A,8k,068rdc75mHM_8k,answer position,other keys,exact75,0.76332,784,771.32,77.143
+qwen_A,8k,068rdc75mHM_8k,answer position,all keys,exact75,0.76332,784,784,89.372
+qwen_A,16k,0Jbc3Ah4EIc_16k,all rows,video keys,exact50,0.10872,12744704,5.5149e+06,7.7762e+05
+qwen_A,16k,0Jbc3Ah4EIc_16k,all rows,other keys,exact50,0.10872,12744704,7.2298e+06,1.0676e+05
+qwen_A,16k,0Jbc3Ah4EIc_16k,all rows,all keys,exact50,0.10872,12744704,1.2745e+07,8.8438e+05
+qwen_A,16k,0Jbc3Ah4EIc_16k,all rows,video keys,exact75,0.56975,12744704,5.5149e+06,2.0111e+06
+qwen_A,16k,0Jbc3Ah4EIc_16k,all rows,other keys,exact75,0.56975,12744704,7.2298e+06,3.0015e+05
+qwen_A,16k,0Jbc3Ah4EIc_16k,all rows,all keys,exact75,0.56975,12744704,1.2745e+07,2.3112e+06
+qwen_A,16k,0Jbc3Ah4EIc_16k,text before video,video keys,exact50,0.10872,802816,0,0
+qwen_A,16k,0Jbc3Ah4EIc_16k,text before video,other keys,exact50,0.10872,802816,8.0282e+05,4603.7
+qwen_A,16k,0Jbc3Ah4EIc_16k,text before video,all keys,exact50,0.10872,802816,8.0282e+05,4603.7
+qwen_A,16k,0Jbc3Ah4EIc_16k,text before video,video keys,exact75,0.56975,802816,0,0
+qwen_A,16k,0Jbc3Ah4EIc_16k,text before video,other keys,exact75,0.56975,802816,8.0282e+05,27404
+qwen_A,16k,0Jbc3Ah4EIc_16k,text before video,all keys,exact75,0.56975,802816,8.0282e+05,27404
+qwen_A,16k,0Jbc3Ah4EIc_16k,video,video keys,exact50,0.10872,11063808,5.4556e+06,7.4525e+05
+qwen_A,16k,0Jbc3Ah4EIc_16k,video,other keys,exact50,0.10872,11063808,5.6082e+06,89655
+qwen_A,16k,0Jbc3Ah4EIc_16k,video,all keys,exact50,0.10872,11063808,1.1064e+07,8.3491e+05
+qwen_A,16k,0Jbc3Ah4EIc_16k,video,video keys,exact75,0.56975,11063808,5.4556e+06,1.9617e+06
+qwen_A,16k,0Jbc3Ah4EIc_16k,video,other keys,exact75,0.56975,11063808,5.6082e+06,2.2791e+05
+qwen_A,16k,0Jbc3Ah4EIc_16k,video,all keys,exact75,0.56975,11063808,1.1064e+07,2.1896e+06
+qwen_A,16k,0Jbc3Ah4EIc_16k,text after video,video keys,exact50,0.10872,878080,59323,32364
+qwen_A,16k,0Jbc3Ah4EIc_16k,text after video,other keys,exact50,0.10872,878080,8.1876e+05,12500
+qwen_A,16k,0Jbc3Ah4EIc_16k,text after video,all keys,exact50,0.10872,878080,8.7808e+05,44864
+qwen_A,16k,0Jbc3Ah4EIc_16k,text after video,video keys,exact75,0.56975,878080,59323,49367
+qwen_A,16k,0Jbc3Ah4EIc_16k,text after video,other keys,exact75,0.56975,878080,8.1876e+05,44837
+qwen_A,16k,0Jbc3Ah4EIc_16k,text after video,all keys,exact75,0.56975,878080,8.7808e+05,94204
+qwen_A,16k,0Jbc3Ah4EIc_16k,question,video keys,exact50,0.10872,66640,3946.4,2449.5
+qwen_A,16k,0Jbc3Ah4EIc_16k,question,other keys,exact50,0.10872,66640,62694,1007.9
+qwen_A,16k,0Jbc3Ah4EIc_16k,question,all keys,exact50,0.10872,66640,66640,3457.4
+qwen_A,16k,0Jbc3Ah4EIc_16k,question,video keys,exact75,0.56975,66640,3946.4,3516.7
+qwen_A,16k,0Jbc3Ah4EIc_16k,question,other keys,exact75,0.56975,66640,62694,3180
+qwen_A,16k,0Jbc3Ah4EIc_16k,question,all keys,exact75,0.56975,66640,66640,6696.7
+qwen_A,16k,0Jbc3Ah4EIc_16k,answer position,video keys,exact50,0.10872,784,29.636,19.832
+qwen_A,16k,0Jbc3Ah4EIc_16k,answer position,other keys,exact50,0.10872,784,754.36,6.3871
+qwen_A,16k,0Jbc3Ah4EIc_16k,answer position,all keys,exact50,0.10872,784,784,26.219
+qwen_A,16k,0Jbc3Ah4EIc_16k,answer position,video keys,exact75,0.56975,784,29.636,27.563
+qwen_A,16k,0Jbc3Ah4EIc_16k,answer position,other keys,exact75,0.56975,784,754.36,21.29
+qwen_A,16k,0Jbc3Ah4EIc_16k,answer position,all keys,exact75,0.56975,784,784,48.852
+qwen_A,8k,0Jbc3Ah4EIc_8k,all rows,video keys,exact50,0.1546,6422528,2.142e+06,2.7634e+05
+qwen_A,8k,0Jbc3Ah4EIc_8k,all rows,other keys,exact50,0.1546,6422528,4.2805e+06,92964
+qwen_A,8k,0Jbc3Ah4EIc_8k,all rows,all keys,exact50,0.1546,6422528,6.4225e+06,3.693e+05
+qwen_A,8k,0Jbc3Ah4EIc_8k,all rows,video keys,exact75,0.94282,6422528,2.142e+06,7.8978e+05
+qwen_A,8k,0Jbc3Ah4EIc_8k,all rows,other keys,exact75,0.94282,6422528,4.2805e+06,2.9653e+05
+qwen_A,8k,0Jbc3Ah4EIc_8k,all rows,all keys,exact75,0.94282,6422528,6.4225e+06,1.0863e+06
+qwen_A,8k,0Jbc3Ah4EIc_8k,text before video,video keys,exact50,0.1546,802816,0,0
+qwen_A,8k,0Jbc3Ah4EIc_8k,text before video,other keys,exact50,0.1546,802816,8.0282e+05,7082.2
+qwen_A,8k,0Jbc3Ah4EIc_8k,text before video,all keys,exact50,0.1546,802816,8.0282e+05,7082.2
+qwen_A,8k,0Jbc3Ah4EIc_8k,text before video,video keys,exact75,0.94282,802816,0,0
+qwen_A,8k,0Jbc3Ah4EIc_8k,text before video,other keys,exact75,0.94282,802816,8.0282e+05,43414
+qwen_A,8k,0Jbc3Ah4EIc_8k,text before video,all keys,exact75,0.94282,802816,8.0282e+05,43414
+qwen_A,8k,0Jbc3Ah4EIc_8k,video,video keys,exact50,0.1546,4741632,2.0993e+06,2.5287e+05
+qwen_A,8k,0Jbc3Ah4EIc_8k,video,other keys,exact50,0.1546,4741632,2.6423e+06,67934
+qwen_A,8k,0Jbc3Ah4EIc_8k,video,all keys,exact50,0.1546,4741632,4.7416e+06,3.2081e+05
+qwen_A,8k,0Jbc3Ah4EIc_8k,video,video keys,exact75,0.94282,4741632,2.0993e+06,7.5328e+05
+qwen_A,8k,0Jbc3Ah4EIc_8k,video,other keys,exact75,0.94282,4741632,2.6423e+06,1.844e+05
+qwen_A,8k,0Jbc3Ah4EIc_8k,video,all keys,exact75,0.94282,4741632,4.7416e+06,9.3768e+05
+qwen_A,8k,0Jbc3Ah4EIc_8k,text after video,video keys,exact50,0.1546,878080,42694,23469
+qwen_A,8k,0Jbc3Ah4EIc_8k,text after video,other keys,exact50,0.1546,878080,8.3539e+05,17948
+qwen_A,8k,0Jbc3Ah4EIc_8k,text after video,all keys,exact50,0.1546,878080,8.7808e+05,41416
+qwen_A,8k,0Jbc3Ah4EIc_8k,text after video,video keys,exact75,0.94282,878080,42694,36500
+qwen_A,8k,0Jbc3Ah4EIc_8k,text after video,other keys,exact75,0.94282,878080,8.3539e+05,68721
+qwen_A,8k,0Jbc3Ah4EIc_8k,text after video,all keys,exact75,0.94282,878080,8.7808e+05,1.0522e+05
+qwen_A,8k,0Jbc3Ah4EIc_8k,question,video keys,exact50,0.1546,66640,2818,1697.2
+qwen_A,8k,0Jbc3Ah4EIc_8k,question,other keys,exact50,0.1546,66640,63822,1439.3
+qwen_A,8k,0Jbc3Ah4EIc_8k,question,all keys,exact50,0.1546,66640,66640,3136.5
+qwen_A,8k,0Jbc3Ah4EIc_8k,question,video keys,exact75,0.94282,66640,2818,2556.7
+qwen_A,8k,0Jbc3Ah4EIc_8k,question,other keys,exact75,0.94282,66640,63822,4771.5
+qwen_A,8k,0Jbc3Ah4EIc_8k,question,all keys,exact75,0.94282,66640,66640,7328.2
+qwen_A,8k,0Jbc3Ah4EIc_8k,answer position,video keys,exact50,0.1546,784,20.805,14.254
+qwen_A,8k,0Jbc3Ah4EIc_8k,answer position,other keys,exact50,0.1546,784,763.19,9.2382
+qwen_A,8k,0Jbc3Ah4EIc_8k,answer position,all keys,exact50,0.1546,784,784,23.492
+qwen_A,8k,0Jbc3Ah4EIc_8k,answer position,video keys,exact75,0.94282,784,20.805,19.796
+qwen_A,8k,0Jbc3Ah4EIc_8k,answer position,other keys,exact75,0.94282,784,763.19,36.235
+qwen_A,8k,0Jbc3Ah4EIc_8k,answer position,all keys,exact75,0.94282,784,784,56.031
+qwen_A,16k,0bwyCF0HteE_16k,all rows,video keys,exact50,0.084338,12718832,5.4831e+06,6.685e+05
+qwen_A,16k,0bwyCF0HteE_16k,all rows,other keys,exact50,0.084338,12718832,7.2357e+06,86209
+qwen_A,16k,0bwyCF0HteE_16k,all rows,all keys,exact50,0.084338,12718832,1.2719e+07,7.5471e+05
+qwen_A,16k,0bwyCF0HteE_16k,all rows,video keys,exact75,0.45895,12718832,5.4831e+06,1.8098e+06
+qwen_A,16k,0bwyCF0HteE_16k,all rows,other keys,exact75,0.45895,12718832,7.2357e+06,2.4738e+05
+qwen_A,16k,0bwyCF0HteE_16k,all rows,all keys,exact75,0.45895,12718832,1.2719e+07,2.0572e+06
+qwen_A,16k,0bwyCF0HteE_16k,text before video,video keys,exact50,0.084338,802816,0,0
+qwen_A,16k,0bwyCF0HteE_16k,text before video,other keys,exact50,0.084338,802816,8.0282e+05,4626.7
+qwen_A,16k,0bwyCF0HteE_16k,text before video,all keys,exact50,0.084338,802816,8.0282e+05,4626.7
+qwen_A,16k,0bwyCF0HteE_16k,text before video,video keys,exact75,0.45895,802816,0,0
+qwen_A,16k,0bwyCF0HteE_16k,text before video,other keys,exact75,0.45895,802816,8.0282e+05,26542
+qwen_A,16k,0bwyCF0HteE_16k,text before video,all keys,exact75,0.45895,802816,8.0282e+05,26542
+qwen_A,16k,0bwyCF0HteE_16k,video,video keys,exact50,0.084338,11063808,5.4237e+06,6.4054e+05
+qwen_A,16k,0bwyCF0HteE_16k,video,other keys,exact50,0.084338,11063808,5.6401e+06,72082
+qwen_A,16k,0bwyCF0HteE_16k,video,all keys,exact50,0.084338,11063808,1.1064e+07,7.1262e+05
+qwen_A,16k,0bwyCF0HteE_16k,video,video keys,exact75,0.45895,11063808,5.4237e+06,1.7645e+06
+qwen_A,16k,0bwyCF0HteE_16k,video,other keys,exact75,0.45895,11063808,5.6401e+06,1.8666e+05
+qwen_A,16k,0bwyCF0HteE_16k,video,all keys,exact75,0.45895,11063808,1.1064e+07,1.9511e+06
+qwen_A,16k,0bwyCF0HteE_16k,text after video,video keys,exact50,0.084338,852208,59463,27958
+qwen_A,16k,0bwyCF0HteE_16k,text after video,other keys,exact50,0.084338,852208,7.9274e+05,9500.4
+qwen_A,16k,0bwyCF0HteE_16k,text after video,all keys,exact50,0.084338,852208,8.5221e+05,37458
+qwen_A,16k,0bwyCF0HteE_16k,text after video,video keys,exact75,0.45895,852208,59463,45288
+qwen_A,16k,0bwyCF0HteE_16k,text after video,other keys,exact75,0.45895,852208,7.9274e+05,34181
+qwen_A,16k,0bwyCF0HteE_16k,text after video,all keys,exact75,0.45895,852208,8.5221e+05,79469
+qwen_A,16k,0bwyCF0HteE_16k,question,video keys,exact50,0.084338,40768,2600.7,1209.2
+qwen_A,16k,0bwyCF0HteE_16k,question,other keys,exact50,0.084338,40768,38167,422.21
+qwen_A,16k,0bwyCF0HteE_16k,question,all keys,exact50,0.084338,40768,40768,1631.4
+qwen_A,16k,0bwyCF0HteE_16k,question,video keys,exact75,0.45895,40768,2600.7,2060.2
+qwen_A,16k,0bwyCF0HteE_16k,question,other keys,exact75,0.45895,40768,38167,1316.5
+qwen_A,16k,0bwyCF0HteE_16k,question,all keys,exact75,0.45895,40768,40768,3376.7
+qwen_A,16k,0bwyCF0HteE_16k,answer position,video keys,exact50,0.084338,784,28.376,15.248
+qwen_A,16k,0bwyCF0HteE_16k,answer position,other keys,exact50,0.084338,784,755.62,4.7633
+qwen_A,16k,0bwyCF0HteE_16k,answer position,all keys,exact50,0.084338,784,784,20.011
+qwen_A,16k,0bwyCF0HteE_16k,answer position,video keys,exact75,0.45895,784,28.376,24.463
+qwen_A,16k,0bwyCF0HteE_16k,answer position,other keys,exact75,0.45895,784,755.62,18.954
+qwen_A,16k,0bwyCF0HteE_16k,answer position,all keys,exact75,0.45895,784,784,43.417
+qwen_A,8k,0bwyCF0HteE_8k,all rows,video keys,exact50,0.13129,6396656,2.1135e+06,2.6071e+05
+qwen_A,8k,0bwyCF0HteE_8k,all rows,other keys,exact50,0.13129,6396656,4.2832e+06,77838
+qwen_A,8k,0bwyCF0HteE_8k,all rows,all keys,exact50,0.13129,6396656,6.3967e+06,3.3854e+05
+qwen_A,8k,0bwyCF0HteE_8k,all rows,video keys,exact75,0.78726,6396656,2.1135e+06,7.65e+05
+qwen_A,8k,0bwyCF0HteE_8k,all rows,other keys,exact75,0.78726,6396656,4.2832e+06,2.4529e+05
+qwen_A,8k,0bwyCF0HteE_8k,all rows,all keys,exact75,0.78726,6396656,6.3967e+06,1.0103e+06
+qwen_A,8k,0bwyCF0HteE_8k,text before video,video keys,exact50,0.13129,802816,0,0
+qwen_A,8k,0bwyCF0HteE_8k,text before video,other keys,exact50,0.13129,802816,8.0282e+05,7661.9
+qwen_A,8k,0bwyCF0HteE_8k,text before video,all keys,exact50,0.13129,802816,8.0282e+05,7661.9
+qwen_A,8k,0bwyCF0HteE_8k,text before video,video keys,exact75,0.78726,802816,0,0
+qwen_A,8k,0bwyCF0HteE_8k,text before video,other keys,exact75,0.78726,802816,8.0282e+05,41963
+qwen_A,8k,0bwyCF0HteE_8k,text before video,all keys,exact75,0.78726,802816,8.0282e+05,41963
+qwen_A,8k,0bwyCF0HteE_8k,video,video keys,exact50,0.13129,4741632,2.071e+06,2.3949e+05
+qwen_A,8k,0bwyCF0HteE_8k,video,other keys,exact50,0.13129,4741632,2.6706e+06,54981
+qwen_A,8k,0bwyCF0HteE_8k,video,all keys,exact50,0.13129,4741632,4.7416e+06,2.9447e+05
+qwen_A,8k,0bwyCF0HteE_8k,video,video keys,exact75,0.78726,4741632,2.071e+06,7.3107e+05
+qwen_A,8k,0bwyCF0HteE_8k,video,other keys,exact75,0.78726,4741632,2.6706e+06,1.4675e+05
+qwen_A,8k,0bwyCF0HteE_8k,video,all keys,exact75,0.78726,4741632,4.7416e+06,8.7782e+05
+qwen_A,8k,0bwyCF0HteE_8k,text after video,video keys,exact50,0.13129,852208,42501,21221
+qwen_A,8k,0bwyCF0HteE_8k,text after video,other keys,exact50,0.13129,852208,8.0971e+05,15195
+qwen_A,8k,0bwyCF0HteE_8k,text after video,all keys,exact50,0.13129,852208,8.5221e+05,36416
+qwen_A,8k,0bwyCF0HteE_8k,text after video,video keys,exact75,0.78726,852208,42501,33938
+qwen_A,8k,0bwyCF0HteE_8k,text after video,other keys,exact75,0.78726,852208,8.0971e+05,56575
+qwen_A,8k,0bwyCF0HteE_8k,text after video,all keys,exact75,0.78726,852208,8.5221e+05,90514
+qwen_A,8k,0bwyCF0HteE_8k,question,video keys,exact50,0.13129,40768,1979.6,986.51
+qwen_A,8k,0bwyCF0HteE_8k,question,other keys,exact50,0.13129,40768,38788,604.94
+qwen_A,8k,0bwyCF0HteE_8k,question,all keys,exact50,0.13129,40768,40768,1591.5
+qwen_A,8k,0bwyCF0HteE_8k,question,video keys,exact75,0.78726,40768,1979.6,1651
+qwen_A,8k,0bwyCF0HteE_8k,question,other keys,exact75,0.78726,40768,38788,2089.8
+qwen_A,8k,0bwyCF0HteE_8k,question,all keys,exact75,0.78726,40768,40768,3740.9
+qwen_A,8k,0bwyCF0HteE_8k,answer position,video keys,exact50,0.13129,784,24.08,14.073
+qwen_A,8k,0bwyCF0HteE_8k,answer position,other keys,exact50,0.13129,784,759.92,7.4024
+qwen_A,8k,0bwyCF0HteE_8k,answer position,all keys,exact50,0.13129,784,784,21.476
+qwen_A,8k,0bwyCF0HteE_8k,answer position,video keys,exact75,0.78726,784,24.08,21.541
+qwen_A,8k,0bwyCF0HteE_8k,answer position,other keys,exact75,0.78726,784,759.92,34.184
+qwen_A,8k,0bwyCF0HteE_8k,answer position,all keys,exact75,0.78726,784,784,55.724
+qwen_A,16k,0iED5BojTMI_16k,all rows,video keys,exact50,0.14499,12764304,5.8935e+06,9.3365e+05
+qwen_A,16k,0iED5BojTMI_16k,all rows,other keys,exact50,0.14499,12764304,6.8708e+06,1.2516e+05
+qwen_A,16k,0iED5BojTMI_16k,all rows,all keys,exact50,0.14499,12764304,1.2764e+07,1.0588e+06
+qwen_A,16k,0iED5BojTMI_16k,all rows,video keys,exact75,0.64287,12764304,5.8935e+06,2.2575e+06
+qwen_A,16k,0iED5BojTMI_16k,all rows,other keys,exact75,0.64287,12764304,6.8708e+06,3.0412e+05
+qwen_A,16k,0iED5BojTMI_16k,all rows,all keys,exact75,0.64287,12764304,1.2764e+07,2.5616e+06
+qwen_A,16k,0iED5BojTMI_16k,text before video,video keys,exact50,0.14499,802816,0,0
+qwen_A,16k,0iED5BojTMI_16k,text before video,other keys,exact50,0.14499,802816,8.0282e+05,5282.3
+qwen_A,16k,0iED5BojTMI_16k,text before video,all keys,exact50,0.14499,802816,8.0282e+05,5282.3
+qwen_A,16k,0iED5BojTMI_16k,text before video,video keys,exact75,0.64287,802816,0,0
+qwen_A,16k,0iED5BojTMI_16k,text before video,other keys,exact75,0.64287,802816,8.0282e+05,26102
+qwen_A,16k,0iED5BojTMI_16k,text before video,all keys,exact75,0.64287,802816,8.0282e+05,26102
+qwen_A,16k,0iED5BojTMI_16k,video,video keys,exact50,0.14499,11458944,5.847e+06,9.1056e+05
+qwen_A,16k,0iED5BojTMI_16k,video,other keys,exact50,0.14499,11458944,5.6119e+06,1.1353e+05
+qwen_A,16k,0iED5BojTMI_16k,video,all keys,exact50,0.14499,11458944,1.1459e+07,1.0241e+06
+qwen_A,16k,0iED5BojTMI_16k,video,video keys,exact75,0.64287,11458944,5.847e+06,2.2203e+06
+qwen_A,16k,0iED5BojTMI_16k,video,other keys,exact75,0.64287,11458944,5.6119e+06,2.5745e+05
+qwen_A,16k,0iED5BojTMI_16k,video,all keys,exact75,0.64287,11458944,1.1459e+07,2.4778e+06
+qwen_A,16k,0iED5BojTMI_16k,text after video,video keys,exact50,0.14499,502544,46429,23089
+qwen_A,16k,0iED5BojTMI_16k,text after video,other keys,exact50,0.14499,502544,4.5611e+05,6355.9
+qwen_A,16k,0iED5BojTMI_16k,text after video,all keys,exact50,0.14499,502544,5.0254e+05,29445
+qwen_A,16k,0iED5BojTMI_16k,text after video,video keys,exact75,0.64287,502544,46429,37105
+qwen_A,16k,0iED5BojTMI_16k,text after video,other keys,exact75,0.64287,502544,4.5611e+05,20564
+qwen_A,16k,0iED5BojTMI_16k,text after video,all keys,exact75,0.64287,502544,5.0254e+05,57669
+qwen_A,16k,0iED5BojTMI_16k,question,video keys,exact50,0.14499,39200,2814.6,1813.6
+qwen_A,16k,0iED5BojTMI_16k,question,other keys,exact50,0.14499,39200,36385,675.23
+qwen_A,16k,0iED5BojTMI_16k,question,all keys,exact50,0.14499,39200,39200,2488.9
+qwen_A,16k,0iED5BojTMI_16k,question,video keys,exact75,0.64287,39200,2814.6,2528.5
+qwen_A,16k,0iED5BojTMI_16k,question,other keys,exact75,0.64287,39200,36385,2109.1
+qwen_A,16k,0iED5BojTMI_16k,question,all keys,exact75,0.64287,39200,39200,4637.6
+qwen_A,16k,0iED5BojTMI_16k,answer position,video keys,exact50,0.14499,784,33.484,26.348
+qwen_A,16k,0iED5BojTMI_16k,answer position,other keys,exact50,0.14499,784,750.52,15.514
+qwen_A,16k,0iED5BojTMI_16k,answer position,all keys,exact50,0.14499,784,784,41.862
+qwen_A,16k,0iED5BojTMI_16k,answer position,video keys,exact75,0.64287,784,33.484,32.036
+qwen_A,16k,0iED5BojTMI_16k,answer position,other keys,exact75,0.64287,784,750.52,60.623
+qwen_A,16k,0iED5BojTMI_16k,answer position,all keys,exact75,0.64287,784,784,92.66
+qwen_A,8k,0iED5BojTMI_8k,all rows,video keys,exact50,0.22538,6244560,2.2989e+06,3.3978e+05
+qwen_A,8k,0iED5BojTMI_8k,all rows,other keys,exact50,0.22538,6244560,3.9456e+06,1.027e+05
+qwen_A,8k,0iED5BojTMI_8k,all rows,all keys,exact50,0.22538,6244560,6.2446e+06,4.4248e+05
+qwen_A,8k,0iED5BojTMI_8k,all rows,video keys,exact75,1,6244560,2.2989e+06,8.6021e+05
+qwen_A,8k,0iED5BojTMI_8k,all rows,other keys,exact75,1,6244560,3.9456e+06,2.6172e+05
+qwen_A,8k,0iED5BojTMI_8k,all rows,all keys,exact75,1,6244560,6.2446e+06,1.1219e+06
+qwen_A,8k,0iED5BojTMI_8k,text before video,video keys,exact50,0.22538,802816,0,0
+qwen_A,8k,0iED5BojTMI_8k,text before video,other keys,exact50,0.22538,802816,8.0282e+05,8945.1
+qwen_A,8k,0iED5BojTMI_8k,text before video,all keys,exact50,0.22538,802816,8.0282e+05,8945.1
+qwen_A,8k,0iED5BojTMI_8k,text before video,video keys,exact75,1,802816,0,0
+qwen_A,8k,0iED5BojTMI_8k,text before video,other keys,exact75,1,802816,8.0282e+05,38995
+qwen_A,8k,0iED5BojTMI_8k,text before video,all keys,exact75,1,802816,8.0282e+05,38995
+qwen_A,8k,0iED5BojTMI_8k,video,video keys,exact50,0.22538,4939200,2.2641e+06,3.2214e+05
+qwen_A,8k,0iED5BojTMI_8k,video,other keys,exact50,0.22538,4939200,2.6751e+06,83698
+qwen_A,8k,0iED5BojTMI_8k,video,all keys,exact50,0.22538,4939200,4.9392e+06,4.0584e+05
+qwen_A,8k,0iED5BojTMI_8k,video,video keys,exact75,1,4939200,2.2641e+06,8.3221e+05
+qwen_A,8k,0iED5BojTMI_8k,video,other keys,exact75,1,4939200,2.6751e+06,1.904e+05
+qwen_A,8k,0iED5BojTMI_8k,video,all keys,exact75,1,4939200,4.9392e+06,1.0226e+06
+qwen_A,8k,0iED5BojTMI_8k,text after video,video keys,exact50,0.22538,502544,34787,17640
+qwen_A,8k,0iED5BojTMI_8k,text after video,other keys,exact50,0.22538,502544,4.6776e+05,10061
+qwen_A,8k,0iED5BojTMI_8k,text after video,all keys,exact50,0.22538,502544,5.0254e+05,27701
+qwen_A,8k,0iED5BojTMI_8k,text after video,video keys,exact75,1,502544,34787,27993
+qwen_A,8k,0iED5BojTMI_8k,text after video,other keys,exact75,1,502544,4.6776e+05,32325
+qwen_A,8k,0iED5BojTMI_8k,text after video,all keys,exact75,1,502544,5.0254e+05,60318
+qwen_A,8k,0iED5BojTMI_8k,question,video keys,exact50,0.22538,39200,2109.4,1433.4
+qwen_A,8k,0iED5BojTMI_8k,question,other keys,exact50,0.22538,39200,37091,1083.9
+qwen_A,8k,0iED5BojTMI_8k,question,all keys,exact50,0.22538,39200,39200,2517.3
+qwen_A,8k,0iED5BojTMI_8k,question,video keys,exact75,1,39200,2109.4,1931.1
+qwen_A,8k,0iED5BojTMI_8k,question,other keys,exact75,1,39200,37091,3214.9
+qwen_A,8k,0iED5BojTMI_8k,question,all keys,exact75,1,39200,39200,5146
+qwen_A,8k,0iED5BojTMI_8k,answer position,video keys,exact50,0.22538,784,21.368,18.155
+qwen_A,8k,0iED5BojTMI_8k,answer position,other keys,exact50,0.22538,784,762.63,24.462
+qwen_A,8k,0iED5BojTMI_8k,answer position,all keys,exact50,0.22538,784,784,42.617
+qwen_A,8k,0iED5BojTMI_8k,answer position,video keys,exact75,1,784,21.368,20.948
+qwen_A,8k,0iED5BojTMI_8k,answer position,other keys,exact75,1,784,762.63,87.194
+qwen_A,8k,0iED5BojTMI_8k,answer position,all keys,exact75,1,784,784,108.14
+qwen_A,16k,0kRsiSdDFYg_16k,all rows,video keys,exact50,0.097061,12735296,5.0869e+06,7.8087e+05
+qwen_A,16k,0kRsiSdDFYg_16k,all rows,other keys,exact50,0.097061,12735296,7.6483e+06,1.285e+05
+qwen_A,16k,0kRsiSdDFYg_16k,all rows,all keys,exact50,0.097061,12735296,1.2735e+07,9.0937e+05
+qwen_A,16k,0kRsiSdDFYg_16k,all rows,video keys,exact75,0.51217,12735296,5.0869e+06,2.0059e+06
+qwen_A,16k,0kRsiSdDFYg_16k,all rows,other keys,exact75,0.51217,12735296,7.6483e+06,3.709e+05
+qwen_A,16k,0kRsiSdDFYg_16k,all rows,all keys,exact75,0.51217,12735296,1.2735e+07,2.3768e+06
+qwen_A,16k,0kRsiSdDFYg_16k,text before video,video keys,exact50,0.097061,802816,0,0
+qwen_A,16k,0kRsiSdDFYg_16k,text before video,other keys,exact50,0.097061,802816,8.0282e+05,4726.7
+qwen_A,16k,0kRsiSdDFYg_16k,text before video,all keys,exact50,0.097061,802816,8.0282e+05,4726.7
+qwen_A,16k,0kRsiSdDFYg_16k,text before video,video keys,exact75,0.51217,802816,0,0
+qwen_A,16k,0kRsiSdDFYg_16k,text before video,other keys,exact75,0.51217,802816,8.0282e+05,27030
+qwen_A,16k,0kRsiSdDFYg_16k,text before video,all keys,exact75,0.51217,802816,8.0282e+05,27030
+qwen_A,16k,0kRsiSdDFYg_16k,video,video keys,exact50,0.097061,11063808,5.0402e+06,7.5454e+05
+qwen_A,16k,0kRsiSdDFYg_16k,video,other keys,exact50,0.097061,11063808,6.0236e+06,1.1006e+05
+qwen_A,16k,0kRsiSdDFYg_16k,video,all keys,exact50,0.097061,11063808,1.1064e+07,8.646e+05
+qwen_A,16k,0kRsiSdDFYg_16k,video,video keys,exact75,0.51217,11063808,5.0402e+06,1.9661e+06
+qwen_A,16k,0kRsiSdDFYg_16k,video,other keys,exact75,0.51217,11063808,6.0236e+06,2.956e+05
+qwen_A,16k,0kRsiSdDFYg_16k,video,all keys,exact75,0.51217,11063808,1.1064e+07,2.2617e+06
+qwen_A,16k,0kRsiSdDFYg_16k,text after video,video keys,exact50,0.097061,868672,46774,26327
+qwen_A,16k,0kRsiSdDFYg_16k,text after video,other keys,exact50,0.097061,868672,8.219e+05,13715
+qwen_A,16k,0kRsiSdDFYg_16k,text after video,all keys,exact50,0.097061,868672,8.6867e+05,40042
+qwen_A,16k,0kRsiSdDFYg_16k,text after video,video keys,exact75,0.51217,868672,46774,39817
+qwen_A,16k,0kRsiSdDFYg_16k,text after video,other keys,exact75,0.51217,868672,8.219e+05,48275
+qwen_A,16k,0kRsiSdDFYg_16k,text after video,all keys,exact75,0.51217,868672,8.6867e+05,88092
+qwen_A,16k,0kRsiSdDFYg_16k,question,video keys,exact50,0.097061,57232,3771.7,1732.1
+qwen_A,16k,0kRsiSdDFYg_16k,question,other keys,exact50,0.097061,57232,53460,749.31
+qwen_A,16k,0kRsiSdDFYg_16k,question,all keys,exact50,0.097061,57232,57232,2481.5
+qwen_A,16k,0kRsiSdDFYg_16k,question,video keys,exact75,0.51217,57232,3771.7,2927.1
+qwen_A,16k,0kRsiSdDFYg_16k,question,other keys,exact75,0.51217,57232,53460,2128.3
+qwen_A,16k,0kRsiSdDFYg_16k,question,all keys,exact75,0.51217,57232,57232,5055.3
+qwen_A,16k,0kRsiSdDFYg_16k,answer position,video keys,exact50,0.097061,784,18.734,11.899
+qwen_A,16k,0kRsiSdDFYg_16k,answer position,other keys,exact50,0.097061,784,765.27,5.8132
+qwen_A,16k,0kRsiSdDFYg_16k,answer position,all keys,exact50,0.097061,784,784,17.713
+qwen_A,16k,0kRsiSdDFYg_16k,answer position,video keys,exact75,0.51217,784,18.734,17.369
+qwen_A,16k,0kRsiSdDFYg_16k,answer position,other keys,exact75,0.51217,784,765.27,18.3
+qwen_A,16k,0kRsiSdDFYg_16k,answer position,all keys,exact75,0.51217,784,784,35.669
+qwen_A,8k,0kRsiSdDFYg_8k,all rows,video keys,exact50,0.15106,6413120,2.0175e+06,2.9137e+05
+qwen_A,8k,0kRsiSdDFYg_8k,all rows,other keys,exact50,0.15106,6413120,4.3956e+06,1.0671e+05
+qwen_A,8k,0kRsiSdDFYg_8k,all rows,all keys,exact50,0.15106,6413120,6.4131e+06,3.9808e+05
+qwen_A,8k,0kRsiSdDFYg_8k,all rows,video keys,exact75,0.89154,6413120,2.0175e+06,8.4459e+05
+qwen_A,8k,0kRsiSdDFYg_8k,all rows,other keys,exact75,0.89154,6413120,4.3956e+06,3.4028e+05
+qwen_A,8k,0kRsiSdDFYg_8k,all rows,all keys,exact75,0.89154,6413120,6.4131e+06,1.1849e+06
+qwen_A,8k,0kRsiSdDFYg_8k,text before video,video keys,exact50,0.15106,802816,0,0
+qwen_A,8k,0kRsiSdDFYg_8k,text before video,other keys,exact50,0.15106,802816,8.0282e+05,7743.2
+qwen_A,8k,0kRsiSdDFYg_8k,text before video,all keys,exact50,0.15106,802816,8.0282e+05,7743.2
+qwen_A,8k,0kRsiSdDFYg_8k,text before video,video keys,exact75,0.89154,802816,0,0
+qwen_A,8k,0kRsiSdDFYg_8k,text before video,other keys,exact75,0.89154,802816,8.0282e+05,43950
+qwen_A,8k,0kRsiSdDFYg_8k,text before video,all keys,exact75,0.89154,802816,8.0282e+05,43950
+qwen_A,8k,0kRsiSdDFYg_8k,video,video keys,exact50,0.15106,4741632,1.9888e+06,2.7391e+05
+qwen_A,8k,0kRsiSdDFYg_8k,video,other keys,exact50,0.15106,4741632,2.7528e+06,77759
+qwen_A,8k,0kRsiSdDFYg_8k,video,all keys,exact50,0.15106,4741632,4.7416e+06,3.5167e+05
+qwen_A,8k,0kRsiSdDFYg_8k,video,video keys,exact75,0.89154,4741632,1.9888e+06,8.1903e+05
+qwen_A,8k,0kRsiSdDFYg_8k,video,other keys,exact75,0.89154,4741632,2.7528e+06,2.1638e+05
+qwen_A,8k,0kRsiSdDFYg_8k,video,all keys,exact75,0.89154,4741632,4.7416e+06,1.0354e+06
+qwen_A,8k,0kRsiSdDFYg_8k,text after video,video keys,exact50,0.15106,868672,28660,17463
+qwen_A,8k,0kRsiSdDFYg_8k,text after video,other keys,exact50,0.15106,868672,8.4001e+05,21206
+qwen_A,8k,0kRsiSdDFYg_8k,text after video,all keys,exact50,0.15106,868672,8.6867e+05,38669
+qwen_A,8k,0kRsiSdDFYg_8k,text after video,video keys,exact75,0.89154,868672,28660,25568
+qwen_A,8k,0kRsiSdDFYg_8k,text after video,other keys,exact75,0.89154,868672,8.4001e+05,79945
+qwen_A,8k,0kRsiSdDFYg_8k,text after video,all keys,exact75,0.89154,868672,8.6867e+05,1.0551e+05
+qwen_A,8k,0kRsiSdDFYg_8k,question,video keys,exact50,0.15106,57232,2984.7,1404.1
+qwen_A,8k,0kRsiSdDFYg_8k,question,other keys,exact50,0.15106,57232,54247,1072.5
+qwen_A,8k,0kRsiSdDFYg_8k,question,all keys,exact50,0.15106,57232,57232,2476.6
+qwen_A,8k,0kRsiSdDFYg_8k,question,video keys,exact75,0.89154,57232,2984.7,2401.9
+qwen_A,8k,0kRsiSdDFYg_8k,question,other keys,exact75,0.89154,57232,54247,3395.7
+qwen_A,8k,0kRsiSdDFYg_8k,question,all keys,exact75,0.89154,57232,57232,5797.6
+qwen_A,8k,0kRsiSdDFYg_8k,answer position,video keys,exact50,0.15106,784,13.736,9.4337
+qwen_A,8k,0kRsiSdDFYg_8k,answer position,other keys,exact50,0.15106,784,770.26,8.7225
+qwen_A,8k,0kRsiSdDFYg_8k,answer position,all keys,exact50,0.15106,784,784,18.156
+qwen_A,8k,0kRsiSdDFYg_8k,answer position,video keys,exact75,0.89154,784,13.736,12.863
+qwen_A,8k,0kRsiSdDFYg_8k,answer position,other keys,exact75,0.89154,784,770.26,34.235
+qwen_A,8k,0kRsiSdDFYg_8k,answer position,all keys,exact75,0.89154,784,784,47.098
+qwen_B,16k,068rdc75mHM_16k,all rows,video keys,exact50,0.04311,12788608,5.7644e+06,5.234e+05
+qwen_B,16k,068rdc75mHM_16k,all rows,other keys,exact50,0.04311,12788608,7.0242e+06,7740.7
+qwen_B,16k,068rdc75mHM_16k,all rows,all keys,exact50,0.04311,12788608,1.2789e+07,5.3114e+05
+qwen_B,16k,068rdc75mHM_16k,all rows,video keys,exact75,0.28444,12788608,5.7644e+06,1.5835e+06
+qwen_B,16k,068rdc75mHM_16k,all rows,other keys,exact75,0.28444,12788608,7.0242e+06,40424
+qwen_B,16k,068rdc75mHM_16k,all rows,all keys,exact75,0.28444,12788608,1.2789e+07,1.624e+06
+qwen_B,16k,068rdc75mHM_16k,text before video,video keys,exact50,0.04311,11760,0,0
+qwen_B,16k,068rdc75mHM_16k,text before video,other keys,exact50,0.04311,11760,11760,0
+qwen_B,16k,068rdc75mHM_16k,text before video,all keys,exact50,0.04311,11760,11760,0
+qwen_B,16k,068rdc75mHM_16k,text before video,video keys,exact75,0.28444,11760,0,0
+qwen_B,16k,068rdc75mHM_16k,text before video,other keys,exact75,0.28444,11760,11760,0
+qwen_B,16k,068rdc75mHM_16k,text before video,all keys,exact75,0.28444,11760,11760,0
+qwen_B,16k,068rdc75mHM_16k,video,video keys,exact50,0.04311,11063808,5.6435e+06,4.7284e+05
+qwen_B,16k,068rdc75mHM_16k,video,other keys,exact50,0.04311,11063808,5.4203e+06,0
+qwen_B,16k,068rdc75mHM_16k,video,all keys,exact50,0.04311,11063808,1.1064e+07,4.7284e+05
+qwen_B,16k,068rdc75mHM_16k,video,video keys,exact75,0.28444,11063808,5.6435e+06,1.4975e+06
+qwen_B,16k,068rdc75mHM_16k,video,other keys,exact75,0.28444,11063808,5.4203e+06,0
+qwen_B,16k,068rdc75mHM_16k,video,all keys,exact75,0.28444,11063808,1.1064e+07,1.4975e+06
+qwen_B,16k,068rdc75mHM_16k,text after video,video keys,exact50,0.04311,1713040,1.2087e+05,50559
+qwen_B,16k,068rdc75mHM_16k,text after video,other keys,exact50,0.04311,1713040,1.5922e+06,7740.8
+qwen_B,16k,068rdc75mHM_16k,text after video,all keys,exact50,0.04311,1713040,1.713e+06,58300
+qwen_B,16k,068rdc75mHM_16k,text after video,video keys,exact75,0.28444,1713040,1.2087e+05,85999
+qwen_B,16k,068rdc75mHM_16k,text after video,other keys,exact75,0.28444,1713040,1.5922e+06,40424
+qwen_B,16k,068rdc75mHM_16k,text after video,all keys,exact75,0.28444,1713040,1.713e+06,1.2642e+05
+qwen_B,16k,068rdc75mHM_16k,question,video keys,exact50,0.04311,99568,5136.9,2748.4
+qwen_B,16k,068rdc75mHM_16k,question,other keys,exact50,0.04311,99568,94431,1066.8
+qwen_B,16k,068rdc75mHM_16k,question,all keys,exact50,0.04311,99568,99568,3815.2
+qwen_B,16k,068rdc75mHM_16k,question,video keys,exact75,0.28444,99568,5136.9,4125.7
+qwen_B,16k,068rdc75mHM_16k,question,other keys,exact75,0.28444,99568,94431,3711.9
+qwen_B,16k,068rdc75mHM_16k,question,all keys,exact75,0.28444,99568,99568,7837.6
+qwen_B,16k,068rdc75mHM_16k,answer position,video keys,exact50,0.04311,784,29.555,16.858
+qwen_B,16k,068rdc75mHM_16k,answer position,other keys,exact50,0.04311,784,754.44,6.3446
+qwen_B,16k,068rdc75mHM_16k,answer position,all keys,exact50,0.04311,784,784,23.203
+qwen_B,16k,068rdc75mHM_16k,answer position,video keys,exact75,0.28444,784,29.555,23.236
+qwen_B,16k,068rdc75mHM_16k,answer position,other keys,exact75,0.28444,784,754.44,20.582
+qwen_B,16k,068rdc75mHM_16k,answer position,all keys,exact75,0.28444,784,784,43.818
+qwen_B,8k,068rdc75mHM_8k,all rows,video keys,exact50,0.068507,6268864,2.3458e+06,1.9939e+05
+qwen_B,8k,068rdc75mHM_8k,all rows,other keys,exact50,0.068507,6268864,3.9231e+06,11674
+qwen_B,8k,068rdc75mHM_8k,all rows,all keys,exact50,0.068507,6268864,6.2689e+06,2.1107e+05
+qwen_B,8k,068rdc75mHM_8k,all rows,video keys,exact75,0.53531,6268864,2.3458e+06,6.4821e+05
+qwen_B,8k,068rdc75mHM_8k,all rows,other keys,exact75,0.53531,6268864,3.9231e+06,70345
+qwen_B,8k,068rdc75mHM_8k,all rows,all keys,exact75,0.53531,6268864,6.2689e+06,7.1856e+05
+qwen_B,8k,068rdc75mHM_8k,text before video,video keys,exact50,0.068507,11760,0,0
+qwen_B,8k,068rdc75mHM_8k,text before video,other keys,exact50,0.068507,11760,11760,0
+qwen_B,8k,068rdc75mHM_8k,text before video,all keys,exact50,0.068507,11760,11760,0
+qwen_B,8k,068rdc75mHM_8k,text before video,video keys,exact75,0.53531,11760,0,0
+qwen_B,8k,068rdc75mHM_8k,text before video,other keys,exact75,0.53531,11760,11760,0
+qwen_B,8k,068rdc75mHM_8k,text before video,all keys,exact75,0.53531,11760,11760,0
+qwen_B,8k,068rdc75mHM_8k,video,video keys,exact50,0.068507,4544064,2.2439e+06,1.6086e+05
+qwen_B,8k,068rdc75mHM_8k,video,other keys,exact50,0.068507,4544064,2.3001e+06,0
+qwen_B,8k,068rdc75mHM_8k,video,all keys,exact50,0.068507,4544064,4.5441e+06,1.6086e+05
+qwen_B,8k,068rdc75mHM_8k,video,video keys,exact75,0.53531,4544064,2.2439e+06,5.7744e+05
+qwen_B,8k,068rdc75mHM_8k,video,other keys,exact75,0.53531,4544064,2.3001e+06,0
+qwen_B,8k,068rdc75mHM_8k,video,all keys,exact75,0.53531,4544064,4.5441e+06,5.7744e+05
+qwen_B,8k,068rdc75mHM_8k,text after video,video keys,exact50,0.068507,1713040,1.0185e+05,38533
+qwen_B,8k,068rdc75mHM_8k,text after video,other keys,exact50,0.068507,1713040,1.6112e+06,11674
+qwen_B,8k,068rdc75mHM_8k,text after video,all keys,exact50,0.068507,1713040,1.713e+06,50206
+qwen_B,8k,068rdc75mHM_8k,text after video,video keys,exact75,0.53531,1713040,1.0185e+05,70775
+qwen_B,8k,068rdc75mHM_8k,text after video,other keys,exact75,0.53531,1713040,1.6112e+06,70345
+qwen_B,8k,068rdc75mHM_8k,text after video,all keys,exact75,0.53531,1713040,1.713e+06,1.4112e+05
+qwen_B,8k,068rdc75mHM_8k,question,video keys,exact50,0.068507,99568,4854.2,2165.5
+qwen_B,8k,068rdc75mHM_8k,question,other keys,exact50,0.068507,99568,94714,1562.3
+qwen_B,8k,068rdc75mHM_8k,question,all keys,exact50,0.068507,99568,99568,3727.9
+qwen_B,8k,068rdc75mHM_8k,question,video keys,exact75,0.53531,99568,4854.2,3532.1
+qwen_B,8k,068rdc75mHM_8k,question,other keys,exact75,0.53531,99568,94714,5760.1
+qwen_B,8k,068rdc75mHM_8k,question,all keys,exact75,0.53531,99568,99568,9292.2
+qwen_B,8k,068rdc75mHM_8k,answer position,video keys,exact50,0.068507,784,28.88,16.01
+qwen_B,8k,068rdc75mHM_8k,answer position,other keys,exact50,0.068507,784,755.12,8.9123
+qwen_B,8k,068rdc75mHM_8k,answer position,all keys,exact50,0.068507,784,784,24.922
+qwen_B,8k,068rdc75mHM_8k,answer position,video keys,exact75,0.53531,784,28.88,23.015
+qwen_B,8k,068rdc75mHM_8k,answer position,other keys,exact75,0.53531,784,755.12,33.609
+qwen_B,8k,068rdc75mHM_8k,answer position,all keys,exact75,0.53531,784,784,56.624
+qwen_B,16k,0Jbc3Ah4EIc_16k,all rows,video keys,exact50,0.055603,12774496,5.8808e+06,5.8974e+05
+qwen_B,16k,0Jbc3Ah4EIc_16k,all rows,other keys,exact50,0.055603,12774496,6.8937e+06,10647
+qwen_B,16k,0Jbc3Ah4EIc_16k,all rows,all keys,exact50,0.055603,12774496,1.2774e+07,6.0039e+05
+qwen_B,16k,0Jbc3Ah4EIc_16k,all rows,video keys,exact75,0.38793,12774496,5.8808e+06,1.8162e+06
+qwen_B,16k,0Jbc3Ah4EIc_16k,all rows,other keys,exact75,0.38793,12774496,6.8937e+06,59348
+qwen_B,16k,0Jbc3Ah4EIc_16k,all rows,all keys,exact75,0.38793,12774496,1.2774e+07,1.8756e+06
+qwen_B,16k,0Jbc3Ah4EIc_16k,text before video,video keys,exact50,0.055603,11760,0,0
+qwen_B,16k,0Jbc3Ah4EIc_16k,text before video,other keys,exact50,0.055603,11760,11760,0
+qwen_B,16k,0Jbc3Ah4EIc_16k,text before video,all keys,exact50,0.055603,11760,11760,0
+qwen_B,16k,0Jbc3Ah4EIc_16k,text before video,video keys,exact75,0.38793,11760,0,0
+qwen_B,16k,0Jbc3Ah4EIc_16k,text before video,other keys,exact75,0.38793,11760,11760,0
+qwen_B,16k,0Jbc3Ah4EIc_16k,text before video,all keys,exact75,0.38793,11760,11760,0
+qwen_B,16k,0Jbc3Ah4EIc_16k,video,video keys,exact50,0.055603,11063808,5.7715e+06,5.4162e+05
+qwen_B,16k,0Jbc3Ah4EIc_16k,video,other keys,exact50,0.055603,11063808,5.2923e+06,0
+qwen_B,16k,0Jbc3Ah4EIc_16k,video,all keys,exact50,0.055603,11063808,1.1064e+07,5.4162e+05
+qwen_B,16k,0Jbc3Ah4EIc_16k,video,video keys,exact75,0.38793,11063808,5.7715e+06,1.7359e+06
+qwen_B,16k,0Jbc3Ah4EIc_16k,video,other keys,exact75,0.38793,11063808,5.2923e+06,0
+qwen_B,16k,0Jbc3Ah4EIc_16k,video,all keys,exact75,0.38793,11063808,1.1064e+07,1.7359e+06
+qwen_B,16k,0Jbc3Ah4EIc_16k,text after video,video keys,exact50,0.055603,1698928,1.0929e+05,48124
+qwen_B,16k,0Jbc3Ah4EIc_16k,text after video,other keys,exact50,0.055603,1698928,1.5896e+06,10647
+qwen_B,16k,0Jbc3Ah4EIc_16k,text after video,all keys,exact50,0.055603,1698928,1.6989e+06,58771
+qwen_B,16k,0Jbc3Ah4EIc_16k,text after video,video keys,exact75,0.38793,1698928,1.0929e+05,80331
+qwen_B,16k,0Jbc3Ah4EIc_16k,text after video,other keys,exact75,0.38793,1698928,1.5896e+06,59348
+qwen_B,16k,0Jbc3Ah4EIc_16k,text after video,all keys,exact75,0.38793,1698928,1.6989e+06,1.3968e+05
+qwen_B,16k,0Jbc3Ah4EIc_16k,question,video keys,exact50,0.055603,85456,5515.6,2919.4
+qwen_B,16k,0Jbc3Ah4EIc_16k,question,other keys,exact50,0.055603,85456,79940,1142.2
+qwen_B,16k,0Jbc3Ah4EIc_16k,question,all keys,exact50,0.055603,85456,85456,4061.5
+qwen_B,16k,0Jbc3Ah4EIc_16k,question,video keys,exact75,0.38793,85456,5515.6,4514
+qwen_B,16k,0Jbc3Ah4EIc_16k,question,other keys,exact75,0.38793,85456,79940,4274.7
+qwen_B,16k,0Jbc3Ah4EIc_16k,question,all keys,exact75,0.38793,85456,85456,8788.7
+qwen_B,16k,0Jbc3Ah4EIc_16k,answer position,video keys,exact50,0.055603,784,32.189,19.948
+qwen_B,16k,0Jbc3Ah4EIc_16k,answer position,other keys,exact50,0.055603,784,751.81,7.5921
+qwen_B,16k,0Jbc3Ah4EIc_16k,answer position,all keys,exact50,0.055603,784,784,27.541
+qwen_B,16k,0Jbc3Ah4EIc_16k,answer position,video keys,exact75,0.38793,784,32.189,27.462
+qwen_B,16k,0Jbc3Ah4EIc_16k,answer position,other keys,exact75,0.38793,784,751.81,29.072
+qwen_B,16k,0Jbc3Ah4EIc_16k,answer position,all keys,exact75,0.38793,784,784,56.534
+qwen_B,8k,0Jbc3Ah4EIc_8k,all rows,video keys,exact50,0.071559,6254752,2.2947e+06,2.0057e+05
+qwen_B,8k,0Jbc3Ah4EIc_8k,all rows,other keys,exact50,0.071559,6254752,3.96e+06,14213
+qwen_B,8k,0Jbc3Ah4EIc_8k,all rows,all keys,exact50,0.071559,6254752,6.2548e+06,2.1478e+05
+qwen_B,8k,0Jbc3Ah4EIc_8k,all rows,video keys,exact75,0.65713,6254752,2.2947e+06,7.2171e+05
+qwen_B,8k,0Jbc3Ah4EIc_8k,all rows,other keys,exact75,0.65713,6254752,3.96e+06,97384
+qwen_B,8k,0Jbc3Ah4EIc_8k,all rows,all keys,exact75,0.65713,6254752,6.2548e+06,8.1909e+05
+qwen_B,8k,0Jbc3Ah4EIc_8k,text before video,video keys,exact50,0.071559,11760,0,0
+qwen_B,8k,0Jbc3Ah4EIc_8k,text before video,other keys,exact50,0.071559,11760,11760,0
+qwen_B,8k,0Jbc3Ah4EIc_8k,text before video,all keys,exact50,0.071559,11760,11760,0
+qwen_B,8k,0Jbc3Ah4EIc_8k,text before video,video keys,exact75,0.65713,11760,0,0
+qwen_B,8k,0Jbc3Ah4EIc_8k,text before video,other keys,exact75,0.65713,11760,11760,0
+qwen_B,8k,0Jbc3Ah4EIc_8k,text before video,all keys,exact75,0.65713,11760,11760,0
+qwen_B,8k,0Jbc3Ah4EIc_8k,video,video keys,exact50,0.071559,4544064,2.2231e+06,1.6917e+05
+qwen_B,8k,0Jbc3Ah4EIc_8k,video,other keys,exact50,0.071559,4544064,2.321e+06,0
+qwen_B,8k,0Jbc3Ah4EIc_8k,video,all keys,exact50,0.071559,4544064,4.5441e+06,1.6917e+05
+qwen_B,8k,0Jbc3Ah4EIc_8k,video,video keys,exact75,0.65713,4544064,2.2231e+06,6.6555e+05
+qwen_B,8k,0Jbc3Ah4EIc_8k,video,other keys,exact75,0.65713,4544064,2.321e+06,0
+qwen_B,8k,0Jbc3Ah4EIc_8k,video,all keys,exact75,0.65713,4544064,4.5441e+06,6.6555e+05
+qwen_B,8k,0Jbc3Ah4EIc_8k,text after video,video keys,exact50,0.071559,1698928,71661,31405
+qwen_B,8k,0Jbc3Ah4EIc_8k,text after video,other keys,exact50,0.071559,1698928,1.6273e+06,14213
+qwen_B,8k,0Jbc3Ah4EIc_8k,text after video,all keys,exact50,0.071559,1698928,1.6989e+06,45618
+qwen_B,8k,0Jbc3Ah4EIc_8k,text after video,video keys,exact75,0.65713,1698928,71661,56161
+qwen_B,8k,0Jbc3Ah4EIc_8k,text after video,other keys,exact75,0.65713,1698928,1.6273e+06,97384
+qwen_B,8k,0Jbc3Ah4EIc_8k,text after video,all keys,exact75,0.65713,1698928,1.6989e+06,1.5354e+05
+qwen_B,8k,0Jbc3Ah4EIc_8k,question,video keys,exact50,0.071559,85456,4359.6,2081.6
+qwen_B,8k,0Jbc3Ah4EIc_8k,question,other keys,exact50,0.071559,85456,81096,1554.4
+qwen_B,8k,0Jbc3Ah4EIc_8k,question,all keys,exact50,0.071559,85456,85456,3636
+qwen_B,8k,0Jbc3Ah4EIc_8k,question,video keys,exact75,0.65713,85456,4359.6,3538.6
+qwen_B,8k,0Jbc3Ah4EIc_8k,question,other keys,exact75,0.65713,85456,81096,6389.4
+qwen_B,8k,0Jbc3Ah4EIc_8k,question,all keys,exact75,0.65713,85456,85456,9928
+qwen_B,8k,0Jbc3Ah4EIc_8k,answer position,video keys,exact50,0.071559,784,25.041,14.444
+qwen_B,8k,0Jbc3Ah4EIc_8k,answer position,other keys,exact50,0.071559,784,758.96,9.7268
+qwen_B,8k,0Jbc3Ah4EIc_8k,answer position,all keys,exact50,0.071559,784,784,24.17
+qwen_B,8k,0Jbc3Ah4EIc_8k,answer position,video keys,exact75,0.65713,784,25.041,21.082
+qwen_B,8k,0Jbc3Ah4EIc_8k,answer position,other keys,exact75,0.65713,784,758.96,47.669
+qwen_B,8k,0Jbc3Ah4EIc_8k,answer position,all keys,exact75,0.65713,784,784,68.751
+qwen_B,16k,0bwyCF0HteE_16k,all rows,video keys,exact50,0.051496,12748624,5.8874e+06,5.7778e+05
+qwen_B,16k,0bwyCF0HteE_16k,all rows,other keys,exact50,0.051496,12748624,6.8612e+06,10869
+qwen_B,16k,0bwyCF0HteE_16k,all rows,all keys,exact50,0.051496,12748624,1.2749e+07,5.8865e+05
+qwen_B,16k,0bwyCF0HteE_16k,all rows,video keys,exact75,0.34334,12748624,5.8874e+06,1.7434e+06
+qwen_B,16k,0bwyCF0HteE_16k,all rows,other keys,exact75,0.34334,12748624,6.8612e+06,58714
+qwen_B,16k,0bwyCF0HteE_16k,all rows,all keys,exact75,0.34334,12748624,1.2749e+07,1.8021e+06
+qwen_B,16k,0bwyCF0HteE_16k,text before video,video keys,exact50,0.051496,11760,0,0
+qwen_B,16k,0bwyCF0HteE_16k,text before video,other keys,exact50,0.051496,11760,11760,0
+qwen_B,16k,0bwyCF0HteE_16k,text before video,all keys,exact50,0.051496,11760,11760,0
+qwen_B,16k,0bwyCF0HteE_16k,text before video,video keys,exact75,0.34334,11760,0,0
+qwen_B,16k,0bwyCF0HteE_16k,text before video,other keys,exact75,0.34334,11760,11760,0
+qwen_B,16k,0bwyCF0HteE_16k,text before video,all keys,exact75,0.34334,11760,11760,0
+qwen_B,16k,0bwyCF0HteE_16k,video,video keys,exact50,0.051496,11063808,5.756e+06,5.2662e+05
+qwen_B,16k,0bwyCF0HteE_16k,video,other keys,exact50,0.051496,11063808,5.3078e+06,0
+qwen_B,16k,0bwyCF0HteE_16k,video,all keys,exact50,0.051496,11063808,1.1064e+07,5.2662e+05
+qwen_B,16k,0bwyCF0HteE_16k,video,video keys,exact75,0.34334,11063808,5.756e+06,1.6527e+06
+qwen_B,16k,0bwyCF0HteE_16k,video,other keys,exact75,0.34334,11063808,5.3078e+06,0
+qwen_B,16k,0bwyCF0HteE_16k,video,all keys,exact75,0.34334,11063808,1.1064e+07,1.6527e+06
+qwen_B,16k,0bwyCF0HteE_16k,text after video,video keys,exact50,0.051496,1673056,1.3139e+05,51162
+qwen_B,16k,0bwyCF0HteE_16k,text after video,other keys,exact50,0.051496,1673056,1.5417e+06,10869
+qwen_B,16k,0bwyCF0HteE_16k,text after video,all keys,exact50,0.051496,1673056,1.6731e+06,62031
+qwen_B,16k,0bwyCF0HteE_16k,text after video,video keys,exact75,0.34334,1673056,1.3139e+05,90738
+qwen_B,16k,0bwyCF0HteE_16k,text after video,other keys,exact75,0.34334,1673056,1.5417e+06,58714
+qwen_B,16k,0bwyCF0HteE_16k,text after video,all keys,exact75,0.34334,1673056,1.6731e+06,1.4945e+05
+qwen_B,16k,0bwyCF0HteE_16k,question,video keys,exact50,0.051496,59584,3877,1613.3
+qwen_B,16k,0bwyCF0HteE_16k,question,other keys,exact50,0.051496,59584,55707,573.12
+qwen_B,16k,0bwyCF0HteE_16k,question,all keys,exact50,0.051496,59584,59584,2186.5
+qwen_B,16k,0bwyCF0HteE_16k,question,video keys,exact75,0.34334,59584,3877,2836.2
+qwen_B,16k,0bwyCF0HteE_16k,question,other keys,exact75,0.34334,59584,55707,2036.7
+qwen_B,16k,0bwyCF0HteE_16k,question,all keys,exact75,0.34334,59584,59584,4872.9
+qwen_B,16k,0bwyCF0HteE_16k,answer position,video keys,exact50,0.051496,784,33.138,21.681
+qwen_B,16k,0bwyCF0HteE_16k,answer position,other keys,exact50,0.051496,784,750.86,20.977
+qwen_B,16k,0bwyCF0HteE_16k,answer position,all keys,exact50,0.051496,784,784,42.657
+qwen_B,16k,0bwyCF0HteE_16k,answer position,video keys,exact75,0.34334,784,33.138,28.581
+qwen_B,16k,0bwyCF0HteE_16k,answer position,other keys,exact75,0.34334,784,750.86,89.773
+qwen_B,16k,0bwyCF0HteE_16k,answer position,all keys,exact75,0.34334,784,784,118.35
+qwen_B,8k,0bwyCF0HteE_8k,all rows,video keys,exact50,0.081661,6228880,2.3139e+06,2.2796e+05
+qwen_B,8k,0bwyCF0HteE_8k,all rows,other keys,exact50,0.081661,6228880,3.915e+06,17734
+qwen_B,8k,0bwyCF0HteE_8k,all rows,all keys,exact50,0.081661,6228880,6.2289e+06,2.457e+05
+qwen_B,8k,0bwyCF0HteE_8k,all rows,video keys,exact75,0.63434,6228880,2.3139e+06,7.3286e+05
+qwen_B,8k,0bwyCF0HteE_8k,all rows,other keys,exact75,0.63434,6228880,3.915e+06,1.0302e+05
+qwen_B,8k,0bwyCF0HteE_8k,all rows,all keys,exact75,0.63434,6228880,6.2289e+06,8.3588e+05
+qwen_B,8k,0bwyCF0HteE_8k,text before video,video keys,exact50,0.081661,11760,0,0
+qwen_B,8k,0bwyCF0HteE_8k,text before video,other keys,exact50,0.081661,11760,11760,0
+qwen_B,8k,0bwyCF0HteE_8k,text before video,all keys,exact50,0.081661,11760,11760,0
+qwen_B,8k,0bwyCF0HteE_8k,text before video,video keys,exact75,0.63434,11760,0,0
+qwen_B,8k,0bwyCF0HteE_8k,text before video,other keys,exact75,0.63434,11760,11760,0
+qwen_B,8k,0bwyCF0HteE_8k,text before video,all keys,exact75,0.63434,11760,11760,0
+qwen_B,8k,0bwyCF0HteE_8k,video,video keys,exact50,0.081661,4544064,2.2171e+06,1.8965e+05
+qwen_B,8k,0bwyCF0HteE_8k,video,other keys,exact50,0.081661,4544064,2.327e+06,0
+qwen_B,8k,0bwyCF0HteE_8k,video,all keys,exact50,0.081661,4544064,4.5441e+06,1.8965e+05
+qwen_B,8k,0bwyCF0HteE_8k,video,video keys,exact75,0.63434,4544064,2.2171e+06,6.6349e+05
+qwen_B,8k,0bwyCF0HteE_8k,video,other keys,exact75,0.63434,4544064,2.327e+06,0
+qwen_B,8k,0bwyCF0HteE_8k,video,all keys,exact75,0.63434,4544064,4.5441e+06,6.6349e+05
+qwen_B,8k,0bwyCF0HteE_8k,text after video,video keys,exact50,0.081661,1673056,96841,38308
+qwen_B,8k,0bwyCF0HteE_8k,text after video,other keys,exact50,0.081661,1673056,1.5762e+06,17734
+qwen_B,8k,0bwyCF0HteE_8k,text after video,all keys,exact50,0.081661,1673056,1.6731e+06,56043
+qwen_B,8k,0bwyCF0HteE_8k,text after video,video keys,exact75,0.63434,1673056,96841,69372
+qwen_B,8k,0bwyCF0HteE_8k,text after video,other keys,exact75,0.63434,1673056,1.5762e+06,1.0302e+05
+qwen_B,8k,0bwyCF0HteE_8k,text after video,all keys,exact75,0.63434,1673056,1.6731e+06,1.7239e+05
+qwen_B,8k,0bwyCF0HteE_8k,question,video keys,exact50,0.081661,59584,3306.6,1326.5
+qwen_B,8k,0bwyCF0HteE_8k,question,other keys,exact50,0.081661,59584,56277,806.29
+qwen_B,8k,0bwyCF0HteE_8k,question,all keys,exact50,0.081661,59584,59584,2132.8
+qwen_B,8k,0bwyCF0HteE_8k,question,video keys,exact75,0.63434,59584,3306.6,2417.1
+qwen_B,8k,0bwyCF0HteE_8k,question,other keys,exact75,0.63434,59584,56277,3271
+qwen_B,8k,0bwyCF0HteE_8k,question,all keys,exact75,0.63434,59584,59584,5688.1
+qwen_B,8k,0bwyCF0HteE_8k,answer position,video keys,exact50,0.081661,784,23.547,16.225
+qwen_B,8k,0bwyCF0HteE_8k,answer position,other keys,exact50,0.081661,784,760.45,20.869
+qwen_B,8k,0bwyCF0HteE_8k,answer position,all keys,exact50,0.081661,784,784,37.094
+qwen_B,8k,0bwyCF0HteE_8k,answer position,video keys,exact75,0.63434,784,23.547,20.386
+qwen_B,8k,0bwyCF0HteE_8k,answer position,other keys,exact75,0.63434,784,760.45,104.24
+qwen_B,8k,0bwyCF0HteE_8k,answer position,all keys,exact75,0.63434,784,784,124.62
+qwen_B,16k,0iED5BojTMI_16k,all rows,video keys,exact50,0.086855,12794096,6.348e+06,7.8543e+05
+qwen_B,16k,0iED5BojTMI_16k,all rows,other keys,exact50,0.086855,12794096,6.4461e+06,9437
+qwen_B,16k,0iED5BojTMI_16k,all rows,all keys,exact50,0.086855,12794096,1.2794e+07,7.9487e+05
+qwen_B,16k,0iED5BojTMI_16k,all rows,video keys,exact75,0.483,12794096,6.348e+06,2.1233e+06
+qwen_B,16k,0iED5BojTMI_16k,all rows,other keys,exact75,0.483,12794096,6.4461e+06,44018
+qwen_B,16k,0iED5BojTMI_16k,all rows,all keys,exact75,0.483,12794096,1.2794e+07,2.1673e+06
+qwen_B,16k,0iED5BojTMI_16k,text before video,video keys,exact50,0.086855,11760,0,0
+qwen_B,16k,0iED5BojTMI_16k,text before video,other keys,exact50,0.086855,11760,11760,0
+qwen_B,16k,0iED5BojTMI_16k,text before video,all keys,exact50,0.086855,11760,11760,0
+qwen_B,16k,0iED5BojTMI_16k,text before video,video keys,exact75,0.483,11760,0,0
+qwen_B,16k,0iED5BojTMI_16k,text before video,other keys,exact75,0.483,11760,11760,0
+qwen_B,16k,0iED5BojTMI_16k,text before video,all keys,exact75,0.483,11760,11760,0
+qwen_B,16k,0iED5BojTMI_16k,video,video keys,exact50,0.086855,11458944,6.2329e+06,7.4335e+05
+qwen_B,16k,0iED5BojTMI_16k,video,other keys,exact50,0.086855,11458944,5.2261e+06,0
+qwen_B,16k,0iED5BojTMI_16k,video,all keys,exact50,0.086855,11458944,1.1459e+07,7.4335e+05
+qwen_B,16k,0iED5BojTMI_16k,video,video keys,exact75,0.483,11458944,6.2329e+06,2.0498e+06
+qwen_B,16k,0iED5BojTMI_16k,video,other keys,exact75,0.483,11458944,5.2261e+06,0
+qwen_B,16k,0iED5BojTMI_16k,video,all keys,exact75,0.483,11458944,1.1459e+07,2.0498e+06
+qwen_B,16k,0iED5BojTMI_16k,text after video,video keys,exact50,0.086855,1323392,1.1514e+05,42084
+qwen_B,16k,0iED5BojTMI_16k,text after video,other keys,exact50,0.086855,1323392,1.2082e+06,9437
+qwen_B,16k,0iED5BojTMI_16k,text after video,all keys,exact50,0.086855,1323392,1.3234e+06,51521
+qwen_B,16k,0iED5BojTMI_16k,text after video,video keys,exact75,0.483,1323392,1.1514e+05,73438
+qwen_B,16k,0iED5BojTMI_16k,text after video,other keys,exact75,0.483,1323392,1.2082e+06,44018
+qwen_B,16k,0iED5BojTMI_16k,text after video,all keys,exact75,0.483,1323392,1.3234e+06,1.1746e+05
+qwen_B,16k,0iED5BojTMI_16k,question,video keys,exact50,0.086855,58016,4229.7,2317.8
+qwen_B,16k,0iED5BojTMI_16k,question,other keys,exact50,0.086855,58016,53786,883.74
+qwen_B,16k,0iED5BojTMI_16k,question,all keys,exact50,0.086855,58016,58016,3201.6
+qwen_B,16k,0iED5BojTMI_16k,question,video keys,exact75,0.483,58016,4229.7,3390.8
+qwen_B,16k,0iED5BojTMI_16k,question,other keys,exact75,0.483,58016,53786,2685.5
+qwen_B,16k,0iED5BojTMI_16k,question,all keys,exact75,0.483,58016,58016,6076.3
+qwen_B,16k,0iED5BojTMI_16k,answer position,video keys,exact50,0.086855,784,37.122,19.328
+qwen_B,16k,0iED5BojTMI_16k,answer position,other keys,exact50,0.086855,784,746.88,5.9504
+qwen_B,16k,0iED5BojTMI_16k,answer position,all keys,exact50,0.086855,784,784,25.278
+qwen_B,16k,0iED5BojTMI_16k,answer position,video keys,exact75,0.483,784,37.122,29.106
+qwen_B,16k,0iED5BojTMI_16k,answer position,other keys,exact75,0.483,784,746.88,24.709
+qwen_B,16k,0iED5BojTMI_16k,answer position,all keys,exact75,0.483,784,784,53.815
+qwen_B,8k,0iED5BojTMI_8k,all rows,video keys,exact50,0.12633,6274352,2.6102e+06,2.9974e+05
+qwen_B,8k,0iED5BojTMI_8k,all rows,other keys,exact50,0.12633,6274352,3.6642e+06,14136
+qwen_B,8k,0iED5BojTMI_8k,all rows,all keys,exact50,0.12633,6274352,6.2744e+06,3.1387e+05
+qwen_B,8k,0iED5BojTMI_8k,all rows,video keys,exact75,0.81987,6274352,2.6102e+06,9.0361e+05
+qwen_B,8k,0iED5BojTMI_8k,all rows,other keys,exact75,0.81987,6274352,3.6642e+06,75308
+qwen_B,8k,0iED5BojTMI_8k,all rows,all keys,exact75,0.81987,6274352,6.2744e+06,9.7891e+05
+qwen_B,8k,0iED5BojTMI_8k,text before video,video keys,exact50,0.12633,11760,0,0
+qwen_B,8k,0iED5BojTMI_8k,text before video,other keys,exact50,0.12633,11760,11760,0
+qwen_B,8k,0iED5BojTMI_8k,text before video,all keys,exact50,0.12633,11760,11760,0
+qwen_B,8k,0iED5BojTMI_8k,text before video,video keys,exact75,0.81987,11760,0,0
+qwen_B,8k,0iED5BojTMI_8k,text before video,other keys,exact75,0.81987,11760,11760,0
+qwen_B,8k,0iED5BojTMI_8k,text before video,all keys,exact75,0.81987,11760,11760,0
+qwen_B,8k,0iED5BojTMI_8k,video,video keys,exact50,0.12633,4939200,2.5191e+06,2.6589e+05
+qwen_B,8k,0iED5BojTMI_8k,video,other keys,exact50,0.12633,4939200,2.4201e+06,0
+qwen_B,8k,0iED5BojTMI_8k,video,all keys,exact50,0.12633,4939200,4.9392e+06,2.6589e+05
+qwen_B,8k,0iED5BojTMI_8k,video,video keys,exact75,0.81987,4939200,2.5191e+06,8.4228e+05
+qwen_B,8k,0iED5BojTMI_8k,video,other keys,exact75,0.81987,4939200,2.4201e+06,0
+qwen_B,8k,0iED5BojTMI_8k,video,all keys,exact75,0.81987,4939200,4.9392e+06,8.4228e+05
+qwen_B,8k,0iED5BojTMI_8k,text after video,video keys,exact50,0.12633,1323392,91057,33852
+qwen_B,8k,0iED5BojTMI_8k,text after video,other keys,exact50,0.12633,1323392,1.2323e+06,14136
+qwen_B,8k,0iED5BojTMI_8k,text after video,all keys,exact50,0.12633,1323392,1.3234e+06,47988
+qwen_B,8k,0iED5BojTMI_8k,text after video,video keys,exact75,0.81987,1323392,91057,61326
+qwen_B,8k,0iED5BojTMI_8k,text after video,other keys,exact75,0.81987,1323392,1.2323e+06,75308
+qwen_B,8k,0iED5BojTMI_8k,text after video,all keys,exact75,0.81987,1323392,1.3234e+06,1.3663e+05
+qwen_B,8k,0iED5BojTMI_8k,question,video keys,exact50,0.12633,58016,3182.9,1754.4
+qwen_B,8k,0iED5BojTMI_8k,question,other keys,exact50,0.12633,58016,54833,1199.7
+qwen_B,8k,0iED5BojTMI_8k,question,all keys,exact50,0.12633,58016,58016,2954.1
+qwen_B,8k,0iED5BojTMI_8k,question,video keys,exact75,0.81987,58016,3182.9,2628.3
+qwen_B,8k,0iED5BojTMI_8k,question,other keys,exact75,0.81987,58016,54833,4006.1
+qwen_B,8k,0iED5BojTMI_8k,question,all keys,exact75,0.81987,58016,58016,6634.4
+qwen_B,8k,0iED5BojTMI_8k,answer position,video keys,exact50,0.12633,784,25.137,13.633
+qwen_B,8k,0iED5BojTMI_8k,answer position,other keys,exact50,0.12633,784,758.86,7.7861
+qwen_B,8k,0iED5BojTMI_8k,answer position,all keys,exact50,0.12633,784,784,21.419
+qwen_B,8k,0iED5BojTMI_8k,answer position,video keys,exact75,0.81987,784,25.137,20.514
+qwen_B,8k,0iED5BojTMI_8k,answer position,other keys,exact75,0.81987,784,758.86,38.902
+qwen_B,8k,0iED5BojTMI_8k,answer position,all keys,exact75,0.81987,784,784,59.416
+qwen_B,16k,0kRsiSdDFYg_16k,all rows,video keys,exact50,0.053117,12765088,5.5452e+06,6.4656e+05
+qwen_B,16k,0kRsiSdDFYg_16k,all rows,other keys,exact50,0.053117,12765088,7.2199e+06,13303
+qwen_B,16k,0kRsiSdDFYg_16k,all rows,all keys,exact50,0.053117,12765088,1.2765e+07,6.5987e+05
+qwen_B,16k,0kRsiSdDFYg_16k,all rows,video keys,exact75,0.35471,12765088,5.5452e+06,1.8914e+06
+qwen_B,16k,0kRsiSdDFYg_16k,all rows,other keys,exact75,0.35471,12765088,7.2199e+06,72651
+qwen_B,16k,0kRsiSdDFYg_16k,all rows,all keys,exact75,0.35471,12765088,1.2765e+07,1.964e+06
+qwen_B,16k,0kRsiSdDFYg_16k,text before video,video keys,exact50,0.053117,11760,0,0
+qwen_B,16k,0kRsiSdDFYg_16k,text before video,other keys,exact50,0.053117,11760,11760,0
+qwen_B,16k,0kRsiSdDFYg_16k,text before video,all keys,exact50,0.053117,11760,11760,0
+qwen_B,16k,0kRsiSdDFYg_16k,text before video,video keys,exact75,0.35471,11760,0,0
+qwen_B,16k,0kRsiSdDFYg_16k,text before video,other keys,exact75,0.35471,11760,11760,0
+qwen_B,16k,0kRsiSdDFYg_16k,text before video,all keys,exact75,0.35471,11760,11760,0
+qwen_B,16k,0kRsiSdDFYg_16k,video,video keys,exact50,0.053117,11063808,5.4515e+06,6.022e+05
+qwen_B,16k,0kRsiSdDFYg_16k,video,other keys,exact50,0.053117,11063808,5.6123e+06,0
+qwen_B,16k,0kRsiSdDFYg_16k,video,all keys,exact50,0.053117,11063808,1.1064e+07,6.022e+05
+qwen_B,16k,0kRsiSdDFYg_16k,video,video keys,exact75,0.35471,11063808,5.4515e+06,1.8204e+06
+qwen_B,16k,0kRsiSdDFYg_16k,video,other keys,exact75,0.35471,11063808,5.6123e+06,0
+qwen_B,16k,0kRsiSdDFYg_16k,video,all keys,exact75,0.35471,11063808,1.1064e+07,1.8204e+06
+qwen_B,16k,0kRsiSdDFYg_16k,text after video,video keys,exact50,0.053117,1689520,93606,44363
+qwen_B,16k,0kRsiSdDFYg_16k,text after video,other keys,exact50,0.053117,1689520,1.5959e+06,13303
+qwen_B,16k,0kRsiSdDFYg_16k,text after video,all keys,exact50,0.053117,1689520,1.6895e+06,57666
+qwen_B,16k,0kRsiSdDFYg_16k,text after video,video keys,exact75,0.35471,1689520,93606,71018
+qwen_B,16k,0kRsiSdDFYg_16k,text after video,other keys,exact75,0.35471,1689520,1.5959e+06,72651
+qwen_B,16k,0kRsiSdDFYg_16k,text after video,all keys,exact75,0.35471,1689520,1.6895e+06,1.4367e+05
+qwen_B,16k,0kRsiSdDFYg_16k,question,video keys,exact50,0.053117,76048,5486.7,2323.2
+qwen_B,16k,0kRsiSdDFYg_16k,question,other keys,exact50,0.053117,76048,70561,866.39
+qwen_B,16k,0kRsiSdDFYg_16k,question,all keys,exact50,0.053117,76048,76048,3189.6
+qwen_B,16k,0kRsiSdDFYg_16k,question,video keys,exact75,0.35471,76048,5486.7,3983.8
+qwen_B,16k,0kRsiSdDFYg_16k,question,other keys,exact75,0.35471,76048,70561,2858.6
+qwen_B,16k,0kRsiSdDFYg_16k,question,all keys,exact75,0.35471,76048,76048,6842.4
+qwen_B,16k,0kRsiSdDFYg_16k,answer position,video keys,exact50,0.053117,784,30.686,17.641
+qwen_B,16k,0kRsiSdDFYg_16k,answer position,other keys,exact50,0.053117,784,753.31,9.6397
+qwen_B,16k,0kRsiSdDFYg_16k,answer position,all keys,exact50,0.053117,784,784,27.28
+qwen_B,16k,0kRsiSdDFYg_16k,answer position,video keys,exact75,0.35471,784,30.686,25.169
+qwen_B,16k,0kRsiSdDFYg_16k,answer position,other keys,exact75,0.35471,784,753.31,35.79
+qwen_B,16k,0kRsiSdDFYg_16k,answer position,all keys,exact75,0.35471,784,784,60.959
+qwen_B,8k,0kRsiSdDFYg_8k,all rows,video keys,exact50,0.06864,6245344,2.1697e+06,2.219e+05
+qwen_B,8k,0kRsiSdDFYg_8k,all rows,other keys,exact50,0.06864,6245344,4.0756e+06,17653
+qwen_B,8k,0kRsiSdDFYg_8k,all rows,all keys,exact50,0.06864,6245344,6.2453e+06,2.3955e+05
+qwen_B,8k,0kRsiSdDFYg_8k,all rows,video keys,exact75,0.60159,6245344,2.1697e+06,7.6344e+05
+qwen_B,8k,0kRsiSdDFYg_8k,all rows,other keys,exact75,0.60159,6245344,4.0756e+06,1.1415e+05
+qwen_B,8k,0kRsiSdDFYg_8k,all rows,all keys,exact75,0.60159,6245344,6.2453e+06,8.7759e+05
+qwen_B,8k,0kRsiSdDFYg_8k,text before video,video keys,exact50,0.06864,11760,0,0
+qwen_B,8k,0kRsiSdDFYg_8k,text before video,other keys,exact50,0.06864,11760,11760,0
+qwen_B,8k,0kRsiSdDFYg_8k,text before video,all keys,exact50,0.06864,11760,11760,0
+qwen_B,8k,0kRsiSdDFYg_8k,text before video,video keys,exact75,0.60159,11760,0,0
+qwen_B,8k,0kRsiSdDFYg_8k,text before video,other keys,exact75,0.60159,11760,11760,0
+qwen_B,8k,0kRsiSdDFYg_8k,text before video,all keys,exact75,0.60159,11760,11760,0
+qwen_B,8k,0kRsiSdDFYg_8k,video,video keys,exact50,0.06864,4544064,2.1071e+06,1.9135e+05
+qwen_B,8k,0kRsiSdDFYg_8k,video,other keys,exact50,0.06864,4544064,2.437e+06,0
+qwen_B,8k,0kRsiSdDFYg_8k,video,all keys,exact50,0.06864,4544064,4.5441e+06,1.9135e+05
+qwen_B,8k,0kRsiSdDFYg_8k,video,video keys,exact75,0.60159,4544064,2.1071e+06,7.1382e+05
+qwen_B,8k,0kRsiSdDFYg_8k,video,other keys,exact75,0.60159,4544064,2.437e+06,0
+qwen_B,8k,0kRsiSdDFYg_8k,video,all keys,exact75,0.60159,4544064,4.5441e+06,7.1382e+05
+qwen_B,8k,0kRsiSdDFYg_8k,text after video,video keys,exact50,0.06864,1689520,62597,30555
+qwen_B,8k,0kRsiSdDFYg_8k,text after video,other keys,exact50,0.06864,1689520,1.6269e+06,17653
+qwen_B,8k,0kRsiSdDFYg_8k,text after video,all keys,exact50,0.06864,1689520,1.6895e+06,48208
+qwen_B,8k,0kRsiSdDFYg_8k,text after video,video keys,exact75,0.60159,1689520,62597,49616
+qwen_B,8k,0kRsiSdDFYg_8k,text after video,other keys,exact75,0.60159,1689520,1.6269e+06,1.1415e+05
+qwen_B,8k,0kRsiSdDFYg_8k,text after video,all keys,exact75,0.60159,1689520,1.6895e+06,1.6377e+05
+qwen_B,8k,0kRsiSdDFYg_8k,question,video keys,exact50,0.06864,76048,3943.2,1721.2
+qwen_B,8k,0kRsiSdDFYg_8k,question,other keys,exact50,0.06864,76048,72105,1167.4
+qwen_B,8k,0kRsiSdDFYg_8k,question,all keys,exact50,0.06864,76048,76048,2888.6
+qwen_B,8k,0kRsiSdDFYg_8k,question,video keys,exact75,0.60159,76048,3943.2,3009.1
+qwen_B,8k,0kRsiSdDFYg_8k,question,other keys,exact75,0.60159,76048,72105,4626.1
+qwen_B,8k,0kRsiSdDFYg_8k,question,all keys,exact75,0.60159,76048,76048,7635.2
+qwen_B,8k,0kRsiSdDFYg_8k,answer position,video keys,exact50,0.06864,784,20.701,12.011
+qwen_B,8k,0kRsiSdDFYg_8k,answer position,other keys,exact50,0.06864,784,763.3,11.475
+qwen_B,8k,0kRsiSdDFYg_8k,answer position,all keys,exact50,0.06864,784,784,23.486
+qwen_B,8k,0kRsiSdDFYg_8k,answer position,video keys,exact75,0.60159,784,20.701,17.079
+qwen_B,8k,0kRsiSdDFYg_8k,answer position,other keys,exact75,0.60159,784,763.3,57.146
+qwen_B,8k,0kRsiSdDFYg_8k,answer position,all keys,exact75,0.60159,784,784,74.225
+qwen_C,16k,068rdc75mHM_16k,all rows,video keys,exact50,0.053678,12756464,6.5371e+06,6.7145e+05
+qwen_C,16k,068rdc75mHM_16k,all rows,other keys,exact50,0.053678,12756464,6.2193e+06,19.854
+qwen_C,16k,068rdc75mHM_16k,all rows,all keys,exact50,0.053678,12756464,1.2756e+07,6.7147e+05
+qwen_C,16k,068rdc75mHM_16k,all rows,video keys,exact75,0.3074,12756464,6.5371e+06,1.8141e+06
+qwen_C,16k,068rdc75mHM_16k,all rows,other keys,exact75,0.3074,12756464,6.2193e+06,303.05
+qwen_C,16k,068rdc75mHM_16k,all rows,all keys,exact75,0.3074,12756464,1.2756e+07,1.8144e+06
+qwen_C,16k,068rdc75mHM_16k,text before video,video keys,exact50,0.053678,11760,0,0
+qwen_C,16k,068rdc75mHM_16k,text before video,other keys,exact50,0.053678,11760,11760,0
+qwen_C,16k,068rdc75mHM_16k,text before video,all keys,exact50,0.053678,11760,11760,0
+qwen_C,16k,068rdc75mHM_16k,text before video,video keys,exact75,0.3074,11760,0,0
+qwen_C,16k,068rdc75mHM_16k,text before video,other keys,exact75,0.3074,11760,11760,0
+qwen_C,16k,068rdc75mHM_16k,text before video,all keys,exact75,0.3074,11760,11760,0
+qwen_C,16k,068rdc75mHM_16k,video,video keys,exact50,0.053678,12644352,6.5274e+06,6.6772e+05
+qwen_C,16k,068rdc75mHM_16k,video,other keys,exact50,0.053678,12644352,6.117e+06,0
+qwen_C,16k,068rdc75mHM_16k,video,all keys,exact50,0.053678,12644352,1.2644e+07,6.6772e+05
+qwen_C,16k,068rdc75mHM_16k,video,video keys,exact75,0.3074,12644352,6.5274e+06,1.8074e+06
+qwen_C,16k,068rdc75mHM_16k,video,other keys,exact75,0.3074,12644352,6.117e+06,0
+qwen_C,16k,068rdc75mHM_16k,video,all keys,exact75,0.3074,12644352,1.2644e+07,1.8074e+06
+qwen_C,16k,068rdc75mHM_16k,text after video,video keys,exact50,0.053678,100352,9754.7,3723.5
+qwen_C,16k,068rdc75mHM_16k,text after video,other keys,exact50,0.053678,100352,90597,19.854
+qwen_C,16k,068rdc75mHM_16k,text after video,all keys,exact50,0.053678,100352,1.0035e+05,3743.3
+qwen_C,16k,068rdc75mHM_16k,text after video,video keys,exact75,0.3074,100352,9754.7,6721.2
+qwen_C,16k,068rdc75mHM_16k,text after video,other keys,exact75,0.3074,100352,90597,303.05
+qwen_C,16k,068rdc75mHM_16k,text after video,all keys,exact75,0.3074,100352,1.0035e+05,7024.3
+qwen_C,16k,068rdc75mHM_16k,question,video keys,exact50,0.053678,99568,9416.5,3593.5
+qwen_C,16k,068rdc75mHM_16k,question,other keys,exact50,0.053678,99568,90152,19.842
+qwen_C,16k,068rdc75mHM_16k,question,all keys,exact50,0.053678,99568,99568,3613.3
+qwen_C,16k,068rdc75mHM_16k,question,video keys,exact75,0.3074,99568,9416.5,6492.9
+qwen_C,16k,068rdc75mHM_16k,question,other keys,exact75,0.3074,99568,90152,303
+qwen_C,16k,068rdc75mHM_16k,question,all keys,exact75,0.3074,99568,99568,6795.9
+qwen_C,16k,068rdc75mHM_16k,answer position,video keys,exact50,0.053678,784,38.53,25.999
+qwen_C,16k,068rdc75mHM_16k,answer position,other keys,exact50,0.053678,784,745.47,0.99191
+qwen_C,16k,068rdc75mHM_16k,answer position,all keys,exact50,0.053678,784,784,26.99
+qwen_C,16k,068rdc75mHM_16k,answer position,video keys,exact75,0.3074,784,38.53,33.03
+qwen_C,16k,068rdc75mHM_16k,answer position,other keys,exact75,0.3074,784,745.47,18.842
+qwen_C,16k,068rdc75mHM_16k,answer position,all keys,exact75,0.3074,784,784,51.872
+qwen_C,8k,068rdc75mHM_8k,all rows,video keys,exact50,0.10239,6236720,3.0531e+06,3.5486e+05
+qwen_C,8k,068rdc75mHM_8k,all rows,other keys,exact50,0.10239,6236720,3.1836e+06,51.709
+qwen_C,8k,068rdc75mHM_8k,all rows,all keys,exact50,0.10239,6236720,6.2367e+06,3.5491e+05
+qwen_C,8k,068rdc75mHM_8k,all rows,video keys,exact75,0.60803,6236720,3.0531e+06,9.6431e+05
+qwen_C,8k,068rdc75mHM_8k,all rows,other keys,exact75,0.60803,6236720,3.1836e+06,979.45
+qwen_C,8k,068rdc75mHM_8k,all rows,all keys,exact75,0.60803,6236720,6.2367e+06,9.6529e+05
+qwen_C,8k,068rdc75mHM_8k,text before video,video keys,exact50,0.10239,11760,0,0
+qwen_C,8k,068rdc75mHM_8k,text before video,other keys,exact50,0.10239,11760,11760,0
+qwen_C,8k,068rdc75mHM_8k,text before video,all keys,exact50,0.10239,11760,11760,0
+qwen_C,8k,068rdc75mHM_8k,text before video,video keys,exact75,0.60803,11760,0,0
+qwen_C,8k,068rdc75mHM_8k,text before video,other keys,exact75,0.60803,11760,11760,0
+qwen_C,8k,068rdc75mHM_8k,text before video,all keys,exact75,0.60803,11760,11760,0
+qwen_C,8k,068rdc75mHM_8k,video,video keys,exact50,0.10239,6124608,3.0441e+06,3.512e+05
+qwen_C,8k,068rdc75mHM_8k,video,other keys,exact50,0.10239,6124608,3.0805e+06,0
+qwen_C,8k,068rdc75mHM_8k,video,all keys,exact50,0.10239,6124608,6.1246e+06,3.512e+05
+qwen_C,8k,068rdc75mHM_8k,video,video keys,exact75,0.60803,6124608,3.0441e+06,9.5767e+05
+qwen_C,8k,068rdc75mHM_8k,video,other keys,exact75,0.60803,6124608,3.0805e+06,0
+qwen_C,8k,068rdc75mHM_8k,video,all keys,exact75,0.60803,6124608,6.1246e+06,9.5767e+05
+qwen_C,8k,068rdc75mHM_8k,text after video,video keys,exact50,0.10239,100352,8952.3,3659.5
+qwen_C,8k,068rdc75mHM_8k,text after video,other keys,exact50,0.10239,100352,91400,51.709
+qwen_C,8k,068rdc75mHM_8k,text after video,all keys,exact50,0.10239,100352,1.0035e+05,3711.2
+qwen_C,8k,068rdc75mHM_8k,text after video,video keys,exact75,0.60803,100352,8952.3,6643.9
+qwen_C,8k,068rdc75mHM_8k,text after video,other keys,exact75,0.60803,100352,91400,979.45
+qwen_C,8k,068rdc75mHM_8k,text after video,all keys,exact75,0.60803,100352,1.0035e+05,7623.4
+qwen_C,8k,068rdc75mHM_8k,question,video keys,exact50,0.10239,99568,8631.4,3539.6
+qwen_C,8k,068rdc75mHM_8k,question,other keys,exact50,0.10239,99568,90937,51.693
+qwen_C,8k,068rdc75mHM_8k,question,all keys,exact50,0.10239,99568,99568,3591.3
+qwen_C,8k,068rdc75mHM_8k,question,video keys,exact75,0.60803,99568,8631.4,6421.2
+qwen_C,8k,068rdc75mHM_8k,question,other keys,exact75,0.60803,99568,90937,978.93
+qwen_C,8k,068rdc75mHM_8k,question,all keys,exact75,0.60803,99568,99568,7400.2
+qwen_C,8k,068rdc75mHM_8k,answer position,video keys,exact50,0.10239,784,33.556,23.535
+qwen_C,8k,068rdc75mHM_8k,answer position,other keys,exact50,0.10239,784,750.44,2.5535
+qwen_C,8k,068rdc75mHM_8k,answer position,all keys,exact50,0.10239,784,784,26.088
+qwen_C,8k,068rdc75mHM_8k,answer position,video keys,exact75,0.60803,784,33.556,29.201
+qwen_C,8k,068rdc75mHM_8k,answer position,other keys,exact75,0.60803,784,750.44,43.506
+qwen_C,8k,068rdc75mHM_8k,answer position,all keys,exact75,0.60803,784,784,72.706
+qwen_C,16k,0Jbc3Ah4EIc_16k,all rows,video keys,exact50,0.072895,12742352,6.7099e+06,8.0981e+05
+qwen_C,16k,0Jbc3Ah4EIc_16k,all rows,other keys,exact50,0.072895,12742352,6.0324e+06,1.4631
+qwen_C,16k,0Jbc3Ah4EIc_16k,all rows,all keys,exact50,0.072895,12742352,1.2742e+07,8.0981e+05
+qwen_C,16k,0Jbc3Ah4EIc_16k,all rows,video keys,exact75,0.42085,12742352,6.7099e+06,2.1407e+06
+qwen_C,16k,0Jbc3Ah4EIc_16k,all rows,other keys,exact75,0.42085,12742352,6.0324e+06,64.48
+qwen_C,16k,0Jbc3Ah4EIc_16k,all rows,all keys,exact75,0.42085,12742352,1.2742e+07,2.1408e+06
+qwen_C,16k,0Jbc3Ah4EIc_16k,text before video,video keys,exact50,0.072895,11760,0,0
+qwen_C,16k,0Jbc3Ah4EIc_16k,text before video,other keys,exact50,0.072895,11760,11760,0
+qwen_C,16k,0Jbc3Ah4EIc_16k,text before video,all keys,exact50,0.072895,11760,11760,0
+qwen_C,16k,0Jbc3Ah4EIc_16k,text before video,video keys,exact75,0.42085,11760,0,0
+qwen_C,16k,0Jbc3Ah4EIc_16k,text before video,other keys,exact75,0.42085,11760,11760,0
+qwen_C,16k,0Jbc3Ah4EIc_16k,text before video,all keys,exact75,0.42085,11760,11760,0
+qwen_C,16k,0Jbc3Ah4EIc_16k,video,video keys,exact50,0.072895,12644352,6.6987e+06,8.0567e+05
+qwen_C,16k,0Jbc3Ah4EIc_16k,video,other keys,exact50,0.072895,12644352,5.9457e+06,0
+qwen_C,16k,0Jbc3Ah4EIc_16k,video,all keys,exact50,0.072895,12644352,1.2644e+07,8.0567e+05
+qwen_C,16k,0Jbc3Ah4EIc_16k,video,video keys,exact75,0.42085,12644352,6.6987e+06,2.1328e+06
+qwen_C,16k,0Jbc3Ah4EIc_16k,video,other keys,exact75,0.42085,12644352,5.9457e+06,0
+qwen_C,16k,0Jbc3Ah4EIc_16k,video,all keys,exact75,0.42085,12644352,1.2644e+07,2.1328e+06
+qwen_C,16k,0Jbc3Ah4EIc_16k,text after video,video keys,exact50,0.072895,86240,11271,4135.6
+qwen_C,16k,0Jbc3Ah4EIc_16k,text after video,other keys,exact50,0.072895,86240,74969,1.4631
+qwen_C,16k,0Jbc3Ah4EIc_16k,text after video,all keys,exact50,0.072895,86240,86240,4137
+qwen_C,16k,0Jbc3Ah4EIc_16k,text after video,video keys,exact75,0.42085,86240,11271,7891
+qwen_C,16k,0Jbc3Ah4EIc_16k,text after video,other keys,exact75,0.42085,86240,74969,64.48
+qwen_C,16k,0Jbc3Ah4EIc_16k,text after video,all keys,exact75,0.42085,86240,86240,7955.5
+qwen_C,16k,0Jbc3Ah4EIc_16k,question,video keys,exact50,0.072895,85456,10938,4008.8
+qwen_C,16k,0Jbc3Ah4EIc_16k,question,other keys,exact50,0.072895,85456,74518,1.4608
+qwen_C,16k,0Jbc3Ah4EIc_16k,question,all keys,exact50,0.072895,85456,85456,4010.2
+qwen_C,16k,0Jbc3Ah4EIc_16k,question,video keys,exact75,0.42085,85456,10938,7664.2
+qwen_C,16k,0Jbc3Ah4EIc_16k,question,other keys,exact75,0.42085,85456,74518,64.421
+qwen_C,16k,0Jbc3Ah4EIc_16k,question,all keys,exact75,0.42085,85456,85456,7728.6
+qwen_C,16k,0Jbc3Ah4EIc_16k,answer position,video keys,exact50,0.072895,784,44.223,17.724
+qwen_C,16k,0Jbc3Ah4EIc_16k,answer position,other keys,exact50,0.072895,784,739.78,0.010056
+qwen_C,16k,0Jbc3Ah4EIc_16k,answer position,all keys,exact50,0.072895,784,784,17.734
+qwen_C,16k,0Jbc3Ah4EIc_16k,answer position,video keys,exact75,0.42085,784,44.223,31.405
+qwen_C,16k,0Jbc3Ah4EIc_16k,answer position,other keys,exact75,0.42085,784,739.78,1.2334
+qwen_C,16k,0Jbc3Ah4EIc_16k,answer position,all keys,exact75,0.42085,784,784,32.638
+qwen_C,8k,0Jbc3Ah4EIc_8k,all rows,video keys,exact50,0.12565,6420176,3.1621e+06,4.2959e+05
+qwen_C,8k,0Jbc3Ah4EIc_8k,all rows,other keys,exact50,0.12565,6420176,3.2581e+06,5.064
+qwen_C,8k,0Jbc3Ah4EIc_8k,all rows,all keys,exact50,0.12565,6420176,6.4202e+06,4.296e+05
+qwen_C,8k,0Jbc3Ah4EIc_8k,all rows,video keys,exact75,0.74988,6420176,3.1621e+06,1.109e+06
+qwen_C,8k,0Jbc3Ah4EIc_8k,all rows,other keys,exact75,0.74988,6420176,3.2581e+06,351.57
+qwen_C,8k,0Jbc3Ah4EIc_8k,all rows,all keys,exact75,0.74988,6420176,6.4202e+06,1.1094e+06
+qwen_C,8k,0Jbc3Ah4EIc_8k,text before video,video keys,exact50,0.12565,11760,0,0
+qwen_C,8k,0Jbc3Ah4EIc_8k,text before video,other keys,exact50,0.12565,11760,11760,0
+qwen_C,8k,0Jbc3Ah4EIc_8k,text before video,all keys,exact50,0.12565,11760,11760,0
+qwen_C,8k,0Jbc3Ah4EIc_8k,text before video,video keys,exact75,0.74988,11760,0,0
+qwen_C,8k,0Jbc3Ah4EIc_8k,text before video,other keys,exact75,0.74988,11760,11760,0
+qwen_C,8k,0Jbc3Ah4EIc_8k,text before video,all keys,exact75,0.74988,11760,11760,0
+qwen_C,8k,0Jbc3Ah4EIc_8k,video,video keys,exact50,0.12565,6322176,3.1522e+06,4.2545e+05
+qwen_C,8k,0Jbc3Ah4EIc_8k,video,other keys,exact50,0.12565,6322176,3.17e+06,0
+qwen_C,8k,0Jbc3Ah4EIc_8k,video,all keys,exact50,0.12565,6322176,6.3222e+06,4.2545e+05
+qwen_C,8k,0Jbc3Ah4EIc_8k,video,video keys,exact75,0.74988,6322176,3.1522e+06,1.1014e+06
+qwen_C,8k,0Jbc3Ah4EIc_8k,video,other keys,exact75,0.74988,6322176,3.17e+06,0
+qwen_C,8k,0Jbc3Ah4EIc_8k,video,all keys,exact75,0.74988,6322176,6.3222e+06,1.1014e+06
+qwen_C,8k,0Jbc3Ah4EIc_8k,text after video,video keys,exact50,0.12565,86240,9841.3,4140.3
+qwen_C,8k,0Jbc3Ah4EIc_8k,text after video,other keys,exact50,0.12565,86240,76399,5.064
+qwen_C,8k,0Jbc3Ah4EIc_8k,text after video,all keys,exact50,0.12565,86240,86240,4145.4
+qwen_C,8k,0Jbc3Ah4EIc_8k,text after video,video keys,exact75,0.74988,86240,9841.3,7602.5
+qwen_C,8k,0Jbc3Ah4EIc_8k,text after video,other keys,exact75,0.74988,86240,76399,351.57
+qwen_C,8k,0Jbc3Ah4EIc_8k,text after video,all keys,exact75,0.74988,86240,86240,7954.1
+qwen_C,8k,0Jbc3Ah4EIc_8k,question,video keys,exact50,0.12565,85456,9510.6,4001.8
+qwen_C,8k,0Jbc3Ah4EIc_8k,question,other keys,exact50,0.12565,85456,75945,5.0415
+qwen_C,8k,0Jbc3Ah4EIc_8k,question,all keys,exact50,0.12565,85456,85456,4006.8
+qwen_C,8k,0Jbc3Ah4EIc_8k,question,video keys,exact75,0.74988,85456,9510.6,7352.1
+qwen_C,8k,0Jbc3Ah4EIc_8k,question,other keys,exact75,0.74988,85456,75945,351.28
+qwen_C,8k,0Jbc3Ah4EIc_8k,question,all keys,exact75,0.74988,85456,85456,7703.4
+qwen_C,8k,0Jbc3Ah4EIc_8k,answer position,video keys,exact50,0.12565,784,39.891,18.011
+qwen_C,8k,0Jbc3Ah4EIc_8k,answer position,other keys,exact50,0.12565,784,744.11,0.069136
+qwen_C,8k,0Jbc3Ah4EIc_8k,answer position,all keys,exact50,0.12565,784,784,18.08
+qwen_C,8k,0Jbc3Ah4EIc_8k,answer position,video keys,exact75,0.74988,784,39.891,30.601
+qwen_C,8k,0Jbc3Ah4EIc_8k,answer position,other keys,exact75,0.74988,784,744.11,4.6557
+qwen_C,8k,0Jbc3Ah4EIc_8k,answer position,all keys,exact75,0.74988,784,784,35.257
+qwen_C,16k,0bwyCF0HteE_16k,all rows,video keys,exact50,0.065324,12716480,6.5709e+06,7.8151e+05
+qwen_C,16k,0bwyCF0HteE_16k,all rows,other keys,exact50,0.065324,12716480,6.1456e+06,2.0322
+qwen_C,16k,0bwyCF0HteE_16k,all rows,all keys,exact50,0.065324,12716480,1.2716e+07,7.8151e+05
+qwen_C,16k,0bwyCF0HteE_16k,all rows,video keys,exact75,0.3783,12716480,6.5709e+06,2.0522e+06
+qwen_C,16k,0bwyCF0HteE_16k,all rows,other keys,exact75,0.3783,12716480,6.1456e+06,81.37
+qwen_C,16k,0bwyCF0HteE_16k,all rows,all keys,exact75,0.3783,12716480,1.2716e+07,2.0523e+06
+qwen_C,16k,0bwyCF0HteE_16k,text before video,video keys,exact50,0.065324,11760,0,0
+qwen_C,16k,0bwyCF0HteE_16k,text before video,other keys,exact50,0.065324,11760,11760,0
+qwen_C,16k,0bwyCF0HteE_16k,text before video,all keys,exact50,0.065324,11760,11760,0
+qwen_C,16k,0bwyCF0HteE_16k,text before video,video keys,exact75,0.3783,11760,0,0
+qwen_C,16k,0bwyCF0HteE_16k,text before video,other keys,exact75,0.3783,11760,11760,0
+qwen_C,16k,0bwyCF0HteE_16k,text before video,all keys,exact75,0.3783,11760,11760,0
+qwen_C,16k,0bwyCF0HteE_16k,video,video keys,exact50,0.065324,12644352,6.5639e+06,7.7872e+05
+qwen_C,16k,0bwyCF0HteE_16k,video,other keys,exact50,0.065324,12644352,6.0805e+06,0
+qwen_C,16k,0bwyCF0HteE_16k,video,all keys,exact50,0.065324,12644352,1.2644e+07,7.7872e+05
+qwen_C,16k,0bwyCF0HteE_16k,video,video keys,exact75,0.3783,12644352,6.5639e+06,2.0473e+06
+qwen_C,16k,0bwyCF0HteE_16k,video,other keys,exact75,0.3783,12644352,6.0805e+06,0
+qwen_C,16k,0bwyCF0HteE_16k,video,all keys,exact75,0.3783,12644352,1.2644e+07,2.0473e+06
+qwen_C,16k,0bwyCF0HteE_16k,text after video,video keys,exact50,0.065324,60368,6955.9,2784.4
+qwen_C,16k,0bwyCF0HteE_16k,text after video,other keys,exact50,0.065324,60368,53412,2.0322
+qwen_C,16k,0bwyCF0HteE_16k,text after video,all keys,exact50,0.065324,60368,60368,2786.5
+qwen_C,16k,0bwyCF0HteE_16k,text after video,video keys,exact75,0.3783,60368,6955.9,4902.2
+qwen_C,16k,0bwyCF0HteE_16k,text after video,other keys,exact75,0.3783,60368,53412,81.37
+qwen_C,16k,0bwyCF0HteE_16k,text after video,all keys,exact75,0.3783,60368,60368,4983.5
+qwen_C,16k,0bwyCF0HteE_16k,question,video keys,exact50,0.065324,59584,6614.9,2653.3
+qwen_C,16k,0bwyCF0HteE_16k,question,other keys,exact50,0.065324,59584,52969,2.0193
+qwen_C,16k,0bwyCF0HteE_16k,question,all keys,exact50,0.065324,59584,59584,2655.3
+qwen_C,16k,0bwyCF0HteE_16k,question,video keys,exact75,0.3783,59584,6614.9,4669.1
+qwen_C,16k,0bwyCF0HteE_16k,question,other keys,exact75,0.3783,59584,52969,81.265
+qwen_C,16k,0bwyCF0HteE_16k,question,all keys,exact75,0.3783,59584,59584,4750.3
+qwen_C,16k,0bwyCF0HteE_16k,answer position,video keys,exact50,0.065324,784,40.924,19.199
+qwen_C,16k,0bwyCF0HteE_16k,answer position,other keys,exact50,0.065324,784,743.08,0.025455
+qwen_C,16k,0bwyCF0HteE_16k,answer position,all keys,exact50,0.065324,784,784,19.224
+qwen_C,16k,0bwyCF0HteE_16k,answer position,video keys,exact75,0.3783,784,40.924,31.565
+qwen_C,16k,0bwyCF0HteE_16k,answer position,other keys,exact75,0.3783,784,743.08,1.6653
+qwen_C,16k,0bwyCF0HteE_16k,answer position,all keys,exact75,0.3783,784,784,33.231
+qwen_C,8k,0bwyCF0HteE_8k,all rows,video keys,exact50,0.13384,6394304,3.1581e+06,4.5212e+05
+qwen_C,8k,0bwyCF0HteE_8k,all rows,other keys,exact50,0.13384,6394304,3.2363e+06,13.797
+qwen_C,8k,0bwyCF0HteE_8k,all rows,all keys,exact50,0.13384,6394304,6.3943e+06,4.5213e+05
+qwen_C,8k,0bwyCF0HteE_8k,all rows,video keys,exact75,0.76229,6394304,3.1581e+06,1.135e+06
+qwen_C,8k,0bwyCF0HteE_8k,all rows,other keys,exact75,0.76229,6394304,3.2363e+06,449.64
+qwen_C,8k,0bwyCF0HteE_8k,all rows,all keys,exact75,0.76229,6394304,6.3943e+06,1.1354e+06
+qwen_C,8k,0bwyCF0HteE_8k,text before video,video keys,exact50,0.13384,11760,0,0
+qwen_C,8k,0bwyCF0HteE_8k,text before video,other keys,exact50,0.13384,11760,11760,0
+qwen_C,8k,0bwyCF0HteE_8k,text before video,all keys,exact50,0.13384,11760,11760,0
+qwen_C,8k,0bwyCF0HteE_8k,text before video,video keys,exact75,0.76229,11760,0,0
+qwen_C,8k,0bwyCF0HteE_8k,text before video,other keys,exact75,0.76229,11760,11760,0
+qwen_C,8k,0bwyCF0HteE_8k,text before video,all keys,exact75,0.76229,11760,11760,0
+qwen_C,8k,0bwyCF0HteE_8k,video,video keys,exact50,0.13384,6322176,3.1518e+06,4.4943e+05
+qwen_C,8k,0bwyCF0HteE_8k,video,other keys,exact50,0.13384,6322176,3.1703e+06,0
+qwen_C,8k,0bwyCF0HteE_8k,video,all keys,exact50,0.13384,6322176,6.3222e+06,4.4943e+05
+qwen_C,8k,0bwyCF0HteE_8k,video,video keys,exact75,0.76229,6322176,3.1518e+06,1.1303e+06
+qwen_C,8k,0bwyCF0HteE_8k,video,other keys,exact75,0.76229,6322176,3.1703e+06,0
+qwen_C,8k,0bwyCF0HteE_8k,video,all keys,exact75,0.76229,6322176,6.3222e+06,1.1303e+06
+qwen_C,8k,0bwyCF0HteE_8k,text after video,video keys,exact50,0.13384,60368,6202.7,2686.6
+qwen_C,8k,0bwyCF0HteE_8k,text after video,other keys,exact50,0.13384,60368,54165,13.797
+qwen_C,8k,0bwyCF0HteE_8k,text after video,all keys,exact50,0.13384,60368,60368,2700.4
+qwen_C,8k,0bwyCF0HteE_8k,text after video,video keys,exact75,0.76229,60368,6202.7,4629.1
+qwen_C,8k,0bwyCF0HteE_8k,text after video,other keys,exact75,0.76229,60368,54165,449.64
+qwen_C,8k,0bwyCF0HteE_8k,text after video,all keys,exact75,0.76229,60368,60368,5078.7
+qwen_C,8k,0bwyCF0HteE_8k,question,video keys,exact50,0.13384,59584,5883.4,2549.7
+qwen_C,8k,0bwyCF0HteE_8k,question,other keys,exact50,0.13384,59584,53701,13.751
+qwen_C,8k,0bwyCF0HteE_8k,question,all keys,exact50,0.13384,59584,59584,2563.4
+qwen_C,8k,0bwyCF0HteE_8k,question,video keys,exact75,0.76229,59584,5883.4,4392.8
+qwen_C,8k,0bwyCF0HteE_8k,question,other keys,exact75,0.76229,59584,53701,448.77
+qwen_C,8k,0bwyCF0HteE_8k,question,all keys,exact75,0.76229,59584,59584,4841.6
+qwen_C,8k,0bwyCF0HteE_8k,answer position,video keys,exact50,0.13384,784,36.512,18.426
+qwen_C,8k,0bwyCF0HteE_8k,answer position,other keys,exact50,0.13384,784,747.49,0.1739
+qwen_C,8k,0bwyCF0HteE_8k,answer position,all keys,exact50,0.13384,784,784,18.599
+qwen_C,8k,0bwyCF0HteE_8k,answer position,video keys,exact75,0.76229,784,36.512,29.071
+qwen_C,8k,0bwyCF0HteE_8k,answer position,other keys,exact75,0.76229,784,747.49,9.7331
+qwen_C,8k,0bwyCF0HteE_8k,answer position,all keys,exact75,0.76229,784,784,38.805
+qwen_C,16k,0iED5BojTMI_16k,all rows,video keys,exact50,0.10777,12714912,6.8728e+06,1.0106e+06
+qwen_C,16k,0iED5BojTMI_16k,all rows,other keys,exact50,0.10777,12714912,5.8422e+06,12.392
+qwen_C,16k,0iED5BojTMI_16k,all rows,all keys,exact50,0.10777,12714912,1.2715e+07,1.0106e+06
+qwen_C,16k,0iED5BojTMI_16k,all rows,video keys,exact75,0.52551,12714912,6.8728e+06,2.4305e+06
+qwen_C,16k,0iED5BojTMI_16k,all rows,other keys,exact75,0.52551,12714912,5.8422e+06,266.78
+qwen_C,16k,0iED5BojTMI_16k,all rows,all keys,exact75,0.52551,12714912,1.2715e+07,2.4308e+06
+qwen_C,16k,0iED5BojTMI_16k,text before video,video keys,exact50,0.10777,11760,0,0
+qwen_C,16k,0iED5BojTMI_16k,text before video,other keys,exact50,0.10777,11760,11760,0
+qwen_C,16k,0iED5BojTMI_16k,text before video,all keys,exact50,0.10777,11760,11760,0
+qwen_C,16k,0iED5BojTMI_16k,text before video,video keys,exact75,0.52551,11760,0,0
+qwen_C,16k,0iED5BojTMI_16k,text before video,other keys,exact75,0.52551,11760,11760,0
+qwen_C,16k,0iED5BojTMI_16k,text before video,all keys,exact75,0.52551,11760,11760,0
+qwen_C,16k,0iED5BojTMI_16k,video,video keys,exact50,0.10777,12644352,6.866e+06,1.0074e+06
+qwen_C,16k,0iED5BojTMI_16k,video,other keys,exact50,0.10777,12644352,5.7784e+06,0
+qwen_C,16k,0iED5BojTMI_16k,video,all keys,exact50,0.10777,12644352,1.2644e+07,1.0074e+06
+qwen_C,16k,0iED5BojTMI_16k,video,video keys,exact75,0.52551,12644352,6.866e+06,2.4253e+06
+qwen_C,16k,0iED5BojTMI_16k,video,other keys,exact75,0.52551,12644352,5.7784e+06,0
+qwen_C,16k,0iED5BojTMI_16k,video,all keys,exact75,0.52551,12644352,1.2644e+07,2.4253e+06
+qwen_C,16k,0iED5BojTMI_16k,text after video,video keys,exact50,0.10777,58800,6783.6,3229.6
+qwen_C,16k,0iED5BojTMI_16k,text after video,other keys,exact50,0.10777,58800,52016,12.392
+qwen_C,16k,0iED5BojTMI_16k,text after video,all keys,exact50,0.10777,58800,58800,3242
+qwen_C,16k,0iED5BojTMI_16k,text after video,video keys,exact75,0.52551,58800,6783.6,5229.8
+qwen_C,16k,0iED5BojTMI_16k,text after video,other keys,exact75,0.52551,58800,52016,266.78
+qwen_C,16k,0iED5BojTMI_16k,text after video,all keys,exact75,0.52551,58800,58800,5496.6
+qwen_C,16k,0iED5BojTMI_16k,question,video keys,exact50,0.10777,58016,6450.1,3074
+qwen_C,16k,0iED5BojTMI_16k,question,other keys,exact50,0.10777,58016,51566,12.366
+qwen_C,16k,0iED5BojTMI_16k,question,all keys,exact50,0.10777,58016,58016,3086.4
+qwen_C,16k,0iED5BojTMI_16k,question,video keys,exact75,0.52551,58016,6450.1,4978.2
+qwen_C,16k,0iED5BojTMI_16k,question,other keys,exact75,0.52551,58016,51566,266.41
+qwen_C,16k,0iED5BojTMI_16k,question,all keys,exact75,0.52551,58016,58016,5244.7
+qwen_C,16k,0iED5BojTMI_16k,answer position,video keys,exact50,0.10777,784,49.905,24.747
+qwen_C,16k,0iED5BojTMI_16k,answer position,other keys,exact50,0.10777,784,734.09,0.18779
+qwen_C,16k,0iED5BojTMI_16k,answer position,all keys,exact50,0.10777,784,784,24.935
+qwen_C,16k,0iED5BojTMI_16k,answer position,video keys,exact75,0.52551,784,49.905,39.238
+qwen_C,16k,0iED5BojTMI_16k,answer position,other keys,exact75,0.52551,784,734.09,5.8156
+qwen_C,16k,0iED5BojTMI_16k,answer position,all keys,exact75,0.52551,784,784,45.053
+qwen_C,8k,0iED5BojTMI_8k,all rows,video keys,exact50,0.18294,6392736,3.3129e+06,5.1562e+05
+qwen_C,8k,0iED5BojTMI_8k,all rows,other keys,exact50,0.18294,6392736,3.0798e+06,22.007
+qwen_C,8k,0iED5BojTMI_8k,all rows,all keys,exact50,0.18294,6392736,6.3927e+06,5.1564e+05
+qwen_C,8k,0iED5BojTMI_8k,all rows,video keys,exact75,0.8972,6392736,3.3129e+06,1.2422e+06
+qwen_C,8k,0iED5BojTMI_8k,all rows,other keys,exact75,0.8972,6392736,3.0798e+06,591.11
+qwen_C,8k,0iED5BojTMI_8k,all rows,all keys,exact75,0.8972,6392736,6.3927e+06,1.2428e+06
+qwen_C,8k,0iED5BojTMI_8k,text before video,video keys,exact50,0.18294,11760,0,0
+qwen_C,8k,0iED5BojTMI_8k,text before video,other keys,exact50,0.18294,11760,11760,0
+qwen_C,8k,0iED5BojTMI_8k,text before video,all keys,exact50,0.18294,11760,11760,0
+qwen_C,8k,0iED5BojTMI_8k,text before video,video keys,exact75,0.8972,11760,0,0
+qwen_C,8k,0iED5BojTMI_8k,text before video,other keys,exact75,0.8972,11760,11760,0
+qwen_C,8k,0iED5BojTMI_8k,text before video,all keys,exact75,0.8972,11760,11760,0
+qwen_C,8k,0iED5BojTMI_8k,video,video keys,exact50,0.18294,6322176,3.3068e+06,5.1268e+05
+qwen_C,8k,0iED5BojTMI_8k,video,other keys,exact50,0.18294,6322176,3.0154e+06,0
+qwen_C,8k,0iED5BojTMI_8k,video,all keys,exact50,0.18294,6322176,6.3222e+06,5.1268e+05
+qwen_C,8k,0iED5BojTMI_8k,video,video keys,exact75,0.8972,6322176,3.3068e+06,1.2373e+06
+qwen_C,8k,0iED5BojTMI_8k,video,other keys,exact75,0.8972,6322176,3.0154e+06,0
+qwen_C,8k,0iED5BojTMI_8k,video,all keys,exact75,0.8972,6322176,6.3222e+06,1.2373e+06
+qwen_C,8k,0iED5BojTMI_8k,text after video,video keys,exact50,0.18294,58800,6174.3,2941.4
+qwen_C,8k,0iED5BojTMI_8k,text after video,other keys,exact50,0.18294,58800,52626,22.007
+qwen_C,8k,0iED5BojTMI_8k,text after video,all keys,exact50,0.18294,58800,58800,2963.4
+qwen_C,8k,0iED5BojTMI_8k,text after video,video keys,exact75,0.8972,58800,6174.3,4861.4
+qwen_C,8k,0iED5BojTMI_8k,text after video,other keys,exact75,0.8972,58800,52626,591.11
+qwen_C,8k,0iED5BojTMI_8k,text after video,all keys,exact75,0.8972,58800,58800,5452.5
+qwen_C,8k,0iED5BojTMI_8k,question,video keys,exact50,0.18294,58016,5849,2789.2
+qwen_C,8k,0iED5BojTMI_8k,question,other keys,exact50,0.18294,58016,52167,21.972
+qwen_C,8k,0iED5BojTMI_8k,question,all keys,exact50,0.18294,58016,58016,2811.1
+qwen_C,8k,0iED5BojTMI_8k,question,video keys,exact75,0.8972,58016,5849,4607.9
+qwen_C,8k,0iED5BojTMI_8k,question,other keys,exact75,0.8972,58016,52167,589.58
+qwen_C,8k,0iED5BojTMI_8k,question,all keys,exact75,0.8972,58016,58016,5197.5
+qwen_C,8k,0iED5BojTMI_8k,answer position,video keys,exact50,0.18294,784,40.156,20.786
+qwen_C,8k,0iED5BojTMI_8k,answer position,other keys,exact50,0.18294,784,743.84,0.44018
+qwen_C,8k,0iED5BojTMI_8k,answer position,all keys,exact50,0.18294,784,784,21.226
+qwen_C,8k,0iED5BojTMI_8k,answer position,video keys,exact75,0.8972,784,40.156,32.518
+qwen_C,8k,0iED5BojTMI_8k,answer position,other keys,exact75,0.8972,784,743.84,13.983
+qwen_C,8k,0iED5BojTMI_8k,answer position,all keys,exact75,0.8972,784,784,46.501
+qwen_C,16k,0kRsiSdDFYg_16k,all rows,video keys,exact50,0.080667,12732944,6.3568e+06,1.0002e+06
+qwen_C,16k,0kRsiSdDFYg_16k,all rows,other keys,exact50,0.080667,12732944,6.3762e+06,6.3792
+qwen_C,16k,0kRsiSdDFYg_16k,all rows,all keys,exact50,0.080667,12732944,1.2733e+07,1.0002e+06
+qwen_C,16k,0kRsiSdDFYg_16k,all rows,video keys,exact75,0.43414,12732944,6.3568e+06,2.4037e+06
+qwen_C,16k,0kRsiSdDFYg_16k,all rows,other keys,exact75,0.43414,12732944,6.3762e+06,71.425
+qwen_C,16k,0kRsiSdDFYg_16k,all rows,all keys,exact75,0.43414,12732944,1.2733e+07,2.4038e+06
+qwen_C,16k,0kRsiSdDFYg_16k,text before video,video keys,exact50,0.080667,11760,0,0
+qwen_C,16k,0kRsiSdDFYg_16k,text before video,other keys,exact50,0.080667,11760,11760,0
+qwen_C,16k,0kRsiSdDFYg_16k,text before video,all keys,exact50,0.080667,11760,11760,0
+qwen_C,16k,0kRsiSdDFYg_16k,text before video,video keys,exact75,0.43414,11760,0,0
+qwen_C,16k,0kRsiSdDFYg_16k,text before video,other keys,exact75,0.43414,11760,11760,0
+qwen_C,16k,0kRsiSdDFYg_16k,text before video,all keys,exact75,0.43414,11760,11760,0
+qwen_C,16k,0kRsiSdDFYg_16k,video,video keys,exact50,0.080667,12644352,6.3483e+06,9.9712e+05
+qwen_C,16k,0kRsiSdDFYg_16k,video,other keys,exact50,0.080667,12644352,6.296e+06,0
+qwen_C,16k,0kRsiSdDFYg_16k,video,all keys,exact50,0.080667,12644352,1.2644e+07,9.9712e+05
+qwen_C,16k,0kRsiSdDFYg_16k,video,video keys,exact75,0.43414,12644352,6.3483e+06,2.398e+06
+qwen_C,16k,0kRsiSdDFYg_16k,video,other keys,exact75,0.43414,12644352,6.296e+06,0
+qwen_C,16k,0kRsiSdDFYg_16k,video,all keys,exact75,0.43414,12644352,1.2644e+07,2.398e+06
+qwen_C,16k,0kRsiSdDFYg_16k,text after video,video keys,exact50,0.080667,76832,8449.4,3115.6
+qwen_C,16k,0kRsiSdDFYg_16k,text after video,other keys,exact50,0.080667,76832,68383,6.3792
+qwen_C,16k,0kRsiSdDFYg_16k,text after video,all keys,exact50,0.080667,76832,76832,3122
+qwen_C,16k,0kRsiSdDFYg_16k,text after video,video keys,exact75,0.43414,76832,8449.4,5713.2
+qwen_C,16k,0kRsiSdDFYg_16k,text after video,other keys,exact75,0.43414,76832,68383,71.425
+qwen_C,16k,0kRsiSdDFYg_16k,text after video,all keys,exact75,0.43414,76832,76832,5784.6
+qwen_C,16k,0kRsiSdDFYg_16k,question,video keys,exact50,0.080667,76048,8125.7,2997.2
+qwen_C,16k,0kRsiSdDFYg_16k,question,other keys,exact50,0.080667,76048,67922,6.3599
+qwen_C,16k,0kRsiSdDFYg_16k,question,all keys,exact50,0.080667,76048,76048,3003.5
+qwen_C,16k,0kRsiSdDFYg_16k,question,video keys,exact75,0.43414,76048,8125.7,5497.3
+qwen_C,16k,0kRsiSdDFYg_16k,question,other keys,exact75,0.43414,76048,67922,71.373
+qwen_C,16k,0kRsiSdDFYg_16k,question,all keys,exact75,0.43414,76048,76048,5568.7
+qwen_C,16k,0kRsiSdDFYg_16k,answer position,video keys,exact50,0.080667,784,32.993,13.521
+qwen_C,16k,0kRsiSdDFYg_16k,answer position,other keys,exact50,0.080667,784,751.01,0.075998
+qwen_C,16k,0kRsiSdDFYg_16k,answer position,all keys,exact50,0.080667,784,784,13.597
+qwen_C,16k,0kRsiSdDFYg_16k,answer position,video keys,exact75,0.43414,784,32.993,23.74
+qwen_C,16k,0kRsiSdDFYg_16k,answer position,other keys,exact75,0.43414,784,751.01,1.0032
+qwen_C,16k,0kRsiSdDFYg_16k,answer position,all keys,exact75,0.43414,784,784,24.743
+qwen_C,8k,0kRsiSdDFYg_8k,all rows,video keys,exact50,0.12697,6410768,3.015e+06,4.9223e+05
+qwen_C,8k,0kRsiSdDFYg_8k,all rows,other keys,exact50,0.12697,6410768,3.3958e+06,4.688
+qwen_C,8k,0kRsiSdDFYg_8k,all rows,all keys,exact50,0.12697,6410768,6.4108e+06,4.9224e+05
+qwen_C,8k,0kRsiSdDFYg_8k,all rows,video keys,exact75,0.72013,6410768,3.015e+06,1.1865e+06
+qwen_C,8k,0kRsiSdDFYg_8k,all rows,other keys,exact75,0.72013,6410768,3.3958e+06,353.23
+qwen_C,8k,0kRsiSdDFYg_8k,all rows,all keys,exact75,0.72013,6410768,6.4108e+06,1.1868e+06
+qwen_C,8k,0kRsiSdDFYg_8k,text before video,video keys,exact50,0.12697,11760,0,0
+qwen_C,8k,0kRsiSdDFYg_8k,text before video,other keys,exact50,0.12697,11760,11760,0
+qwen_C,8k,0kRsiSdDFYg_8k,text before video,all keys,exact50,0.12697,11760,11760,0
+qwen_C,8k,0kRsiSdDFYg_8k,text before video,video keys,exact75,0.72013,11760,0,0
+qwen_C,8k,0kRsiSdDFYg_8k,text before video,other keys,exact75,0.72013,11760,11760,0
+qwen_C,8k,0kRsiSdDFYg_8k,text before video,all keys,exact75,0.72013,11760,11760,0
+qwen_C,8k,0kRsiSdDFYg_8k,video,video keys,exact50,0.12697,6322176,3.0076e+06,4.8904e+05
+qwen_C,8k,0kRsiSdDFYg_8k,video,other keys,exact50,0.12697,6322176,3.3146e+06,0
+qwen_C,8k,0kRsiSdDFYg_8k,video,all keys,exact50,0.12697,6322176,6.3222e+06,4.8904e+05
+qwen_C,8k,0kRsiSdDFYg_8k,video,video keys,exact75,0.72013,6322176,3.0076e+06,1.1809e+06
+qwen_C,8k,0kRsiSdDFYg_8k,video,other keys,exact75,0.72013,6322176,3.3146e+06,0
+qwen_C,8k,0kRsiSdDFYg_8k,video,all keys,exact75,0.72013,6322176,6.3222e+06,1.1809e+06
+qwen_C,8k,0kRsiSdDFYg_8k,text after video,video keys,exact50,0.12697,76832,7450,3190.6
+qwen_C,8k,0kRsiSdDFYg_8k,text after video,other keys,exact50,0.12697,76832,69382,4.688
+qwen_C,8k,0kRsiSdDFYg_8k,text after video,all keys,exact50,0.12697,76832,76832,3195.3
+qwen_C,8k,0kRsiSdDFYg_8k,text after video,video keys,exact75,0.72013,76832,7450,5587.8
+qwen_C,8k,0kRsiSdDFYg_8k,text after video,other keys,exact75,0.72013,76832,69382,353.23
+qwen_C,8k,0kRsiSdDFYg_8k,text after video,all keys,exact75,0.72013,76832,76832,5941
+qwen_C,8k,0kRsiSdDFYg_8k,question,video keys,exact50,0.12697,76048,7134.3,3062.2
+qwen_C,8k,0kRsiSdDFYg_8k,question,other keys,exact50,0.12697,76048,68914,4.6724
+qwen_C,8k,0kRsiSdDFYg_8k,question,all keys,exact50,0.12697,76048,76048,3066.8
+qwen_C,8k,0kRsiSdDFYg_8k,question,video keys,exact75,0.72013,76048,7134.3,5362.6
+qwen_C,8k,0kRsiSdDFYg_8k,question,other keys,exact75,0.72013,76048,68914,352.64
+qwen_C,8k,0kRsiSdDFYg_8k,question,all keys,exact75,0.72013,76048,76048,5715.3
+qwen_C,8k,0kRsiSdDFYg_8k,answer position,video keys,exact50,0.12697,784,27.7,12.639
+qwen_C,8k,0kRsiSdDFYg_8k,answer position,other keys,exact50,0.12697,784,756.3,0.040806
+qwen_C,8k,0kRsiSdDFYg_8k,answer position,all keys,exact50,0.12697,784,784,12.679
+qwen_C,8k,0kRsiSdDFYg_8k,answer position,video keys,exact75,0.72013,784,27.7,21.341
+qwen_C,8k,0kRsiSdDFYg_8k,answer position,other keys,exact75,0.72013,784,756.3,5.1165
+qwen_C,8k,0kRsiSdDFYg_8k,answer position,all keys,exact75,0.72013,784,784,26.458
