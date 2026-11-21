@@ -1,7 +1,11 @@
+<!-- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Code
 
-Every script that produced the numbers in `../reports/`, exactly as it ran on DeltaAI (NCSA, NVIDIA GH200 96 GB,
-ARM / aarch64 CPU). Nothing here was edited after the runs.
+Historical experiment scripts from DeltaAI (NCSA, NVIDIA GH200 96 GB, ARM / aarch64 CPU).
+The Nov 21 extension adds decode BLASST, ModelOpt parity checks and an attention-data collector.
+See [Attention Lab](../attention-lab/README.md) for the new workflow; the historical reports and results
+remain the record of the original runs.
 
 ## Before you run anything
 
@@ -27,12 +31,16 @@ ARM / aarch64 CPU). Nothing here was edited after the runs.
   normal softmax and P.V.
 - It is a **simulation**: QK^T is computed for every tile (as in the real BLASST kernel), and the softmax / P.V
   work is not actually saved either. It reports what would be skipped and returns what a skipping kernel would.
-- Decode (one query token): plain PyTorch scaled-dot-product attention.
+- Decode (one query token): BLASST on 1 × 128 cached-key tiles, inheriting the prefill threshold.
+  `set_decode_threshold` selects an independent threshold or restores the original dense SDPA path.
 - Threshold: `set_threshold(lam=...)` (fixed), `set_threshold(a=...)` (calibrated lambda = a / L), or
   `set_threshold(None)` (no skipping).
 - Recording: with `STATE["record"] = True` it saves each tile's **margin** (max over the 128 rows of
   tile max - running max). A tile is skipped at lambda iff margin < ln(lambda), so one dense pass gives the skip
   set for every lambda (`masks_from_margins`). `STATE["dump_qk_layers"]` also saves Q and K.
+
+The new `attention_study.py`, `compare_decode_modelopt.py`, and `test_decode_study.py` are documented
+in [Attention Lab](../attention-lab/README.md).
 
 **`blasst_regions.py`**: the region-aware version for the VLM study (`attn_implementation="blasst_regions"`;
 prefill only, batch size 1).

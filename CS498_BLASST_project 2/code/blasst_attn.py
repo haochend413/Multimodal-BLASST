@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """
 BLASST skip-softmax attention, simulated in PyTorch and registered with
 Hugging Face transformers' AttentionInterface under the name "blasst".
@@ -14,7 +16,8 @@ What it does (prefill, i.e. more than one query token):
   Because a tile that holds some row's running max has (tile_max - running_max) = 0
   for that row, it can never be skipped, so every row keeps at least one tile.
 
-Decode (one query token): plain scaled_dot_product_attention, unchanged.
+Decode uses 1 x 128 tiles over the cached keys, with the same skip rule.
+set_decode_threshold(enabled=False) restores the original dense decode path.
 
 The skip decision is "simulated": QK^T is still computed for every tile, which
 is also true of the real BLASST kernel; here the softmax/PV work is not actually
@@ -63,6 +66,13 @@ STATE: Dict = {
     "qk": {},                # layer_idx -> (q, k) bf16 CPU
     "stats": {},             # layer_idx -> {"skipped": [H] long, "causal": [H] long}
     "collect_stats": True,
+    "decode_override": False,
+    "decode_enabled": True,
+    "decode_lam": None,
+    "decode_a": None,
+    "phase_stats": {},
+    "observer": None,         # optional synchronous callback; must not retain GPU tensors
+    "decode_records": {},    # layer -> list of [B,H,1,key_tiles], one tensor per step
 }
 
 
@@ -80,15 +90,33 @@ def reset_records(record: Optional[bool] = None, dump_qk_layers: Optional[List[i
     STATE["record_meta"] = {}
     STATE["qk"] = {}
     STATE["stats"] = {}
+    STATE["phase_stats"] = {}
+    STATE["decode_records"] = {}
     if record is not None:
         STATE["record"] = record
     if dump_qk_layers is not None:
         STATE["dump_qk_layers"] = list(dump_qk_layers)
 
 
+def set_decode_threshold(lam: float | None = None, a: float | None = None,
+                         *, enabled: bool = True, inherit: bool = False) -> None:
+    """Configure decode separately; inherit=True uses the prefill threshold."""
+    if lam is not None and not 0 < lam <= 1:
+        raise ValueError("decode lambda must be in (0, 1]")
+    if a is not None and (not math.isfinite(a) or a <= 0):
+        raise ValueError("decode scale factor must be finite and positive")
+    STATE.update(decode_override=not inherit, decode_enabled=enabled,
+                 decode_lam=lam, decode_a=a)
+
+
 def get_margins() -> Dict[int, torch.Tensor]:
-    """layer_idx -> margin tensor [B, H, n_q_tiles, n_k_tiles] (fp32, CPU)."""
+    """Prefill margins [B,H,query_tiles,key_tiles], fp32 CPU; decode is recorded separately."""
     return {l: torch.stack(chunks, dim=2) for l, chunks in STATE["records"].items()}
+
+
+def get_decode_margins() -> dict[int, list[torch.Tensor]]:
+    """Decode margins per layer and step; key tile count can grow with the cache."""
+    return STATE["decode_records"]
 
 
 def sparsity_from_stats() -> Dict[str, object]:
@@ -147,7 +175,8 @@ def blasst_attention_forward(
         value = value.repeat_interleave(n_rep, dim=1)
 
     # ---------------- decode: one query token, standard SDPA ----------------
-    if Sq == 1:
+    phase = "decode" if Sq == 1 else "prefill"
+    if Sq == 1 and not STATE["decode_enabled"]:
         mask = attention_mask
         if mask is not None and mask.dtype != torch.bool:
             mask = mask[:, :, -1:, :Skv].to(query.dtype)
@@ -158,6 +187,10 @@ def blasst_attention_forward(
 
     # ---------------- prefill: chunked skip-softmax ----------------
     ln_lam = math.log(STATE["a"] / Skv) if STATE["a"] is not None else STATE["ln_lam"]
+    if phase == "decode" and STATE["decode_override"]:
+        decode_a, decode_lam = STATE["decode_a"], STATE["decode_lam"]
+        ln_lam = (math.log(decode_a / Skv) if decode_a is not None else
+                  NEG_INF if decode_lam is None else math.log(decode_lam))
     # Cap lambda at 1 (ln_lam <= 0). Above 1 even the tile holding a row's max (margin 0) would be
     # skipped, the row would lose every tile and softmax would return NaN. Calibrated a/L hits this
     # when L is short (e.g. a = 1000, L = 650).
@@ -171,8 +204,9 @@ def blasst_attention_forward(
 
     stats = STATE["stats"].setdefault(layer_idx, {
         "skipped": torch.zeros(Hq, dtype=torch.long), "causal": torch.zeros(Hq, dtype=torch.long)})
-    rec = STATE["records"].setdefault(layer_idx, []) if STATE["record"] else None
-    if STATE["record"]:
+    rec = (STATE["records"].setdefault(layer_idx, [])
+           if STATE["record"] and phase == "prefill" else None)
+    if STATE["record"] and phase == "prefill":
         STATE["record_meta"][layer_idx] = {"Sq": Sq, "Skv": Skv, "offset": offset}
 
     for r0 in range(0, Sq, TILE):
@@ -197,6 +231,14 @@ def blasst_attention_forward(
         diff = torch.where(torch.isfinite(running), diff, torch.full_like(diff, NEG_INF))
         margin = diff.amax(dim=2)                                           # max over rows -> [B, H, n_kt]
         skip = margin < ln_lam                                              # all rows far below running max
+        if STATE["record"] and phase == "decode":
+            STATE["decode_records"].setdefault(layer_idx, []).append(
+                margin.detach().float().cpu().unsqueeze(2))
+        observer = STATE["observer"]
+        if observer is not None:
+            observer(layer=layer_idx, phase=phase, q_start=r0 + offset,
+                     scores=s[..., :Skv], margin=margin, skip=skip,
+                     ln_lambda=ln_lam, key_length=Skv)
 
         # bookkeeping (causal tiles only; fully-masked tiles are not "skipped", they do not exist)
         if STATE["collect_stats"] or rec is not None:
@@ -206,6 +248,10 @@ def blasst_attention_forward(
                 sk = (skip & causal[None, None, :]).sum(dim=(0, 2)).cpu()   # [H]
                 stats["skipped"] += sk
                 stats["causal"] += int(causal.sum()) * B
+                phase_stats = STATE["phase_stats"].setdefault(
+                    phase, {"skipped": 0, "causal": 0})
+                phase_stats["skipped"] += int(sk.sum())
+                phase_stats["causal"] += int(causal.sum()) * B * Hq
             if rec is not None:
                 rec.append(margin.detach().float().cpu())
 

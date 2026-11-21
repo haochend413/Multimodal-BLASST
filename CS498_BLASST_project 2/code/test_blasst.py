@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """
 Correctness tests for blasst_attn.py. Runs on CPU or a small GPU with a tiny
 randomly initialised Llama (GQA) so no download is needed.
@@ -210,7 +212,7 @@ def t3_model_level(dev):
     with torch.no_grad():
         gen = model.generate(ids, max_new_tokens=8, do_sample=False)
     assert torch.equal(gen, gen_ref), "generate() mismatch (prefill+decode path)"
-    print("T3 ok  generate() identical to sdpa (prefill via blasst, decode via SDPA)")
+    print("T3 ok  generate() identical to sdpa (BLASST simulation in both phases, skipping off)")
 
     # Skipping ON through the whole model. A random model has no sink, so plant one inside the
     # attention call (same planting for both), then compare our function with the oracle.
