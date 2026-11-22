@@ -105,6 +105,7 @@ CLAUDE.local.md
 CMakeUserPresets.json
 compile_commands.json
 *.bin
+!/CS498_BLASST_project 2/attention-lab/dist/demo.scores.bin
 .dir-locals.el
 .devcontainer/devcontainer.env.user
 .devcontainer/docker-compose.override.yml

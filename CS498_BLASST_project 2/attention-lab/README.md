@@ -16,6 +16,10 @@ Use **Load experiment** to open JSON files from the collector; files stay in bro
 Multiple datasets can be loaded and selected. Choose phase, layer, query head, decode step,
 and heatmap metric. Region buttons highlight cells containing the selected token-pair region.
 The distribution and region statistics always describe the complete selected view.
+Click a block to expand its matrix of scaled QK logits. Each score shows the query-to-key
+modality pair, and masked positions are labeled in the matrix. The bundled demo includes
+token scores. For recorded data, use **Load experiment** to select both the JSON summary and
+its matching `.scores.bin` file. Files can also be selected separately, in either order.
 
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.
 It is explicitly synthetic, not measured Qwen, Video-MME, or accuracy data.
@@ -56,10 +60,11 @@ The decode threshold inherits prefill unless explicitly supplied. Zero means den
 Each run uses the same prompt and video but sparse trajectories can generate different text.
 Do not interpret cross-trajectory differences as same-input kernel error.
 
-For exact individual scores, also pass `--raw-dir /absolute/path/to/score-shards`.
-Each `.pt` shard contains scaled raw scores for one selected layer/head/query chunk, its
-absolute query position, token visual mask, phase and step. Future positions are `-inf`.
-Only load trusted PyTorch files. The website consumes JSON summaries, not `.pt` files.
+For browser inspection of individual scores, add `--score-data` to collection. The collector
+writes an FP32 `.scores.bin` companion next to the JSON. The browser reads the selected
+query chunk on demand. Older summary JSONs still show the tile map and distributions.
+For offline PyTorch analysis, `--raw-dir /absolute/path/to/score-shards` exports a separate
+`.pt` shard per selected layer, head and query chunk. Future positions are `-inf`.
 
 JSON stores, for every selected layer/head/phase/step:
 
@@ -92,8 +97,74 @@ been performed as part of this implementation.
 For CPU smoke testing without weights:
 
 ```bash
-python attention_study.py --demo --decode-tokens 4 --output demo.json
+python attention_study.py --demo --decode-tokens 4 --score-data --output demo.json
 ```
+
+## Image + text: VQA v2 validation
+
+The same collector and visualization also support image/question inputs from
+[VQA v2](https://visualqa.org/download.html). `V` always means **visual**: image tokens for
+these runs, video tokens for Video-MME runs. No visualization redeployment is needed.
+Existing video manifests, recordings, and token-score companion files remain supported.
+
+From the project `code` directory, prepare one image and its first benchmark question:
+
+```bash
+python prepare_vqav2_study.py \
+  --data-root "$HOME/blasst-data/vqav2" \
+  --download --images 1 --questions-per-image 1 --seed 98 \
+  --output "$HOME/blasst-results/vqav2.json"
+```
+
+This downloads the **official validation** question ZIP (about 3.5 MB) and annotation ZIP
+(about 10.5 MB), plus only the selected individual COCO validation images. It does not
+fetch the complete COCO image archive. JSON may also be supplied directly as
+`v2_OpenEnded_mscoco_val2014_questions.json` and `v2_mscoco_val2014_annotations.json` inside
+`--data-root`; local images belong in `val2014/`. Omit `--download` to use local data only.
+Use `--image-id 42 --images 1` to select an exact COCO validation image instead of seeded
+sampling. Increase `--images` or `--questions-per-image` to prepare more samples.
+
+Input is `[image][benchmark question][Answer briefly.]`; the model's chat template adds
+its normal control tokens. Unlike Video-MME, VQA v2 uses open-ended answers, not A–D
+choices. Ten human reference answers and the annotation's consensus answer stay in metadata;
+they are never included in the model prompt. Source ZIP/JSON and image SHA-256 hashes are
+recorded in the manifest to identify the downloaded version. Sampling selects images first,
+then orders each image's questions by question ID. Sample index 0 is the first selected pair.
+
+Run inside an allocated CUDA GPU job, with the same layer/head selection as the expanded
+video experiment:
+
+```bash
+python attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2.json" --sample-index 0 \
+  --layers 0,1,2,10,11,12,13,14,15,16,17,26,27 \
+  --heads 0,4,8,12,16,20,24,27 \
+  --decode-tokens 16 --max-tokens 8192 --max-tiles 500000 \
+  --score-data \
+  --output "$HOME/blasst-results/vqav2-image0-question0.json"
+```
+
+Transfer **both** `vqav2-image0-question0.json` and
+`vqav2-image0-question0.scores.bin` to the Mac. Select both with **Load experiment** in
+Attention Lab. The JSON alone supports tile summaries and distributions; the binary
+companion enables individual-token inspection. There is no need to also use `--raw-dir`
+unless separate PyTorch score shards are desired.
+
+`--image-max-pixels` (default 1,003,520) controls image resizing and therefore the visual
+sequence length. The image still preserves its original aspect ratio. No `--frames` flag
+is needed for images. For a manually supplied image, use `--image /absolute/path/image.jpg`
+with `--question '...'` instead of a manifest.
+
+The collector detects both `image_token_id` and `video_token_id` as visual placeholders;
+vision-start/end and other control tokens stay text. The image encoder uses SDPA, while
+the language-model attention uses the same causal BLASST implementation and recorder.
+Do not interpret an image as one video frame: their processor/position conventions differ.
+V→T is limited to the text preceding the image, including system text. Generated decode
+queries are text, so decode contains T→T and T→V only.
+
+These are attention diagnostics, not official VQA accuracy scores. Fixed-length decode can
+continue after EOS. Preparation and image preprocessing are verifiable on CPU; actual model
+attention collection requires CUDA and has not been run on this Mac.
 
 ## Public benchmark workflow: Video-MME
 
