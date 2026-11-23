@@ -21,3 +21,32 @@
 .tile-score-table td { font-variant-numeric: tabular-nums; }
 .tile-score-table td.masked { color: var(--muted); background: var(--paper); }
 .tile-score-table small { display: block; font-size: 11px; color: var(--muted); }
+
+.study-nav { display: flex; gap: 8px; margin: 0 0 22px; }
+.study-nav button { background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 6px; padding: 10px 15px; font: 600 14px 'DM Sans', sans-serif; cursor: pointer; }
+.study-nav button[aria-pressed="true"] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+.jl-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 10px 16px; margin-bottom: 16px; }
+.jl-controls label { margin: 0; min-width: 145px; }
+.jl-controls label:first-child { min-width: min(100%, 215px); }
+.jl-gap-controls label:first-child { min-width: 145px; }
+.jl-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 20px; }
+.jl-heading h3, .jl-gap-grid h4 { margin: 0; font-family: 'Space Grotesk', sans-serif; font-weight: 500; }
+.jl-gap-heading { margin: 26px 0 14px; }
+.jl-legend { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 13px; color: var(--muted); }
+.jl-legend span::before { content: ''; display: inline-block; width: 13px; margin: 0 5px 3px 0; border-top: 3px solid var(--blue); }
+.jl-legend .jl-projected::before { border-color: var(--teal); border-style: dashed; border-width: 3px 0 0; }
+.jl-legend .jl-cutoff::before { border-color: var(--orange); border-style: dotted; border-width: 3px 0 0; }
+.jl-table-wrap { overflow-x: auto; margin-top: 14px; }
+.jl-table { border-collapse: collapse; width: 100%; text-align: right; font-size: 14px; }
+.jl-table th, .jl-table td { padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.jl-table th:first-child { text-align: left; }
+.jl-gap-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px 28px; margin-top: 18px; }
+.jl-gap-grid figure { min-width: 0; margin: 0; }
+.jl-gap-grid figcaption { color: var(--muted); font-size: 13px; }
+.jl-workspace svg { display: block; width: 100%; height: auto; color: var(--muted); }
+#jl-rate-chart { max-width: 840px; }
+#jl-error { color: #9a3923; }
+@media (max-width: 720px) {
+  .jl-gap-grid { grid-template-columns: 1fr; }
+  .jl-controls label { flex: 1; }
+}

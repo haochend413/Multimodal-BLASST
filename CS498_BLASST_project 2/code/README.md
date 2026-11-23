@@ -46,6 +46,32 @@ in [Attention Lab](../attention-lab/README.md).
 
 ### JL precheck for BLASST
 
+For a paired dimension ablation and gap distributions, run a dense-trajectory
+sweep on the original tiles:
+
+```bash
+python attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-30.json" --sample-count 30 \
+  --layers 0,14,27 --heads 0,4 --decode-tokens 2 \
+  --jl-sweep 8,16,32,64,96 --jl-lambda 0.1 --jl-seed 0 \
+  --output "$HOME/blasst-results/jl-vqav2-30-sweep.json"
+```
+
+Load the resulting JSON in Attention Lab. The **JL ablation** view overlays full and
+projected gap histograms for text→text, text→visual, visual→text and visual→visual,
+with prefill and decode selectable. A gap is the row's running max through the current
+tile minus its best key of the selected modality inside that tile. Mixed tiles contribute
+observations to the appropriate regions using the same all-key running max. Counts use
+one-logit bins and include an overflow bucket for gaps of 80 or greater. A whole-tile
+vote is counted once, under a pure modality pair or under mixed.
+
+The sweep uses nested prefixes of one seeded random orthogonal basis to compare
+dimensions on the same Q/K inputs. This basis differs from the earlier single-width
+audit's basis. The false-skip rate divides by tiles full BLASST keeps, and the
+missed-skip rate divides by tiles full BLASST skips. To smoke-test without model
+weights, use `--demo --jl-sweep 4,8,16,24` in place of the manifest, sample count,
+layer and head flags.
+
 Use `--jl-projected-only` with `--jl-dim` to test whether projected scores alone reproduce
 full BLASST's skip mask. Both passes use the same inputs, tile order, masks, and
 `--jl-lambda`. Each pass builds its own running max. The projected score uses the

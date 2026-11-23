@@ -1,11 +1,55 @@
 <!doctype html>
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BLASST · Attention Lab</title><meta name="description" content="Explore text and visual attention scores, distributions and BLASST tile decisions."><link rel="stylesheet" href="style.css?v=token-scores"></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BLASST · Attention Lab</title><meta name="description" content="Explore text and visual attention scores, distributions and BLASST tile decisions."><link rel="stylesheet" href="style.css?v=jl-sweep"></head>
 <body><header><a class="brand" href="./"><span class="mark">▦</span> BLASST <span class="brand-light">/ Attention Lab</span></a><span class="header-note">MULTIMODAL SYSTEMS RESEARCH</span><label class="upload">Load experiment <input id="upload" type="file" accept=".json,.bin" multiple></label></header>
 <main><section class="intro"><div><p class="eyebrow">LOOK INSIDE THE ATTENTION MATRIX</p><h1>One threshold.<br><span>Four different views.</span></h1><p class="lede">Inspect where text and visual tokens attend—and what BLASST would remove. Move from score magnitudes to tile decisions, one layer and head at a time.</p></div><aside class="dataset-panel"><div class="panel-label">CURRENT EXPERIMENT <span id="badge" class="badge">DEMO</span></div><h2 id="model">Loading…</h2><p id="trajectory"></p><label>Dataset<select id="dataset"></select></label><p id="dataset-note" class="muted"></p></aside></section>
 <div id="error" role="alert" hidden></div>
-<section class="workspace"><aside class="controls"><div class="section-label">EXPERIMENT LENS</div><label>Phase<select id="phase"><option value="prefill">Prefill · prompt processing</option><option value="decode">Decode · generated text query</option></select></label><div class="pair"><label>Layer<select id="layer"></select></label><label>Query head<select id="head"></select></label></div><label id="step-wrap">Decode step<select id="step"></select></label><label>Heatmap metric<select id="metric"><option value="abs">Mean |score|</option><option value="mean">Mean signed score</option><option value="max">Maximum score</option><option value="mass">Dense attention weight</option><option value="margin">BLASST margin</option></select></label><p id="metric-note" class="hint"></p><div class="separator"></div><div class="section-label">BLASST COUNTERFACTUAL</div><div class="lambda-label"><label for="lambda">Threshold λ</label><output id="lambda-value">0.01</output></div><input id="lambda" type="range" min="-6" max="0" value="-2" step="0.05"><div class="range-label"><span>10⁻⁶ · conservative</span><span>1 · aggressive</span></div><label class="check"><input id="overlay" type="checkbox" checked> Mark tiles that would be skipped</label><p class="hint">Skip if every valid query row falls below its running maximum by more than −ln(λ). The slider reuses recorded margins; it does not rerun the model.</p><div class="separator"></div><div class="section-label">REGION HIGHLIGHT</div><div id="region-buttons" class="region-buttons"></div><p class="hint">Arrows mean <strong>query → key</strong>. Mixed tiles can contain more than one region.</p><button id="download" class="secondary">Download current dataset</button></aside>
+<nav class="study-nav" aria-label="Attention Lab views">
+  <button id="show-tiles" type="button" aria-pressed="true" aria-controls="tile-workspace">Tile explorer</button>
+  <button id="show-jl" type="button" aria-pressed="false" aria-controls="jl-workspace">JL ablation</button>
+</nav>
+<section id="jl-workspace" class="chart-panel jl-workspace" aria-labelledby="jl-title" hidden>
+  <div class="chart-header">
+    <div>
+      <h2 id="jl-title">JL ablation</h2>
+      <p class="hint" id="jl-source">Loading synthetic sweep…</p>
+    </div>
+  </div>
+  <div class="jl-controls">
+    <label>Experiment<select id="jl-dataset"></select></label>
+    <label>Phase<select id="jl-phase"></select></label>
+    <label>Tile group<select id="jl-group">
+      <option value="all">All tiles</option><option value="T->T">Text → text</option>
+      <option value="T->V">Text → visual</option><option value="V->T">Visual → text</option>
+      <option value="V->V">Visual → visual</option><option value="mixed">Mixed tiles</option>
+    </select></label>
+  </div>
+  <p id="jl-error" role="alert" hidden></p>
+  <div id="jl-content" hidden>
+    <div class="jl-heading"><h3>Skip errors by JL dimension</h3>
+      <div class="jl-legend"><span class="jl-full">False skips</span><span class="jl-projected">Missed skips</span></div>
+    </div>
+    <div id="jl-rate-chart"></div>
+    <p class="hint">False skip rate is measured over tiles full BLASST keeps. Missed skip rate is measured over tiles full BLASST skips.</p>
+    <div class="jl-table-wrap"><table class="jl-table">
+      <thead><tr><th scope="col">JL dimensions</th><th scope="col">False skips / full keeps</th><th scope="col">Missed skips / full skips</th><th scope="col">Pairs with false skips</th></tr></thead>
+      <tbody id="jl-rate-table"></tbody>
+    </table></div>
+    <div class="jl-heading jl-gap-heading"><h3>Distance to the running max</h3>
+      <div class="jl-legend"><span class="jl-full">Full BLASST</span><span class="jl-projected">JL BLASST</span><span class="jl-cutoff">BLASST cutoff</span></div>
+    </div>
+    <div class="jl-controls jl-gap-controls">
+      <label>JL dimensions<select id="jl-dimension"></select></label>
+      <label>Gap range<select id="jl-window">
+        <option value="20">0–20 logits</option><option value="80">Full range, including overflow</option>
+      </select></label>
+    </div>
+    <p class="hint">Each observation uses the best key of the selected modality in one row of one tile. The running max includes all key modalities through that tile. Higher gaps are easier to skip.</p>
+    <div id="jl-gap-charts" class="jl-gap-grid"></div>
+  </div>
+</section>
+<section id="tile-workspace" class="workspace"><aside class="controls"><div class="section-label">EXPERIMENT LENS</div><label>Phase<select id="phase"><option value="prefill">Prefill · prompt processing</option><option value="decode">Decode · generated text query</option></select></label><div class="pair"><label>Layer<select id="layer"></select></label><label>Query head<select id="head"></select></label></div><label id="step-wrap">Decode step<select id="step"></select></label><label>Heatmap metric<select id="metric"><option value="abs">Mean |score|</option><option value="mean">Mean signed score</option><option value="max">Maximum score</option><option value="mass">Dense attention weight</option><option value="margin">BLASST margin</option></select></label><p id="metric-note" class="hint"></p><div class="separator"></div><div class="section-label">BLASST COUNTERFACTUAL</div><div class="lambda-label"><label for="lambda">Threshold λ</label><output id="lambda-value">0.01</output></div><input id="lambda" type="range" min="-6" max="0" value="-2" step="0.05"><div class="range-label"><span>10⁻⁶ · conservative</span><span>1 · aggressive</span></div><label class="check"><input id="overlay" type="checkbox" checked> Mark tiles that would be skipped</label><p class="hint">Skip if every valid query row falls below its running maximum by more than −ln(λ). The slider reuses recorded margins; it does not rerun the model.</p><div class="separator"></div><div class="section-label">REGION HIGHLIGHT</div><div id="region-buttons" class="region-buttons"></div><p class="hint">Arrows mean <strong>query → key</strong>. Mixed tiles can contain more than one region.</p><button id="download" class="secondary">Download current dataset</button></aside>
 <div class="visuals"><div class="stats"><div><span>Visible causal tiles</span><strong id="tile-count">—</strong></div><div><span>Would skip at λ</span><strong id="skip-count">—</strong></div><div><span>Mean |score|</span><strong id="score-stat">—</strong></div><div><span>Cached / prompt keys</span><strong id="key-count">—</strong></div></div>
 <section class="chart-panel"><div class="chart-header"><div><p class="eyebrow">TILE MAP</p><h2 id="map-title">Attention, block by block</h2></div><div class="legend-small"><span class="key text"></span> Text <span class="key visual"></span> Visual <span class="hatched"></span> Would skip</div></div><div class="map-layout"><span class="axis-y">QUERY POSITION</span><div class="canvas-wrap"><canvas id="heatmap" tabindex="0" aria-label="Attention blocks. Use the arrow keys to inspect blocks." aria-describedby="map-note"></canvas><div id="tooltip" hidden></div></div></div><div class="map-footer"><span>KEY POSITION →</span><div class="scale"><span id="scale-min"></span><i></i><span id="scale-max"></span></div></div><p id="map-note" class="hint"></p>
 <section id="tile-inspector" class="tile-inspector" aria-labelledby="tile-detail-title" hidden>
@@ -19,4 +63,4 @@
   </div>
 </section></section>
 <section class="chart-panel distribution"><div class="chart-header"><div><p class="eyebrow">REGION DISTRIBUTIONS</p><h2>How large are the scores?</h2></div><span class="muted">Each region normalized separately</span></div><svg id="histogram" viewBox="0 0 850 220" role="img" aria-label="Raw attention score histogram by query and key modality"></svg><p id="hist-note" class="hint"></p><div id="region-cards" class="region-cards"></div></section>
-<section class="method"><h3>Read the measurements correctly</h3><p><strong>Score</strong> is scaled QKᵀ before softmax; a large absolute negative score is not a large attention weight. <strong>Weight</strong> is the dense row-normalized softmax on the current recorded trajectory. <strong>Margin</strong> compares a tile’s row maxima with running row maxima. Masked future positions are excluded. All summaries cover only the selected layers and heads.</p><p>Dense recordings support offline threshold exploration. Live sparse recordings contain inputs already changed by earlier skipping. Neither the simulation nor this explorer measures kernel speedup.</p></section></div></section><footer><span>BLASST / ATTENTION LAB</span><span>Local file analysis · uploaded datasets stay in this browser</span></footer></main><script type="module" src="app.js?v=token-scores"></script></body></html>
+<section class="method"><h3>Read the measurements correctly</h3><p><strong>Score</strong> is scaled QKᵀ before softmax; a large absolute negative score is not a large attention weight. <strong>Weight</strong> is the dense row-normalized softmax on the current recorded trajectory. <strong>Margin</strong> compares a tile’s row maxima with running row maxima. Masked future positions are excluded. All summaries cover only the selected layers and heads.</p><p>Dense recordings support offline threshold exploration. Live sparse recordings contain inputs already changed by earlier skipping. Neither the simulation nor this explorer measures kernel speedup.</p></section></div></section><footer><span>BLASST / ATTENTION LAB</span><span>Local file analysis · uploaded datasets stay in this browser</span></footer></main><script type="module" src="app.js?v=jl-sweep"></script></body></html>

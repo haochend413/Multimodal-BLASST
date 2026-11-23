@@ -16,6 +16,7 @@ import torch
 
 import blasst_attn as ba
 from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy, VISUAL_KEY_QUERY_SPLIT
+from jl_gap_study import JLGapStudy, merge_sweeps
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -224,6 +225,8 @@ def main() -> None:
     parser.add_argument("--score-data", action="store_true",
                         help="write exact token scores to a browser-readable .scores.bin companion")
     parser.add_argument("--jl-dim", type=int, help="audit a JL precheck at this sketch dimension")
+    parser.add_argument("--jl-sweep", metavar="DIMS",
+                        help="comma-separated JL widths for a paired skip-rate and gap histogram study")
     parser.add_argument("--jl-epsilon", type=float,
                         help="use a JL norm-product margin instead of the orthogonal residual bound")
     parser.add_argument("--jl-lambda", type=float, default=0.1,
@@ -242,10 +245,24 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int, default=1,
                         help="number of consecutive manifest pairs for a projected-only audit")
     args = parser.parse_args()
+    if args.jl_sweep is not None:
+        try:
+            args.jl_sweep = sorted({int(dim) for dim in args.jl_sweep.split(",")})
+        except ValueError:
+            parser.error("--jl-sweep expects comma-separated integer widths")
+        if args.jl_sweep[0] <= 0 or (args.demo and args.jl_sweep[-1] >= 32):
+            parser.error("JL sweep widths must be positive and below 32 for the demo")
+        if not 0 < args.jl_lambda <= 1:
+            parser.error("--jl-lambda must be in (0, 1]")
+        if (args.jl_dim is not None or args.jl_epsilon is not None or args.jl_live or
+                args.jl_projected_only or args.jl_split_tiles or args.score_data or args.raw_dir):
+            parser.error("--jl-sweep produces its own report; omit other JL modes and raw-score flags")
+        if args.lam or args.decode_lambda:
+            parser.error("--jl-sweep uses a dense trajectory; set the audit threshold with --jl-lambda")
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
-    if args.sample_count > 1 and (not args.manifest or not args.jl_projected_only):
-        parser.error("batch collection requires --manifest and --jl-projected-only")
+    if args.sample_count > 1 and (not args.manifest or not (args.jl_projected_only or args.jl_sweep)):
+        parser.error("batch collection requires --manifest and a projected-only audit or JL sweep")
     if args.sample_count > 1 and (args.score_data or args.raw_dir):
         parser.error("use a single sample when exporting raw scores")
     benchmark = None
@@ -299,7 +316,19 @@ def main() -> None:
                 parser.error(f"Missing input media: {media_path}")
         if not torch.cuda.is_available():
             parser.error("Real model collection requires CUDA; use --demo for CPU verification")
-    if args.sample_count > 1:
+    if args.jl_sweep:
+        if args.sample_count == 1:
+            report = collect(args, parser, benchmark, sample_id)
+            _write_sweep(args.output, report, 1)
+        else:
+            report = None
+            for index, sample in enumerate(samples, start=1):
+                _select_sample(args, parser, sample)
+                report = merge_sweeps(report, collect(args, parser, sample["benchmark"], sample["id"]))
+                _write_sweep(args.output, report, args.sample_count)
+                print(f"Collected JL gaps for {index}/{args.sample_count} pairs", flush=True)
+        print(f"Wrote the JL sweep to {args.output}")
+    elif args.sample_count > 1:
         _collect_batch(args, parser, samples)
     elif args.score_data:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -320,6 +349,14 @@ def _add_pair_counts(totals_by_group, groups):
             totals[name] += count
         totals["pairs_observed"] += 1
         totals["pairs_with_false_skips"] += int(counts["false_skips"] > 0)
+
+
+def _write_sweep(output, report, pairs_requested):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending = output.with_suffix(output.suffix + ".tmp")
+    pending.write_text(json.dumps(dict(report, pairs_requested=pairs_requested),
+                                  separators=(",", ":"), allow_nan=False) + "\n")
+    pending.replace(output)
 
 
 def _collect_batch(args, parser, samples):
@@ -367,16 +404,22 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
     old_observers = ba.STATE["observer"], ba.STATE["qkv_hook"]
     precision = torch.get_float32_matmul_precision()
     try:
-        if args.jl_probe is not None:
+        if args.jl_probe is not None or args.jl_sweep:
             torch.set_float32_matmul_precision("highest")
         return _collect(args, parser, benchmark, sample_id, score_stream)
     finally:
         ba.STATE["observer"], ba.STATE["qkv_hook"] = old_observers
-        if args.jl_probe is not None:
+        if args.jl_probe is not None or args.jl_sweep:
             torch.set_float32_matmul_precision(precision)
 
 
 def _attach_study(args, recorder):
+    if args.jl_sweep:
+        study = JLGapStudy(args.jl_sweep, args.jl_lambda, args.jl_seed, recorder.visual,
+                           recorder.layers, recorder.heads)
+        ba.STATE["observer"] = study.record
+        ba.STATE["qkv_hook"] = study.observe
+        return study
     if args.jl_probe is None:
         return None
     if args.jl_projected_only:
@@ -461,6 +504,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         metadata = {"model": args.model, "synthetic": False, "prompt_tokens": length,
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
+    if args.jl_sweep:
+        return jl_study.summary(metadata)
     if jl_study is not None:
         key = "jl_projected" if args.jl_projected_only else "jl_precheck"
         metadata[key] = jl_study.summary()

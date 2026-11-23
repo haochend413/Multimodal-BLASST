@@ -21,6 +21,12 @@ modality pair, and masked positions are labeled in the matrix. The bundled demo 
 token scores. For recorded data, use **Load experiment** to select both the JSON summary and
 its matching `.scores.bin` file. Files can also be selected separately, in either order.
 
+Open **JL ablation** to see the synthetic dimension sweep or use **Load experiment**
+to open a report collected with `attention_study.py --jl-sweep`. The phase selector
+updates the skip-rate chart and the four modality gap distributions. The dimension
+selector changes the projected distribution overlaid on the full-score distribution.
+See the [JL run guide](../code/README.md#jl-precheck-for-blasst).
+
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.
 It is explicitly synthetic, not measured Qwen, Video-MME, or accuracy data.
 
