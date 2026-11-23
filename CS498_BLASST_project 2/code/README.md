@@ -44,6 +44,43 @@ The new `attention_study.py`, `prepare_videomme_study.py`, `prepare_vqav2_study.
 and their tests are documented
 in [Attention Lab](../attention-lab/README.md).
 
+### Cross-layer tile decisions
+
+Collect full-score BLASST margins across every language-model layer, using the original
+physical tiles and a shared running max:
+
+```bash
+python attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-30.json" --sample-count 30 \
+  --layers all --heads 0,4 --decode-tokens 2 \
+  --tile-layer-study --study-lambda 0.1 \
+  --output "$HOME/blasst-results/vqav2-30-tile-layers.json"
+```
+
+The model follows a dense trajectory. The offline decision is skip when the recorded margin
+is below `ln(study_lambda)`. Each trajectory holds the case, phase, decode step, query head,
+and query/key token ranges fixed. A whole physical tile is labeled from its valid lanes.
+The mixed group retains its own votes. Decode has text queries only.
+
+Load the JSON into **Cross-layer tiles** in Attention Lab. The chart pools by actual layer
+distance, while the table lists the specific layer pairs and all four keep/skip transitions.
+An earlier skip that turns into a keep is a disagreement that would matter for mask reuse.
+Compare skip persistence with the later layer's own skip rate, since a region that almost
+always skips can have high persistence even without useful layer-to-layer prediction.
+The case selector shows a selected tile's margin and decision at every recorded layer.
+
+For saved dense Attention Lab files, recompute the study without running the model:
+
+```bash
+python tile_layer_study.py ../results/attention-[0-5].json \
+  --study-lambda 0.1 --output /tmp/blasst-layer-videomme-pilot.json
+```
+
+These six Video-MME prompts cover two videos and seven sampled layers. Distance 1 pools
+0→1, 1→2, 13→14, and 26→27. Other distances can involve different layer pairs, so use the
+all-layer run for a fuller distance comparison. For a CPU smoke test of the collector,
+replace the manifest flags with `--demo`.
+
 ### JL precheck for BLASST
 
 To compare modality packing and resetting the BLASST bar at key-region boundaries,

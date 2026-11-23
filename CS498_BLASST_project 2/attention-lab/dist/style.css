@@ -69,3 +69,6 @@
   .region-audit-grid { grid-template-columns: 1fr; }
   #region-case { min-width: min(100%, 145px); }
 }
+
+#layers-timeline td[data-decision="Skip"] { background: #fef0dc; color: #8b4314; }
+#layers-timeline td[data-decision="Keep"] { background: #e3f4f0; color: #08685e; }

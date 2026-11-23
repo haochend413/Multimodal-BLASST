@@ -9,7 +9,44 @@
   <button id="show-tiles" type="button" aria-pressed="true" aria-controls="tile-workspace">Tile explorer</button>
   <button id="show-jl" type="button" aria-pressed="false" aria-controls="jl-workspace">JL ablation</button>
   <button id="show-region" type="button" aria-pressed="false" aria-controls="region-workspace">Region audit</button>
+  <button id="show-layers" type="button" aria-pressed="false" aria-controls="layers-workspace">Cross-layer tiles</button>
 </nav>
+<section id="layers-workspace" class="chart-panel" aria-labelledby="layers-title" hidden>
+  <h2 id="layers-title">Cross-layer tile decisions</h2>
+  <p class="hint" id="layers-source">Load a cross-layer study JSON to compare decisions.</p>
+  <div id="layers-content" hidden>
+    <div class="jl-controls">
+      <label>Experiment<select id="layers-dataset"></select></label>
+      <label>Phase<select id="layers-phase"></select></label>
+      <label>Similarity metric<select id="layers-metric">
+        <option value="skip_persistence">Earlier skips still skipped</option>
+        <option value="agreement">Same decision</option>
+        <option value="later_skips_recovered">Later skips covered</option>
+      </select></label>
+    </div>
+    <svg id="layers-chart" viewBox="0 0 760 230" width="100%" role="img" aria-label="Decision similarity by layer distance and modality"></svg>
+    <p class="hint">Each point pools comparisons at the same layer distance. A missing point means no observations or no skips in the denominator. “Earlier skips still skipped” measures how often reusing a skip agrees with the later layer.</p>
+    <div class="jl-controls">
+      <label>Tile group<select id="layers-group"></select></label>
+      <label>Layer distance<select id="layers-lag"></select></label>
+    </div>
+    <div class="jl-table-wrap"><table class="jl-table">
+      <thead><tr><th scope="col">Layer pair</th><th scope="col">Both keep</th>
+        <th scope="col">Keep → skip</th><th scope="col">Skip → keep</th>
+        <th scope="col">Both skip</th><th scope="col">Selected metric</th>
+        <th scope="col">Later skip rate</th></tr></thead><tbody id="layers-pairs"></tbody>
+    </table></div>
+    <h3>Follow one tile</h3>
+    <div class="jl-controls">
+      <label>Case<select id="layers-case"></select></label>
+      <label>Query head<select id="layers-head"></select></label>
+      <label id="layers-step-label">Decode step<select id="layers-step"></select></label>
+      <label>Tile token ranges<select id="layers-tile"></select></label>
+    </div>
+    <p class="hint" id="layers-tile-status"></p>
+    <div class="jl-table-wrap"><table class="jl-table" id="layers-timeline"></table></div>
+  </div>
+</section>
 <section id="jl-workspace" class="chart-panel jl-workspace" aria-labelledby="jl-title" hidden>
   <div class="chart-header">
     <div>
@@ -94,4 +131,4 @@
   </div>
 </section></section>
 <section class="chart-panel distribution"><div class="chart-header"><div><p class="eyebrow">REGION DISTRIBUTIONS</p><h2>How large are the scores?</h2></div><span class="muted">Each region normalized separately</span></div><svg id="histogram" viewBox="0 0 850 220" role="img" aria-label="Raw attention score histogram by query and key modality"></svg><p id="hist-note" class="hint"></p><div id="region-cards" class="region-cards"></div></section>
-<section class="method"><h3>Read the measurements correctly</h3><p><strong>Score</strong> is scaled QKᵀ before softmax; a large absolute negative score is not a large attention weight. <strong>Weight</strong> is the dense row-normalized softmax on the current recorded trajectory. <strong>Margin</strong> compares a tile’s row maxima with running row maxima. Masked future positions are excluded. All summaries cover only the selected layers and heads.</p><p>Dense recordings support offline threshold exploration. Live sparse recordings contain inputs already changed by earlier skipping. Neither the simulation nor this explorer measures kernel speedup.</p></section></div></section><footer><span>BLASST / ATTENTION LAB</span><span>Local file analysis · uploaded datasets stay in this browser</span></footer></main><script type="module" src="app.js?v=region-reset"></script></body></html>
+<section class="method"><h3>Read the measurements correctly</h3><p><strong>Score</strong> is scaled QKᵀ before softmax; a large absolute negative score is not a large attention weight. <strong>Weight</strong> is the dense row-normalized softmax on the current recorded trajectory. <strong>Margin</strong> compares a tile’s row maxima with running row maxima. Masked future positions are excluded. All summaries cover only the selected layers and heads.</p><p>Dense recordings support offline threshold exploration. Live sparse recordings contain inputs already changed by earlier skipping. Neither the simulation nor this explorer measures kernel speedup.</p></section></div></section><footer><span>BLASST / ATTENTION LAB</span><span>Local file analysis · uploaded datasets stay in this browser</span></footer></main><script type="module" src="app.js?v=cross-layer-tiles"></script></body></html>

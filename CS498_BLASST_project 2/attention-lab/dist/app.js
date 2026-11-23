@@ -3,8 +3,9 @@
 import {validate, summary, regions, colors, scoreFileId, tileScores} from './data.mjs?v=token-scores';
 import {isJLSweep, setupJLStudy} from './jl.mjs?v=region-audit';
 import {isRegionAudit, setupRegionAudit} from './region.mjs?v=region-reset';
+import {isLayerStudy, setupLayerStudy} from './layers.mjs';
 const $ = id => document.getElementById(id);
-const workspaces = {tiles:'tile-workspace', jl:'jl-workspace', region:'region-workspace'};
+const workspaces = {tiles:'tile-workspace', jl:'jl-workspace', region:'region-workspace', layers:'layers-workspace'};
 function showView(view) {
   for (const [name, panel] of Object.entries(workspaces)) {
     $(panel).hidden = name !== view;
@@ -15,6 +16,7 @@ function showView(view) {
 for (const view of Object.keys(workspaces)) $(`show-${view}`).addEventListener('click', () => showView(view));
 const jlStudy = setupJLStudy(showView);
 const regionAudit = setupRegionAudit(showView);
+const layerStudy = setupLayerStudy(showView);
 const datasets = []; let data, current, region = 'All', hits = [];
 const scoreFiles = new Map();
 let demoScoreId, demoScores, selectedTile, inspection = 0;
@@ -197,6 +199,7 @@ $('upload').addEventListener('change', async event => {
         const input = JSON.parse(await file.text());
         if (isJLSweep(input)) jlStudy.add(file.name, input);
         else if (isRegionAudit(input)) regionAudit.add(file.name, input);
+        else if (isLayerStudy(input)) layerStudy.add(file.name, input);
         else {
           showView('tiles');
           add(file.name, input);

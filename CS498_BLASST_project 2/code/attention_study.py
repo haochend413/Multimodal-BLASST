@@ -18,6 +18,7 @@ import blasst_attn as ba
 from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy, VISUAL_KEY_QUERY_SPLIT
 from jl_gap_study import JLGapStudy, merge_sweeps
 from jl_region_study import JLRegionStudy, merge_region_audits
+from tile_layer_study import LayerReport, TileLayerRecorder
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -230,6 +231,10 @@ def main() -> None:
                         help="comma-separated JL widths for a paired skip-rate and gap histogram study")
     parser.add_argument("--jl-region-audit", action="store_true",
                         help="compare original, modality-packed, and per-key-region max policies")
+    parser.add_argument("--tile-layer-study", action="store_true",
+                        help="track full-score BLASST decisions on the same physical tile across layers")
+    parser.add_argument("--study-lambda", type=float, default=0.1,
+                        help="offline threshold for the tile layer study")
     parser.add_argument("--jl-epsilon", type=float,
                         help="use a JL norm-product margin instead of the orthogonal residual bound")
     parser.add_argument("--jl-lambda", type=float, default=0.1,
@@ -250,6 +255,14 @@ def main() -> None:
     args = parser.parse_args()
     if args.sample_index < 0:
         parser.error("--sample-index must be nonnegative")
+    if args.tile_layer_study:
+        if not 0 < args.study_lambda <= 1:
+            parser.error("--study-lambda must be in (0, 1]")
+        if (args.jl_sweep or args.jl_region_audit or args.jl_dim is not None or args.lam
+                or args.decode_lambda or args.score_data or args.raw_dir):
+            parser.error("--tile-layer-study uses dense attention and its own report; set --study-lambda")
+        if args.layers != "all" and not args.demo and len(_indices(args.layers)) < 2:
+            parser.error("--tile-layer-study requires at least two layers")
     if args.jl_sweep is not None:
         try:
             args.jl_sweep = sorted({int(dim) for dim in args.jl_sweep.split(",")})
@@ -271,13 +284,13 @@ def main() -> None:
         if (args.jl_epsilon is not None or args.jl_live or args.jl_projected_only or
                 args.jl_split_tiles or args.score_data or args.raw_dir or args.lam or args.decode_lambda):
             parser.error("--jl-region-audit uses a dense trajectory and its own report; set --jl-lambda")
-    paired_audit = args.jl_sweep or args.jl_region_audit
+    paired_audit = args.jl_sweep or args.jl_region_audit or args.tile_layer_study
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
     if args.sample_count > 1 and not (
         (args.manifest and (args.jl_projected_only or paired_audit)) or (args.demo and paired_audit)
     ):
-        parser.error("batch collection requires a manifest audit or synthetic paired JL audit")
+        parser.error("batch collection requires a manifest audit or a supported synthetic audit")
     if args.sample_count > 1 and (args.score_data or args.raw_dir):
         parser.error("use a single sample when exporting raw scores")
     benchmark = None
@@ -331,7 +344,9 @@ def main() -> None:
                 parser.error(f"Missing input media: {media_path}")
         if not torch.cuda.is_available():
             parser.error("Real model collection requires CUDA; use --demo for CPU verification")
-    if paired_audit:
+    if args.tile_layer_study:
+        _collect_layer_study(args, parser, samples if args.manifest else [None] * args.sample_count)
+    elif paired_audit:
         merge = merge_region_audits if args.jl_region_audit else merge_sweeps
         _collect_paired_audit(args, parser, samples if args.manifest else [None] * args.sample_count, merge)
     elif args.sample_count > 1:
@@ -355,6 +370,23 @@ def _add_pair_counts(totals_by_group, groups):
             totals[name] += count
         totals["pairs_observed"] += 1
         totals["pairs_with_false_skips"] += int(counts["false_skips"] > 0)
+
+
+def _collect_layer_study(args, parser, samples):
+    report = None
+    for index, sample in enumerate(samples, start=args.sample_index):
+        run = argparse.Namespace(**dict(vars(args), sample_index=index))
+        benchmark, sample_id = None, None
+        if sample is not None:
+            _select_sample(run, parser, sample)
+            benchmark, sample_id = sample["benchmark"], sample["id"]
+        metadata, case = collect(run, parser, benchmark, sample_id)
+        if report is None:
+            report = LayerReport(metadata["model"], metadata["synthetic"], args.study_lambda, ba.TILE)
+        report.add(case)
+        report.write(args.output, len(samples))
+        print(f"Collected layer trajectories for {len(report.cases)}/{len(samples)} cases", flush=True)
+    print(f"Wrote the cross-layer report to {args.output}")
 
 
 def _collect_paired_audit(args, parser, samples, merge):
@@ -438,6 +470,11 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
 
 
 def _attach_study(args, recorder):
+    if args.tile_layer_study:
+        study = TileLayerRecorder(recorder)
+        ba.STATE["observer"] = study.observe
+        ba.STATE["qkv_hook"] = None
+        return study
     if args.jl_region_audit:
         study = JLRegionStudy(args.jl_dim, args.jl_lambda, args.jl_seed, recorder.visual,
                               recorder.layers, recorder.heads)
@@ -485,7 +522,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
     ba.set_threshold(args.lam or None)
     ba.set_decode_threshold(args.decode_lambda or None, inherit=args.decode_lambda is None)
     if args.demo:
-        torch.manual_seed(98 + args.sample_index if args.jl_sweep or args.jl_region_audit else 98)
+        torch.manual_seed(98 + args.sample_index
+                          if args.jl_sweep or args.jl_region_audit or args.tile_layer_study else 98)
         length = 640
         visual = torch.zeros(length, dtype=torch.bool)
         if args.jl_region_audit:
@@ -516,8 +554,10 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         if length > args.max_tokens:
             parser.error(f"Prompt has {length} tokens, exceeds --max-tokens; reduce --frames or --image-max-pixels")
         model = _load_model(args.model)
-        selected_layers, selected_heads = _indices(args.layers), _indices(args.heads)
         config = model.config.text_config
+        selected_layers = (set(range(config.num_hidden_layers))
+                           if args.tile_layer_study and args.layers == "all" else _indices(args.layers))
+        selected_heads = _indices(args.heads)
         if not all(0 <= x < config.num_hidden_layers for x in selected_layers):
             parser.error("selected layer index is outside the language model")
         if not all(0 <= x < config.num_attention_heads for x in selected_heads):
@@ -537,6 +577,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         metadata = {"model": args.model, "synthetic": False, "prompt_tokens": length,
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
+    if args.tile_layer_study:
+        return metadata, jl_study.case(args.sample_index, sample_id)
     if args.jl_sweep or args.jl_region_audit:
         return jl_study.summary(metadata)
     if jl_study is not None:

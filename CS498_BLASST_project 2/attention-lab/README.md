@@ -35,6 +35,12 @@ and dense weight on false skips for original and packed tiles with a shared or
 reset max. Use the phase, case, and tile-group filters
 to inspect each part of the audit.
 
+Load a JSON from `attention_study.py --tile-layer-study` or `tile_layer_study.py` to open
+**Cross-layer tiles**. Compare agreement and skip persistence against layer distance,
+inspect the keep/skip transitions for specific layer pairs, and choose a case, head,
+and tile to display its layer-by-layer decisions and margins.
+See the [cross-layer run guide](../code/README.md#cross-layer-tile-decisions).
+
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.
 It is explicitly synthetic, not measured Qwen, Video-MME, or accuracy data.
 
