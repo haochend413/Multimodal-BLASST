@@ -42,6 +42,9 @@ and tile to display its layer-by-layer decisions and margins.
 Reports collected with `--study-max-indices` add the decisive query, tile-max key,
 running-max key, and first-layer replay to the tile timeline. The similarity
 selector also offers index match rates and replay errors by modality.
+For adjacent-layer per-row key reuse, select **Per-row key match** or **Row-key replay**.
+Choose a query position in the tile timeline to see its actual and inherited key positions
+in each layer.
 See the [cross-layer run guide](../code/README.md#cross-layer-tile-decisions).
 
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.

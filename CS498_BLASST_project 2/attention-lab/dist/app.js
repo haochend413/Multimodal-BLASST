@@ -3,7 +3,7 @@
 import {validate, summary, regions, colors, scoreFileId, tileScores} from './data.mjs?v=token-scores';
 import {isJLSweep, setupJLStudy} from './jl.mjs?v=region-audit';
 import {isRegionAudit, setupRegionAudit} from './region.mjs?v=region-reset';
-import {isLayerStudy, setupLayerStudy} from './layers.mjs?v=max-indices';
+import {isLayerStudy, setupLayerStudy} from './layers.mjs?v=row-key-replay';
 const $ = id => document.getElementById(id);
 const workspaces = {tiles:'tile-workspace', jl:'jl-workspace', region:'region-workspace', layers:'layers-workspace'};
 function showView(view) {

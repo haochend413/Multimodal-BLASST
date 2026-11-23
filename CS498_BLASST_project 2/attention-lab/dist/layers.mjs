@@ -15,7 +15,16 @@ const indexMetrics = {
   false_skip_rate: 'First-layer replay · false skip rate',
   missed_skip_rate: 'First-layer replay · missed skip rate',
 };
-const metricValue = (point, metric) => point[metric] ?? point.anchor_replay?.[metric];
+const rowMetrics = {
+  'row.key_match_rate': 'Per-row key match · previous layer',
+  'row.max_score_hit_rate': 'Per-row max score recovered · previous layer',
+  'row.false_skip_rate': 'Row-key replay · false skip rate',
+  'row.missed_skip_rate': 'Row-key replay · missed skip rate',
+};
+const isRowMetric = metric => metric.startsWith('row.');
+const metricValue = (point, metric) => isRowMetric(metric)
+  ? point.row_key_replay?.[metric.slice(4)]
+  : point[metric] ?? point.anchor_replay?.[metric];
 const logit = value => value == null ? '—' : value.toFixed(3);
 
 export const isLayerStudy = data => data?.schema === 'blasst-tile-layer-study-v1';
@@ -45,7 +54,15 @@ function similarityChart(svg, data, metric) {
     parent.append(node);
     return node;
   }
-  const lags = unique(data.all.by_lag.map(point => point.lag));
+  const pointsFor = group => isRowMetric(metric)
+    ? (data[group]?.by_layer_pair ?? []).filter(point => point.row_key_replay)
+      .map(point => ({...point, lag:point.later}))
+    : data[group]?.by_lag ?? [];
+  const lags = unique(pointsFor('all').map(point => point.lag));
+  if (!lags.length) {
+    draw('text', {x:52, y:46, 'font-size':14}, 'No adjacent layers were recorded.');
+    return;
+  }
   const x = lag => 52 + 674 * (lags.length === 1 ? .5 : (lag - lags[0]) / (lags.at(-1) - lags[0]));
   const y = val => 166 - 140 * val;
   for (const val of [0, .25, .5, .75, 1]) {
@@ -55,10 +72,11 @@ function similarityChart(svg, data, metric) {
   for (const lag of lags) {
     draw('text', {x:x(lag), y:185, 'text-anchor':'middle', 'font-size':11}, lag);
   }
-  draw('text', {x:389, y:205, 'text-anchor':'middle', 'font-size':12}, 'Layer distance');
+  draw('text', {x:389, y:205, 'text-anchor':'middle', 'font-size':12},
+    isRowMetric(metric) ? 'Target layer · reuse from previous layer' : 'Layer distance');
   groups.forEach((group, index) => {
-    const points = data[group]?.by_lag;
-    if (!points) return;
+    const points = pointsFor(group);
+    if (!points.length) return;
     const color = colors[index];
     draw('text', {x:52+112*index, y:225, fill:color, 'font-size':13}, labels[group]);
     let previous;
@@ -73,7 +91,8 @@ function similarityChart(svg, data, metric) {
           y2:y(value), stroke:color, 'stroke-width':2});
       }
       const dot = draw('circle', {cx:x(point.lag), cy:y(value), r:4, fill:color});
-      draw('title', {}, `${labels[group]} · distance ${point.lag} · ${percent(value)}`, dot);
+      draw('title', {},
+        `${labels[group]} · ${isRowMetric(metric) ? 'target layer' : 'distance'} ${point.lag} · ${percent(value)}`, dot);
       previous = point;
     }
   });
@@ -103,6 +122,7 @@ export function setupLayerStudy(showView) {
     const tile = choices.get($('tile').value);
     const table = $('timeline');
     table.replaceChildren();
+    $('query-label').hidden = !tile || !data.metadata.row_key_replay;
     $('tile-status').textContent = tile
       ? `Tile skips when margin < ${data.metadata.cutoff.toFixed(3)}. Token positions and layer numbers start at zero.`
       : 'This case has no tiles for the selected phase and group.';
@@ -125,24 +145,47 @@ export function setupLayerStudy(showView) {
       row(body, ['Replay decision', ...indices.map(entry =>
         entry == null ? '—' : entry[5] < data.metadata.cutoff ? 'Skip' : 'Keep')]);
     }
+    if (data.metadata.row_key_replay && indices) {
+      const qStart = tile[3];
+      const kStart = tile[4];
+      options($('query'), Array.from({length:tile[5]}, (_, offset) => qStart + offset));
+      const offset = 2 * (Number($('query').value) - qStart);
+      const keyFor = entry => {
+        const key = Number.parseInt(entry?.[6]?.slice(offset, offset + 2), 16);
+        return key < 255 ? kStart + key : '—';
+      };
+      row(body, ['Selected row · actual best key', ...indices.map(keyFor)]);
+      row(body, ['Selected row · inherited key', ...indices.map((entry, index) =>
+        entry?.[7] ? keyFor(indices[index - 1]) : '—')]);
+      row(body, ['Rows with same key', ...indices.map(entry =>
+        entry?.[7] ? `${entry[7][0]} / ${entry[7][2]}` : '—')]);
+      row(body, ['Previous-layer row-key replay margin', ...indices.map(entry => logit(entry?.[7]?.[3]))]);
+      row(body, ['Previous-layer row-key replay decision', ...indices.map(entry => {
+        const margin = entry?.[7]?.[3];
+        return margin == null ? '—' : margin < data.metadata.cutoff ? 'Skip' : 'Keep';
+      })]);
+    }
   }
 
   function renderPairs() {
     const group = phase()[$('group').value];
-    options($('lag'), group.by_lag.map(point => point.lag));
+    const metric = $('metric').value;
+    const rowMetric = isRowMetric(metric);
+    const replay = rowMetric || metric === 'false_skip_rate' || metric === 'missed_skip_rate';
+    $('lag').disabled = rowMetric;
+    options($('lag'), rowMetric ? [1] : group.by_lag.map(point => point.lag));
     const rows = group.by_layer_pair.filter(point => point.later - point.earlier === Number($('lag').value));
     $('pairs').replaceChildren();
-    const metric = $('metric').value;
-    const replay = metric === 'false_skip_rate' || metric === 'missed_skip_rate';
     const header = $('pair-head').cells;
-    header[1].textContent = replay ? 'Replay comparisons' : 'Both keep';
+    header[1].textContent = rowMetric ? 'Matching rows / valid rows' : replay ? 'Replay comparisons' : 'Both keep';
     header[2].textContent = replay ? 'Missed skips' : 'Keep → skip';
     header[3].textContent = replay ? 'False skips' : 'Skip → keep';
     header[4].textContent = replay ? 'Mean |margin error|' : 'Both skip';
     for (const point of rows) {
-      const counts = point.anchor_replay;
+      const counts = rowMetric ? point.row_key_replay : point.anchor_replay;
       if (replay && !counts) continue;
-      const cells = replay ? [counts.observations, counts.missed_skips, counts.false_skips,
+      const cells = replay ? [rowMetric ? `${counts.matched_rows} / ${counts.row_observations}` : counts.observations,
+        counts.missed_skips, counts.false_skips,
         logit(counts.mean_absolute_margin_error)] :
         [point.keep_keep, point.keep_skip, point.skip_keep, point.skip_skip];
       row($('pairs'), [`${point.earlier} → ${point.later}`, ...cells,
@@ -163,7 +206,9 @@ export function setupLayerStudy(showView) {
     $('source').textContent = `${synthetic ? 'Synthetic · ' : ''}${model} · ${data.pairs_completed}/${data.pairs_requested} cases · λ = ${lambda} · full scores on a dense trajectory`;
     $('content').hidden = false;
     $('index-note').hidden = !data.metadata.max_indices;
-    const metrics = data.metadata.max_indices ? {...decisionMetrics, ...indexMetrics} : decisionMetrics;
+    $('row-note').hidden = !data.metadata.row_key_replay;
+    const metrics = {...decisionMetrics, ...(data.metadata.max_indices ? indexMetrics : {}),
+      ...(data.metadata.row_key_replay ? rowMetrics : {})};
     options($('metric'), Object.keys(metrics), id => metrics[id]);
     options($('phase'), Object.keys(data.phases).sort().reverse());
     options($('case'), data.cases.map((_, index) => index),
@@ -174,7 +219,7 @@ export function setupLayerStudy(showView) {
   $('dataset').addEventListener('change', renderDataset);
   for (const id of ['phase', 'metric']) $(id).addEventListener('change', renderPhase);
   for (const id of ['group', 'lag']) $(id).addEventListener('change', renderPairs);
-  for (const id of ['case', 'head', 'step', 'tile']) $(id).addEventListener('change', renderTile);
+  for (const id of ['case', 'head', 'step', 'tile', 'query']) $(id).addEventListener('change', renderTile);
 
   return {
     add(name, data) {

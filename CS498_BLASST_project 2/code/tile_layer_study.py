@@ -12,8 +12,8 @@ OUTCOMES = ("keep_keep", "keep_skip", "skip_keep", "skip_skip")
 INDEX_MATCHES = ("same_query", "same_tile_pair", "same_running_pair", "same_all_indices")
 
 
-def margin_indices(scores, tile_size, anchor=None):
-    """Find the decisive row and its tile and prefix argmax keys for every tile."""
+def margin_indices(scores, tile_size, anchor, previous_keys):
+    """Collect exact argmaxes and replay one prior-layer key per valid query row."""
     import torch
     from torch.nn.functional import pad
 
@@ -38,12 +38,50 @@ def margin_indices(scores, tile_size, anchor=None):
         replay = scores[heads, query, key.clamp(max=width - 1)] - scores[heads, query, running]
     snapshots = torch.stack((tile_scores.gather(-2, row).squeeze(-2),
                              running_scores.gather(-2, row).squeeze(-2), replay), dim=-1)
-    return indices, snapshots
+    valid = torch.isfinite(tile_scores)
+    row_keys = local_keys.masked_fill(~valid, 255)
+    row_replay = None
+    if previous_keys is not None:
+        # Evaluate the SAME query and key positions using the target layer's scores.
+        candidates = tiles.gather(-1, previous_keys.clamp(max=tile_size - 1).unsqueeze(-1)).squeeze(-1)
+        candidates = candidates.masked_fill((previous_keys == 255) | ~valid, -torch.inf)
+        # A candidate that ties the current maximum is a hit even if its key differs.
+        matches = (valid & (previous_keys == row_keys)).sum(-2)
+        hits = (valid & (candidates == tile_scores)).sum(-2)
+        import blasst_attn as ba
+        approximate_margin = ba.row_tile_margins(candidates).amax(-2)
+        row_replay = torch.stack((matches, hits, valid.sum(-2), approximate_margin), dim=-1)
+    return indices, snapshots, row_keys, row_replay
 
 
-def _snapshot(indices, scores, q_start):
-    query, tile_key, running_key = indices
-    return [query + q_start, tile_key, running_key, *scores]
+class TileIndexTracker:
+    def __init__(self):
+        self.anchors = {}
+        self.previous = {}
+
+    def capture(self, chunk, layer, scores, tile_size):
+        if not 0 < tile_size <= 255:
+            raise ValueError("Row-key encoding requires a tile width between 1 and 255")
+        previous_layer, previous_keys = self.previous.get(chunk, (None, None))
+        if previous_layer != layer - 1:
+            previous_keys = None
+        indices, snapshots, row_keys, replay = margin_indices(
+            scores, tile_size, self.anchors.get(chunk), previous_keys)
+        self.anchors.setdefault(chunk, indices)
+        self.previous[chunk] = (layer, row_keys)
+        return (indices.tolist(), snapshots.tolist(), row_keys.transpose(-2, -1).tolist(),
+                replay.tolist() if replay is not None else None)
+
+
+def _snapshot(captured, head, tile, q_start):
+    indices, scores, row_keys, replay = captured
+    query, tile_key, running_key = indices[head][tile]
+    replay_row = None
+    if replay is not None:
+        matches, hits, rows, margin = replay[head][tile]
+        replay_row = [int(matches), int(hits), int(rows), margin if math.isfinite(margin) else None]
+    return [query + q_start, tile_key, running_key, *scores[head][tile],
+            bytes(row_keys[head][tile]).hex(), replay_row]
 
 
 class TileLayerRecorder:
@@ -58,7 +96,7 @@ class TileLayerRecorder:
         self.tiles = defaultdict(dict)
         self.geometry = {}
         self.indices = defaultdict(dict) if track_indices else None
-        self.anchors = {}
+        self.tracker = TileIndexTracker() if track_indices else None
 
     def observe(self, *, layer, phase, q_start, scores, margin, skip, ln_lambda, key_length):
         if layer not in self.layers:
@@ -91,19 +129,15 @@ class TileLayerRecorder:
 
         values = margin[0, self.heads].tolist()
         entries = self.geometry[chunk]
-        if self.indices is not None:
-            indices, snapshots = margin_indices(scores[0, self.heads], ba.TILE, self.anchors.get(chunk))
-            if chunk not in self.anchors:
-                self.anchors[chunk] = indices
-            index_rows, score_rows = indices.tolist(), snapshots.tolist()
+        if self.tracker is not None:
+            captured = self.tracker.capture(chunk, layer, scores[0, self.heads], ba.TILE)
         self.count += len(entries)
         if self.count > self.max_tiles:
             raise ValueError("Layer study exceeds --max-tiles; increase the limit or select fewer heads/tokens")
         for head_index, key_tile, key in entries:
             self.tiles[key][layer] = values[head_index][key_tile]
             if self.indices is not None:
-                self.indices[key][layer] = _snapshot(index_rows[head_index][key_tile],
-                                                     score_rows[head_index][key_tile], q_start)
+                self.indices[key][layer] = _snapshot(captured, head_index, key_tile, q_start)
 
     def case(self, index, sample_id):
         return make_case(index, sample_id, self.tiles, self.indices)
@@ -134,7 +168,7 @@ def recorded_case(data, index, score_file=None):
     spans = data["visual_spans"]
     tiles = defaultdict(dict)
     indices = defaultdict(dict) if score_file else None
-    anchors = {}
+    tracker = TileIndexTracker() if score_file else None
     for view in sorted(data["views"], key=lambda view: view["layer"]):
         chunks = {}
         for tile in view["tiles"]:
@@ -152,13 +186,9 @@ def recorded_case(data, index, score_file=None):
                     width = min(view["key_length"], q + rows)
                     block = read_score_chunk(score_file, view["score_chunks"][str(q)], rows, width)
                     chunk = (view["phase"], view["step"], view["head"], q)
-                    winners, values = margin_indices(block, data["metadata"]["tile_size"],
-                                                     anchors.get(chunk))
-                    anchors.setdefault(chunk, winners)
-                    chunks[q] = (winners[0].tolist(), values[0].tolist())
-                winners, values = chunks[q]
+                    chunks[q] = tracker.capture(chunk, view["layer"], block, data["metadata"]["tile_size"])
                 k_tile = k // data["metadata"]["tile_size"]
-                indices[key][view["layer"]] = _snapshot(winners[k_tile], values[k_tile], q)
+                indices[key][view["layer"]] = _snapshot(chunks[q], 0, k_tile, q)
     return make_case(index, data["metadata"].get("sample_id"), tiles, indices)
 
 
@@ -199,7 +229,28 @@ def layer_pairs(case, cutoff):
                     outcome = OUTCOMES[2 * int(replay < cutoff) + to_skip]
                     counts[f"replay_{outcome}"] += 1
                     counts["replay_absolute_error"] += abs(replay - exact_margin)
+                if later == earlier + 1 and len(target) > 7 and target[7] is not None:
+                    matches, hits, rows, replay = target[7]
+                    if replay is None:
+                        continue
+                    counts["row_matches"] += matches
+                    counts["row_hits"] += hits
+                    counts["row_observations"] += rows
+                    outcome = OUTCOMES[2 * int(replay < cutoff) + to_skip]
+                    counts[f"row_replay_{outcome}"] += 1
+                    counts["row_replay_absolute_error"] += abs(replay - exact_margin)
     return by_phase
+
+
+def _replay_metrics(values, prefix):
+    keeps, misses, false, skips = (values[f"{prefix}_{name}"] for name in OUTCOMES)
+    total = keeps + misses + false + skips
+    if not total:
+        return None
+    return dict(observations=total, false_skips=false, missed_skips=misses,
+                false_skip_rate=false / (keeps + false) if keeps + false else None,
+                missed_skip_rate=misses / (misses + skips) if misses + skips else None,
+                mean_absolute_margin_error=values[f"{prefix}_absolute_error"] / total)
 
 
 def _reliability(values, track_indices):
@@ -215,13 +266,17 @@ def _reliability(values, track_indices):
                   later_skips_recovered=skip_skip / later_skips if later_skips else None)
     if track_indices:
         result.update({name: values[name] / total for name in INDEX_MATCHES})
-        replay = [values[f"replay_{name}"] for name in OUTCOMES]
-        if sum(replay):
-            keeps, misses, false, skips = replay
-            result["anchor_replay"] = dict(observations=sum(replay), false_skips=false, missed_skips=misses,
-                                           false_skip_rate=false / (keeps + false) if keeps + false else None,
-                                           missed_skip_rate=misses / (misses + skips) if misses + skips else None,
-                                           mean_absolute_margin_error=values["replay_absolute_error"] / sum(replay))
+        anchor = _replay_metrics(values, "replay")
+        if anchor:
+            result["anchor_replay"] = anchor
+        row_replay = _replay_metrics(values, "row_replay")
+        if row_replay:
+            rows = values["row_observations"]
+            result["row_key_replay"] = dict(row_replay, row_observations=rows,
+                                            matched_rows=values["row_matches"],
+                                            max_score_hits=values["row_hits"],
+                                            key_match_rate=values["row_matches"] / rows,
+                                            max_score_hit_rate=values["row_hits"] / rows)
     return result
 
 
@@ -233,7 +288,9 @@ class LayerReport:
                              cutoff=math.log(lam), recorded_trajectory="dense", **{"lambda": lam})
         if track_indices:
             self.metadata["max_indices"] = ["query", "tile_key", "running_key", "tile_score",
-                                            "running_score", "first_layer_replayed_margin"]
+                                            "running_score", "first_layer_replayed_margin",
+                                            "row_key_offsets_hex", "previous_layer_row_replay"]
+            self.metadata["row_key_replay"] = True
         self.totals = defaultdict(lambda: defaultdict(lambda: defaultdict(Counter)))
         self.cases = []
 

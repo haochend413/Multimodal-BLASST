@@ -93,12 +93,20 @@ This estimates the skip decision from two dot products. The false-skip rate divi
 by fresh full-score BLASST keeps, and the missed-skip rate divides by fresh skips.
 Actual attention on kept tiles still uses the usual computation.
 
+The **per-row key replay** uses one key per valid query row per tile. It takes each
+row's winning key from the preceding model layer, reads the target layer's score at
+that same query/key position, and rebuilds the running max from those candidate
+scores across key tiles. Both the key-position match rate and max-score hit rate are
+reported. The latter includes a different key that ties the current maximum.
+Each adjacent layer pair starts with freshly computed source maxima. These are
+offline replay results measured against full-score BLASST on the same trajectory.
+
 If a dense export already has its matching `.scores.bin` file, reconstruct the same
 statistics locally without rerunning the model:
 
 ```bash
 OMP_NUM_THREADS=1 python tile_layer_study.py ../results/vqav2-image0-question0.json \
-  --study-max-indices --output /tmp/blasst-max-index-vqa-pilot.json
+  --study-max-indices --output /tmp/blasst-row-key-vqa-pilot.json
 ```
 
 ### JL precheck for BLASST
