@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
 from uuid import uuid4
@@ -183,6 +185,17 @@ def prepare_inputs(processor: Qwen2_5_VLProcessor,
     return inputs, metadata
 
 
+def _select_sample(args, parser, sample):
+    if ("image" in sample) == ("video" in sample):
+        parser.error("each benchmark sample must contain exactly one image or video path")
+    args.image = Path(sample["image"]) if "image" in sample else None
+    args.video = Path(sample["video"]) if "video" in sample else None
+    args.text_before, args.question = sample["text_before"], sample["question"]
+    path = args.image if args.image is not None else args.video
+    if not path.is_file():
+        parser.error(f"Missing input media: {path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -217,7 +230,15 @@ def main() -> None:
     parser.add_argument("--demo", action="store_true", help="synthetic CPU Q/K; no model downloads")
     parser.add_argument("--manifest", type=Path, help="Video-MME or VQA v2 benchmark manifest")
     parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument("--sample-count", type=int, default=1,
+                        help="number of consecutive manifest pairs for a projected-only audit")
     args = parser.parse_args()
+    if args.sample_count < 1:
+        parser.error("--sample-count must be positive")
+    if args.sample_count > 1 and (not args.manifest or not args.jl_projected_only):
+        parser.error("batch collection requires --manifest and --jl-projected-only")
+    if args.sample_count > 1 and (args.score_data or args.raw_dir):
+        parser.error("use a single sample when exporting raw scores")
     benchmark = None
     sample_id = None
     if args.manifest is not None:
@@ -227,14 +248,13 @@ def main() -> None:
         if manifest.get("schema") != "blasst-benchmark-manifest-v1":
             parser.error("unsupported benchmark manifest schema")
         samples = manifest["samples"]
-        if not 0 <= args.sample_index < len(samples):
-            parser.error(f"sample-index must be between 0 and {len(samples) - 1}")
-        sample = samples[args.sample_index]
-        if ("image" in sample) == ("video" in sample):
-            parser.error("each benchmark sample must contain exactly one image or video path")
-        args.image = Path(sample["image"]) if "image" in sample else None
-        args.video = Path(sample["video"]) if "video" in sample else None
-        args.text_before, args.question = sample["text_before"], sample["question"]
+        end = args.sample_index + args.sample_count
+        if not 0 <= args.sample_index < end <= len(samples):
+            parser.error(f"requested sample range is outside the {len(samples)} manifest pairs")
+        samples = samples[args.sample_index:end]
+        sample = samples[0]
+        if args.sample_count == 1:
+            _select_sample(args, parser, sample)
         benchmark, sample_id = sample["benchmark"], sample["id"]
     if args.decode_tokens < 1 or args.max_tokens < 1:
         parser.error("decode-tokens and max-tokens must be positive")
@@ -260,14 +280,17 @@ def main() -> None:
     else:
         args.jl_probe = None
     if not args.demo:
-        if (args.image is None) == (args.video is None):
-            parser.error("provide exactly one --image or --video, or use --manifest")
-        media_path = args.image if args.image is not None else args.video
-        if not media_path.is_file():
-            parser.error(f"Missing input media: {media_path}")
+        if args.manifest is None:
+            if (args.image is None) == (args.video is None):
+                parser.error("provide exactly one --image or --video, or use --manifest")
+            media_path = args.image if args.image is not None else args.video
+            if not media_path.is_file():
+                parser.error(f"Missing input media: {media_path}")
         if not torch.cuda.is_available():
             parser.error("Real model collection requires CUDA; use --demo for CPU verification")
-    if args.score_data:
+    if args.sample_count > 1:
+        _collect_batch(args, parser, samples)
+    elif args.score_data:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         score_path = args.output.with_suffix(".scores.bin")
         if score_path == args.output:
@@ -279,13 +302,52 @@ def main() -> None:
         collect(args, parser, benchmark, sample_id)
 
 
-def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = None) -> None:
+def _collect_batch(args, parser, samples):
+    """Write individual audits and refresh the aggregate after every completed pair."""
+    output = args.output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    details = output.parent / f"{output.stem}-samples"
+    phases = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    completed = []
+    for index, sample in enumerate(samples, start=args.sample_index):
+        _select_sample(args, parser, sample)
+        args.output = details / f"{index:05d}.json"
+        metadata = collect(args, parser, sample["benchmark"], sample["id"])
+        projected = metadata["jl_projected"]
+        for phase, groups in projected["phases"].items():
+            for group, counts in groups.items():
+                totals = phases[phase][group]
+                for name, count in counts.items():
+                    totals[name] += count
+                totals["pairs_observed"] += 1
+                totals["pairs_with_false_skips"] += int(counts["false_skips"] > 0)
+        completed.append({
+            "sample_index": index, "sample_id": sample["id"],
+            "audit": str(args.output.relative_to(output.parent)),
+            "phases": {phase: groups["all"] for phase, groups in projected["phases"].items()},
+        })
+        summary = {
+            "schema": "blasst-jl-projected-batch-v1", "model": args.model,
+            "manifest": str(args.manifest), "sample_index": args.sample_index,
+            "pairs_requested": len(samples), "pairs_completed": len(completed),
+            "dimension": projected["dimension"], "seed": projected["seed"],
+            "lambda": projected["lambda"], "layers": sorted(_indices(args.layers)),
+            "heads": sorted(_indices(args.heads)), "decode_tokens": args.decode_tokens,
+            "phases": phases, "samples": completed,
+        }
+        pending = output.with_suffix(output.suffix + ".tmp")
+        pending.write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
+        pending.replace(output)
+    print(f"Wrote the aggregate for {len(completed)} pairs to {output}")
+
+
+def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = None) -> dict:
     old_observers = ba.STATE["observer"], ba.STATE["qkv_hook"]
     precision = torch.get_float32_matmul_precision()
     try:
         if args.jl_probe is not None:
             torch.set_float32_matmul_precision("highest")
-        _collect(args, parser, benchmark, sample_id, score_stream)
+        return _collect(args, parser, benchmark, sample_id, score_stream)
     finally:
         ba.STATE["observer"], ba.STATE["qkv_hook"] = old_observers
         if args.jl_probe is not None:
@@ -305,7 +367,25 @@ def _attach_study(args, recorder):
     return study
 
 
-def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) -> None:
+@lru_cache(maxsize=2)
+def _load_processor(model_name, image_max_pixels):
+    from transformers import AutoProcessor
+
+    options = ({"min_pixels": 4 * 28 * 28, "max_pixels": image_max_pixels}
+               if image_max_pixels is not None else {})
+    return AutoProcessor.from_pretrained(model_name, **options)
+
+
+@lru_cache(maxsize=1)
+def _load_model(model_name):
+    from transformers import Qwen2_5_VLForConditionalGeneration
+
+    return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16, device_map="cuda",
+        attn_implementation={"text_config": "blasst", "vision_config": "sdpa"}).eval()
+
+
+def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) -> dict:
     ba.set_threshold(args.lam or None)
     ba.set_decode_threshold(args.decode_lambda or None, inherit=args.decode_lambda is None)
     if args.demo:
@@ -330,18 +410,13 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         metadata = {"model": "Synthetic Q/K demonstration", "synthetic": True,
                     "prompt_tokens": length, "note": "Not measured model or Video-MME results"}
     else:
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-        processor_options = ({"min_pixels": 4 * 28 * 28, "max_pixels": args.image_max_pixels}
-                             if args.image is not None else {})
-        processor = AutoProcessor.from_pretrained(args.model, **processor_options)
+        processor = _load_processor(args.model, args.image_max_pixels if args.image is not None else None)
         inputs, media_metadata = prepare_inputs(processor, args)
         inputs = inputs.to("cuda")
         length = inputs.input_ids.shape[1]
         if length > args.max_tokens:
             parser.error(f"Prompt has {length} tokens, exceeds --max-tokens; reduce --frames or --image-max-pixels")
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            args.model, torch_dtype=torch.bfloat16, device_map="cuda",
-            attn_implementation={"text_config": "blasst", "vision_config": "sdpa"}).eval()
+        model = _load_model(args.model)
         selected_layers, selected_heads = _indices(args.layers), _indices(args.heads)
         config = model.config.text_config
         if not all(0 <= x < config.num_hidden_layers for x in selected_layers):
@@ -381,6 +456,7 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
     else:
         recorder.export(args.output, metadata)
         print(f"Wrote {len(recorder.views)} views and {recorder.tile_count} tiles to {args.output}")
+    return metadata
 
 
 if __name__ == "__main__":

@@ -58,6 +58,15 @@ skips, false skips (only projected skips), and missed skips (only full skips). C
 are broken down by phase and tile modality. Each exported tile includes
 `projected_margin`, `projected_skipped`, and `full_skipped_at_jl_lambda`.
 
+For multiple image/question pairs, prepare a VQA v2 manifest using
+`prepare_vqav2_study.py --images 30 --questions-per-image 1`. Add `--sample-count 30`
+to the projected-only audit command, keeping the same `--sample-index` as the start of
+the requested manifest range. One process reuses the model for all pairs. The output JSON
+contains pooled tile counts and the number of pairs with false skips, broken down by phase
+and modality. Individual Attention Lab audits are in a sibling directory named
+`<output-stem>-samples`. Use a different output filename for a different projection width
+or seed.
+
 Start with a CPU smoke test from this directory. The demo has 32-dimensional heads.
 
 ```bash

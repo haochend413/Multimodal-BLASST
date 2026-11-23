@@ -1,3 +1,5 @@
+import argparse
+import json
 import math
 from types import SimpleNamespace
 
@@ -5,6 +7,7 @@ import pytest
 import torch
 
 import blasst_attn as ba
+import attention_study
 from attention_study import AttentionRecorder
 from jl_blasst import JLAudit, JLPrecheck, JLStudy, ProjectedJLStudy
 
@@ -103,3 +106,35 @@ def test_projected_only_uses_its_own_running_max(monkeypatch):
     counts = projected.summary()["phases"]["decode"]
     assert counts["all"]["missed_skips"] == counts["all"]["false_skips"] == 1
     assert counts["key:V"]["false_skips"] == 1
+
+
+def test_projected_batch_counts_pairs_with_false_skips(tmp_path, monkeypatch):
+    output = tmp_path / "summary.json"
+    image = tmp_path / "image.jpg"
+    image.touch()
+    samples = [
+        {"image": str(image), "text_before": "", "question": "What is shown?",
+         "benchmark": {}, "id": f"sample-{i}"}
+        for i in range(2)
+    ]
+    args = argparse.Namespace(output=output, sample_index=3, model="test",
+                              manifest=tmp_path / "vqa.json", layers="0", heads="4", decode_tokens=2)
+
+    def collect_sample(args, parser, benchmark, sample_id):
+        if sample_id == "sample-1":
+            assert json.loads(output.read_text())["pairs_completed"] == 1
+        false_skips = 2 if sample_id == "sample-0" else 0
+        args.output.parent.mkdir(exist_ok=True)
+        args.output.write_text(sample_id)
+        return {"jl_projected": {"dimension": 32, "seed": 0, "lambda": 0.1,
+                                 "phases": {"decode": {"all": {"tiles": 4, "false_skips": false_skips}}}}}
+
+    monkeypatch.setattr(attention_study, "collect", collect_sample)
+    attention_study._collect_batch(args, argparse.ArgumentParser(), samples)
+    report = json.loads(output.read_text())
+    assert report["pairs_completed"] == 2
+    assert report["phases"]["decode"]["all"] == {
+        "tiles": 8, "false_skips": 2, "pairs_observed": 2, "pairs_with_false_skips": 1,
+    }
+    assert [row["sample_index"] for row in report["samples"]] == [3, 4]
+    assert (tmp_path / report["samples"][1]["audit"]).read_text() == "sample-1"
