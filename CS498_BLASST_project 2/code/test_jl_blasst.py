@@ -9,7 +9,9 @@ import torch
 import blasst_attn as ba
 import attention_study
 from attention_study import AttentionRecorder
-from jl_blasst import JLAudit, JLPrecheck, JLStudy, ProjectedJLStudy, _split_margins
+from jl_blasst import (
+    JLAudit, JLPrecheck, JLStudy, ProjectedJLStudy, VISUAL_KEY_QUERY_SPLIT, _split_margins,
+)
 
 
 @pytest.mark.parametrize("query_len,epsilon", [(258, None), (1, None), (1, 0.5)])
@@ -136,17 +138,61 @@ def test_split_prefill_preserves_positions_and_valid_pairs(monkeypatch, split):
     module = SimpleNamespace(layer_idx=1)
     ba.blasst_attention_forward(module, q, k, k, None)
     view = recorder.views["prefill:-1:1:0"]
+    coverage = torch.zeros((n, n), dtype=torch.int32)
+    positions = torch.arange(n)
     for tile in view["split_tiles"]:
+        q_rows = slice(tile["q"], tile["q"] + tile["rows"])
+        k_columns = slice(tile["k"], tile["k"] + tile["cols"])
+        causal = positions[q_rows, None] >= positions[None, k_columns]
+        assert causal.any()
+        coverage[q_rows, k_columns] += causal
         if split in ("query", "both"):
-            q_mod = visual[tile["q"]:tile["q"] + tile["rows"]]
+            q_mod = visual[q_rows]
             assert q_mod.all() or not q_mod.any()
         if split in ("key", "both"):
-            k_mod = visual[tile["k"]:tile["k"] + tile["cols"]]
+            k_mod = visual[k_columns]
             assert k_mod.all() or not k_mod.any()
+    torch.testing.assert_close(coverage, (positions[:, None] >= positions[None, :]).int())
     assert len(view["split_tiles"]) > len(view["tiles"])
     counts = projected.summary()
+    assert counts["split_prefill"]["all"]["tiles"] == len(view["split_tiles"])
     assert counts["split_prefill"]["all"]["valid_pairs"] == n * (n + 1) // 2
     assert counts["phases"]["prefill"]["all"]["valid_pairs"] == n * (n + 1) // 2
+
+
+def test_selective_split_only_partitions_mixed_queries_against_visual_keys(monkeypatch):
+    rng = torch.Generator().manual_seed(5)
+    n = 390
+    q, k = (torch.randn(1, 1, n, 16, generator=rng) for _ in range(2))
+    visual = (torch.arange(n) >= 15) & (torch.arange(n) < 386)
+    recorder = AttentionRecorder(visual, {1}, {0})
+    projected = ProjectedJLStudy(JLPrecheck(8), {1}, {0}, 0.1,
+                                 split=VISUAL_KEY_QUERY_SPLIT, visual=visual)
+    recorder.projected_study = projected
+    monkeypatch.setitem(ba.STATE, "observer", recorder.observe)
+    monkeypatch.setitem(ba.STATE, "qkv_hook", projected.observe)
+    ba.blasst_attention_forward(SimpleNamespace(layer_idx=1), q, k, k, None)
+
+    view = recorder.views["prefill:-1:1:0"]
+    originals = {(tile["q"], tile["k"]): tile for tile in view["tiles"]}
+    selective = {(tile["q"], tile["k"]): tile for tile in view["split_tiles"]}
+    targeted = {(384, 128), (384, 256)}
+    for position, tile in originals.items():
+        kept = selective[position]
+        if position in targeted:
+            assert (kept["rows"], kept["q_kind"], kept["k_kind"]) == (2, "V", "V")
+            text = selective[386, position[1]]
+            assert (text["rows"], text["q_kind"], text["k_kind"]) == (4, "T", "V")
+        else:
+            for field in ("rows", "cols", "margin", "projected_margin", "projected_skipped",
+                          "full_skipped_at_jl_lambda"):
+                assert kept[field] == tile[field]
+    assert len(selective) == len(originals) + len(targeted)
+    summary = projected.summary()
+    original_counts = summary["phases"]["prefill"]["all"]
+    split_counts = summary["split_prefill"]["all"]
+    assert split_counts["valid_pairs"] == original_counts["valid_pairs"]
+    assert split_counts["dense_weight"] == pytest.approx(original_counts["dense_weight"])
 
 
 def test_projected_batch_counts_pairs_with_false_skips(tmp_path, monkeypatch):

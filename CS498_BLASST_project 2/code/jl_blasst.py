@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from typing import NamedTuple
 
 import torch
 
 import blasst_attn as ba
+
+VISUAL_KEY_QUERY_SPLIT = "query-on-visual-keys"
 
 
 class JLPrecheck:
@@ -187,18 +190,31 @@ def _tile_kind(visual):
     return "V" if count == visual.numel() else "mixed"
 
 
-def _tile_spans(visual, split):
-    """Split each original tile internally, preserving position and traversal order."""
-    spans = []
-    for start in range(0, len(visual), ba.TILE):
-        end = min(start + ba.TILE, len(visual))
-        cuts = [start]
-        if split:
-            changes = visual[start + 1:end] != visual[start:end - 1]
-            cuts.extend(start + 1 + i for i in changes.nonzero().flatten().tolist())
-        cuts.append(end)
-        spans.extend(zip(cuts, cuts[1:]))
-    return spans
+class AttentionTile(NamedTuple):
+    query: tuple[int, int]
+    key: tuple[int, int]
+
+
+def _modality_runs(visual, span):
+    start, end = span
+    changes = visual[start + 1:end] != visual[start:end - 1]
+    cuts = [start, *(start + 1 + i for i in changes.nonzero().flatten().tolist()), end]
+    return list(zip(cuts, cuts[1:]))
+
+
+def _attention_tiles(query_visual, key_visual, mode):
+    """Replace each mixed attention tile with modality-pure rectangles on the requested sides."""
+    query = (0, len(query_visual))
+    query_runs = _modality_runs(query_visual, query) if mode != "key" else [query]
+    tiles = []
+    for start in range(0, len(key_visual), ba.TILE):
+        key = (start, min(start + ba.TILE, len(key_visual)))
+        queries = query_runs
+        if mode == VISUAL_KEY_QUERY_SPLIT and not bool(key_visual[slice(*key)].all()):
+            queries = [query]
+        keys = _modality_runs(key_visual, key) if mode in ("key", "both") else [key]
+        tiles.extend(AttentionTile(q, k) for k in keys for q in queries)
+    return tiles
 
 
 def _split_margins(scores, query_spans, key_spans):
@@ -206,6 +222,14 @@ def _split_margins(scores, query_spans, key_spans):
     maxima = torch.stack([scores[..., lo:hi].amax(-1) for lo, hi in key_spans], dim=-1)
     margins = ba.row_tile_margins(maxima)
     return torch.stack([margins[..., lo:hi, :].amax(-2) for lo, hi in query_spans], dim=-2)
+
+
+def _tile_plan_margins(scores, tiles):
+    # Cache reductions for repeated spans. The only decisions emitted are for the tiles in the plan.
+    query_indices = {span: index for index, span in enumerate(dict.fromkeys(t.query for t in tiles))}
+    key_indices = {span: index for index, span in enumerate(dict.fromkeys(t.key for t in tiles))}
+    margins = _split_margins(scores, query_indices, key_indices)
+    return margins[..., [query_indices[t.query] for t in tiles], [key_indices[t.key] for t in tiles]]
 
 
 def _record_mask_decision(groups, q_kind, k_kind, full_skip, projected_skip, valid_pairs, dense_weight):
@@ -261,7 +285,6 @@ class ProjectedJLStudy:
         if split_prefill:
             visual = torch.zeros(key_len, dtype=torch.bool)
             visual[:min(len(self.visual), key_len)] = self.visual[:key_len]
-            key_spans = _tile_spans(visual, self.split in ("key", "both"))
         for start in range(0, query_len, ba.TILE):
             end = min(start + ba.TILE, query_len)
             q_pos = torch.arange(start + offset, end + offset, device=query.device)
@@ -273,11 +296,9 @@ class ProjectedJLStudy:
             q_start = start + offset
             self.margins[q_start] = ba.tile_margins(tiles)[0].cpu()
             if split_prefill:
-                query_spans = _tile_spans(visual[q_start:end + offset], self.split in ("query", "both"))
-                split_margins = _split_margins(
-                    tiles.flatten(-2)[..., :key_len], query_spans, key_spans,
-                )[0].cpu()
-                self.split_chunks[q_start] = (query_spans, key_spans, split_margins)
+                split_tiles = _attention_tiles(visual[q_start:end + offset], visual, self.split)
+                split_margins = _tile_plan_margins(tiles.flatten(-2)[..., :key_len], split_tiles)
+                self.split_chunks[q_start] = (split_tiles, split_margins[0].cpu())
 
     def record(self, *, phase, head_index, q_start, tile_index, full_margin, q_visual, k_visual,
                valid_pairs, dense_weight):
@@ -294,30 +315,29 @@ class ProjectedJLStudy:
         }
 
     def record_split(self, head_index, q_start, scores, probabilities, visual):
-        query_spans, key_spans, projected = self.split_chunks[q_start]
-        full = _split_margins(scores, query_spans, key_spans)
+        tiles, projected = self.split_chunks[q_start]
+        full = _tile_plan_margins(scores, tiles)
         valid = torch.isfinite(scores)
         measurements = []
-        for qi, (qlo, qhi) in enumerate(query_spans):
-            for ki, (klo, khi) in enumerate(key_spans):
-                block = valid[qlo:qhi, klo:khi]
-                count = int(block.sum())
-                if count == 0:
-                    continue
-                q_kind = _tile_kind(visual[q_start + qlo:q_start + qhi][block.any(-1)])
-                k_kind = _tile_kind(visual[klo:khi][block.any(-2)])
-                full_margin, projected_margin = float(full[qi, ki]), float(projected[head_index, qi, ki])
-                full_skip, projected_skip = full_margin < self.ln_lam, projected_margin < self.ln_lam
-                weight = float(probabilities[qlo:qhi, klo:khi].sum())
-                _record_mask_decision(self.split_prefill, q_kind, k_kind, full_skip, projected_skip,
-                                      count, weight)
-                measurements.append({
-                    "q": q_start + qlo, "k": klo, "rows": qhi - qlo, "cols": khi - klo,
-                    "q_kind": q_kind, "k_kind": k_kind, "margin": full_margin,
-                    "mass": weight / (qhi - qlo),
-                    "projected_margin": projected_margin, "projected_skipped": projected_skip,
-                    "full_skipped_at_jl_lambda": full_skip,
-                })
+        for index, ((qlo, qhi), (klo, khi)) in enumerate(tiles):
+            valid_pairs = valid[qlo:qhi, klo:khi]
+            count = int(valid_pairs.sum())
+            if count == 0:
+                continue
+            q_kind = _tile_kind(visual[q_start + qlo:q_start + qhi][valid_pairs.any(-1)])
+            k_kind = _tile_kind(visual[klo:khi][valid_pairs.any(-2)])
+            full_margin, projected_margin = float(full[index]), float(projected[head_index, index])
+            full_skip, projected_skip = full_margin < self.ln_lam, projected_margin < self.ln_lam
+            weight = float(probabilities[qlo:qhi, klo:khi].sum())
+            _record_mask_decision(self.split_prefill, q_kind, k_kind, full_skip, projected_skip,
+                                  count, weight)
+            measurements.append({
+                "q": q_start + qlo, "k": klo, "rows": qhi - qlo, "cols": khi - klo,
+                "q_kind": q_kind, "k_kind": k_kind, "margin": full_margin,
+                "mass": weight / (qhi - qlo),
+                "projected_margin": projected_margin, "projected_skipped": projected_skip,
+                "full_skipped_at_jl_lambda": full_skip,
+            })
         return measurements
 
     def summary(self):

@@ -15,7 +15,7 @@ from uuid import uuid4
 import torch
 
 import blasst_attn as ba
-from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy
+from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy, VISUAL_KEY_QUERY_SPLIT
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -233,8 +233,9 @@ def main() -> None:
                         help="use the precheck during generation in selected layers, for all heads")
     parser.add_argument("--jl-projected-only", action="store_true",
                         help="compare projected-only BLASST masks with full BLASST on the same inputs")
-    parser.add_argument("--jl-split-tiles", choices=("query", "key", "both"),
-                        help="also audit prefill tiles split at text/visual boundaries")
+    parser.add_argument("--jl-split-tiles", choices=("query", "key", "both", VISUAL_KEY_QUERY_SPLIT),
+                        help="audit modality splits; query-on-visual-keys only splits mixed query "
+                             "rows against entirely visual keys")
     parser.add_argument("--demo", action="store_true", help="synthetic CPU Q/K; no model downloads")
     parser.add_argument("--manifest", type=Path, help="Video-MME or VQA v2 benchmark manifest")
     parser.add_argument("--sample-index", type=int, default=0)

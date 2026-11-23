@@ -67,12 +67,16 @@ and modality. Individual Attention Lab audits are in a sibling directory named
 `<output-stem>-samples`. Use a different output filename for a different projection width
 or seed.
 
-Add `--jl-split-tiles query` to audit splitting mixed prefill query tiles into
-contiguous text and visual subtiles within each original 128-token span. Use
-`--jl-split-tiles both` to split both axes so each query and key side is homogeneous,
-or `key` to isolate key-side splitting. Original token positions and causal masks
-are used throughout. The reference reduces valid lanes directly, which has the
-same skip decisions as padding each subtile to 128 with masked score entries.
+Use `--jl-split-tiles both` to break each mixed prefill attention tile at text and
+visual boundaries on either axis. Each resulting tile has homogeneous query rows
+and homogeneous key columns. The split totals count each resulting tile with at least
+one valid query–key pair once. Token positions, key order and causal masks are
+preserved. Reducing real lanes gives the same decisions as padding to 128 with
+masked score entries.
+
+The `query` and `key` modes split only the specified side. The
+`query-on-visual-keys` mode splits mixed query rows only against entirely visual
+key columns. This isolates the effect of splitting the query vote in that region.
 
 The same run reports standard tiles under `phases.prefill` and the split layout
 under `split_prefill` in the batch report. For a single sample, both are under
