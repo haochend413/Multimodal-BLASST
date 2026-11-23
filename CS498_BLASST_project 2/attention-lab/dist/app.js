@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 import {validate, summary, regions, colors, scoreFileId, tileScores} from './data.mjs?v=token-scores';
-import {isJLSweep, setupJLStudy} from './jl.mjs?v=jl-sweep';
+import {isJLSweep, setupJLStudy} from './jl.mjs?v=jl-cases';
 const $ = id => document.getElementById(id);
 const jlStudy = setupJLStudy();
 const datasets = []; let data, current, region = 'All', hits = [];
@@ -197,7 +197,7 @@ $('upload').addEventListener('change', async event => {
 $('download').addEventListener('click',()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(data)],{type:'application/json'})),a=document.createElement('a');a.href=url;a.download='attention-study.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);});
 try{const response=await fetch('demo.json?v=token-scores');if(!response.ok)throw new Error('Demo dataset could not be loaded. Load an experiment JSON to continue.');const demo = await response.json(); demoScoreId = demo.score_file?.id; add('Synthetic demonstration', demo);}catch(error){fail(error);}
 try {
-  const response = await fetch('jl-demo.json?v=jl-sweep');
+  const response = await fetch('jl-demo.json?v=jl-cases');
   if (!response.ok) throw new Error('Missing JL demo');
   jlStudy.add('Synthetic demonstration', await response.json(), false);
 } catch {

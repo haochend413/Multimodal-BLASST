@@ -39,8 +39,10 @@ def test_batch_pools_counts_and_preserves_number_of_pairs():
         "full_gaps": copy.deepcopy(gaps),
         "projections": {"32": {"gaps": gaps, "decisions": {"all": {"false_skips": 2}}}},
     }})
-    result = merge_sweeps(report, copy.deepcopy(report))
+    original = copy.deepcopy(report)
+    result = merge_sweeps(merge_sweeps(None, report), copy.deepcopy(report))
     phase = result["phases"]["prefill"]
     assert result["pairs_completed"] == 2
     assert phase["full_gaps"]["T->V"] == phase["projections"]["32"]["gaps"]["T->V"] == [2, 0]
     assert phase["projections"]["32"]["decisions"]["all"]["false_skips"] == 4
+    assert report == original

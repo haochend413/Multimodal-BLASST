@@ -50,3 +50,9 @@
   .jl-gap-grid { grid-template-columns: 1fr; }
   .jl-controls label { flex: 1; }
 }
+
+.jl-case-controls { margin-bottom: 9px; }
+.jl-case-controls label { min-width: min(100%, 260px); }
+.jl-case-controls button { min-height: 39px; padding: 7px 12px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 5px; font: 600 14px 'DM Sans', sans-serif; cursor: pointer; }
+.jl-case-controls button:disabled { color: var(--muted); background: var(--paper); cursor: default; opacity: .65; }
+#jl-case-note { margin-bottom: 16px; }

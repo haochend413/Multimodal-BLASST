@@ -17,6 +17,7 @@ import torch
 import blasst_attn as ba
 from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy, VISUAL_KEY_QUERY_SPLIT
 from jl_gap_study import JLGapStudy, merge_sweeps
+from jl_region_study import JLRegionStudy, merge_region_audits
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -227,6 +228,8 @@ def main() -> None:
     parser.add_argument("--jl-dim", type=int, help="audit a JL precheck at this sketch dimension")
     parser.add_argument("--jl-sweep", metavar="DIMS",
                         help="comma-separated JL widths for a paired skip-rate and gap histogram study")
+    parser.add_argument("--jl-region-audit", action="store_true",
+                        help="compare original, modality-packed, and per-key-region max policies")
     parser.add_argument("--jl-epsilon", type=float,
                         help="use a JL norm-product margin instead of the orthogonal residual bound")
     parser.add_argument("--jl-lambda", type=float, default=0.1,
@@ -245,6 +248,8 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int, default=1,
                         help="number of consecutive manifest pairs for a projected-only audit")
     args = parser.parse_args()
+    if args.sample_index < 0:
+        parser.error("--sample-index must be nonnegative")
     if args.jl_sweep is not None:
         try:
             args.jl_sweep = sorted({int(dim) for dim in args.jl_sweep.split(",")})
@@ -255,14 +260,24 @@ def main() -> None:
         if not 0 < args.jl_lambda <= 1:
             parser.error("--jl-lambda must be in (0, 1]")
         if (args.jl_dim is not None or args.jl_epsilon is not None or args.jl_live or
-                args.jl_projected_only or args.jl_split_tiles or args.score_data or args.raw_dir):
+                args.jl_projected_only or args.jl_split_tiles or args.jl_region_audit or
+                args.score_data or args.raw_dir):
             parser.error("--jl-sweep produces its own report; omit other JL modes and raw-score flags")
         if args.lam or args.decode_lambda:
             parser.error("--jl-sweep uses a dense trajectory; set the audit threshold with --jl-lambda")
+    if args.jl_region_audit:
+        if args.jl_dim is None:
+            parser.error("--jl-region-audit requires --jl-dim")
+        if (args.jl_epsilon is not None or args.jl_live or args.jl_projected_only or
+                args.jl_split_tiles or args.score_data or args.raw_dir or args.lam or args.decode_lambda):
+            parser.error("--jl-region-audit uses a dense trajectory and its own report; set --jl-lambda")
+    paired_audit = args.jl_sweep or args.jl_region_audit
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
-    if args.sample_count > 1 and (not args.manifest or not (args.jl_projected_only or args.jl_sweep)):
-        parser.error("batch collection requires --manifest and a projected-only audit or JL sweep")
+    if args.sample_count > 1 and not (
+        (args.manifest and (args.jl_projected_only or paired_audit)) or (args.demo and paired_audit)
+    ):
+        parser.error("batch collection requires a manifest audit or synthetic paired JL audit")
     if args.sample_count > 1 and (args.score_data or args.raw_dir):
         parser.error("use a single sample when exporting raw scores")
     benchmark = None
@@ -279,7 +294,7 @@ def main() -> None:
             parser.error(f"requested sample range is outside the {len(samples)} manifest pairs")
         samples = samples[args.sample_index:end]
         sample = samples[0]
-        if args.sample_count == 1:
+        if args.sample_count == 1 and not paired_audit:
             _select_sample(args, parser, sample)
         benchmark, sample_id = sample["benchmark"], sample["id"]
     if args.decode_tokens < 1 or args.max_tokens < 1:
@@ -316,18 +331,9 @@ def main() -> None:
                 parser.error(f"Missing input media: {media_path}")
         if not torch.cuda.is_available():
             parser.error("Real model collection requires CUDA; use --demo for CPU verification")
-    if args.jl_sweep:
-        if args.sample_count == 1:
-            report = collect(args, parser, benchmark, sample_id)
-            _write_sweep(args.output, report, 1)
-        else:
-            report = None
-            for index, sample in enumerate(samples, start=1):
-                _select_sample(args, parser, sample)
-                report = merge_sweeps(report, collect(args, parser, sample["benchmark"], sample["id"]))
-                _write_sweep(args.output, report, args.sample_count)
-                print(f"Collected JL gaps for {index}/{args.sample_count} pairs", flush=True)
-        print(f"Wrote the JL sweep to {args.output}")
+    if paired_audit:
+        merge = merge_region_audits if args.jl_region_audit else merge_sweeps
+        _collect_paired_audit(args, parser, samples if args.manifest else [None] * args.sample_count, merge)
     elif args.sample_count > 1:
         _collect_batch(args, parser, samples)
     elif args.score_data:
@@ -351,11 +357,29 @@ def _add_pair_counts(totals_by_group, groups):
         totals["pairs_with_false_skips"] += int(counts["false_skips"] > 0)
 
 
-def _write_sweep(output, report, pairs_requested):
+def _collect_paired_audit(args, parser, samples, merge):
+    report, cases = None, []
+    for index, sample in enumerate(samples, start=args.sample_index):
+        run = argparse.Namespace(**dict(vars(args), sample_index=index))
+        if sample is not None:
+            _select_sample(run, parser, sample)
+            benchmark, sample_id = sample["benchmark"], sample["id"]
+        else:
+            benchmark, sample_id = None, None
+        result = collect(run, parser, benchmark, sample_id)
+        cases.append({"sample_index": index, "sample_id": sample_id, "phases": result["phases"]})
+        report = merge(report, result)
+        _write_paired_audit(args.output, report, args.sample_count, cases)
+        if args.sample_count > 1:
+            print(f"Collected JL results for {len(cases)}/{args.sample_count} pairs", flush=True)
+    print(f"Wrote the JL report to {args.output}")
+
+
+def _write_paired_audit(output, report, pairs_requested, cases):
     output.parent.mkdir(parents=True, exist_ok=True)
     pending = output.with_suffix(output.suffix + ".tmp")
-    pending.write_text(json.dumps(dict(report, pairs_requested=pairs_requested),
-                                  separators=(",", ":"), allow_nan=False) + "\n")
+    payload = dict(report, pairs_requested=pairs_requested, cases=cases)
+    pending.write_text(json.dumps(payload, separators=(",", ":"), allow_nan=False) + "\n")
     pending.replace(output)
 
 
@@ -414,6 +438,12 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
 
 
 def _attach_study(args, recorder):
+    if args.jl_region_audit:
+        study = JLRegionStudy(args.jl_dim, args.jl_lambda, args.jl_seed, recorder.visual,
+                              recorder.layers, recorder.heads)
+        ba.STATE["observer"] = None
+        ba.STATE["qkv_hook"] = study.observe
+        return study
     if args.jl_sweep:
         study = JLGapStudy(args.jl_sweep, args.jl_lambda, args.jl_seed, recorder.visual,
                            recorder.layers, recorder.heads)
@@ -455,10 +485,13 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
     ba.set_threshold(args.lam or None)
     ba.set_decode_threshold(args.decode_lambda or None, inherit=args.decode_lambda is None)
     if args.demo:
-        torch.manual_seed(98)
+        torch.manual_seed(98 + args.sample_index if args.jl_sweep or args.jl_region_audit else 98)
         length = 640
         visual = torch.zeros(length, dtype=torch.bool)
-        visual[128:512] = True
+        if args.jl_region_audit:
+            visual[15:544] = True
+        else:
+            visual[128:512] = True
         recorder = AttentionRecorder(visual, {0, 1, 2}, {0, 1}, args.raw_dir, args.max_tiles,
                                      score_stream)
         ba.STATE["observer"] = None if args.jl_live else recorder.observe
@@ -504,7 +537,7 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         metadata = {"model": args.model, "synthetic": False, "prompt_tokens": length,
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
-    if args.jl_sweep:
+    if args.jl_sweep or args.jl_region_audit:
         return jl_study.summary(metadata)
     if jl_study is not None:
         key = "jl_projected" if args.jl_projected_only else "jl_precheck"

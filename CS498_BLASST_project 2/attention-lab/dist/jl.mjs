@@ -30,7 +30,26 @@ export function validateJLSweep(data) {
       data.histogram?.bin_width !== 1 || data.histogram?.overflow_from !== 80) {
     throw new Error('Invalid JL sweep report.');
   }
-  const phases = Object.entries(data.phases || {});
+  validatePhases(data.phases, data.dimensions, data.pairs_completed);
+  if (data.cases !== undefined) {
+    if (!Array.isArray(data.cases) || data.cases.length !== data.pairs_completed) {
+      throw new Error('JL sweep case count does not match the completed pairs.');
+    }
+    const indices = new Set();
+    for (const item of data.cases) {
+      if (!item || !validCount(item.sample_index) || indices.has(item.sample_index) ||
+          (item.sample_id !== null && typeof item.sample_id !== 'string')) {
+        throw new Error('Invalid JL sweep case.');
+      }
+      indices.add(item.sample_index);
+      validatePhases(item.phases, data.dimensions, 1);
+    }
+  }
+  return data;
+}
+
+function validatePhases(results, dimensions, pairs) {
+  const phases = Object.entries(results || {});
   if (!phases.length) throw new Error('JL sweep contains no phases.');
   for (const [phase, result] of phases) {
     if (!['prefill', 'decode'].includes(phase)) throw new Error('Unknown JL sweep phase.');
@@ -39,14 +58,14 @@ export function validateJLSweep(data) {
       if (!Array.isArray(full) || full.length !== 81 || !full.every(validCount)) {
         throw new Error('Invalid full-score gap histogram.');
       }
-      for (const dim of data.dimensions) {
+      for (const dim of dimensions) {
         const gaps = result.projections?.[dim]?.gaps?.[region];
         if (!Array.isArray(gaps) || gaps.length !== 81 || !gaps.every(validCount) || total(gaps) !== total(full)) {
           throw new Error('Invalid projected-score gap histogram.');
         }
       }
     }
-    for (const dim of data.dimensions) {
+    for (const dim of dimensions) {
       for (const group of groups) {
         const value = result.projections[dim].decisions?.[group];
         if (!value || !fields.every(field => validCount(value[field])) ||
@@ -54,13 +73,12 @@ export function validateJLSweep(data) {
             value.matched_skips + value.missed_skips !== value.full_skips ||
             value.full_skips + value.false_skips > value.tiles ||
             value.pairs_with_false_skips > value.pairs_observed ||
-            value.pairs_observed > data.pairs_completed) {
+            value.pairs_observed > pairs) {
           throw new Error('Invalid JL skip counts.');
         }
       }
     }
   }
-  return data;
 }
 
 function svgElement(parent, tag, attrs, content) {
@@ -201,6 +219,10 @@ function options(select, values, label = String) {
 export function setupJLStudy() {
   const datasets = [];
   const dataset = $('jl-dataset'), phase = $('jl-phase'), dimension = $('jl-dimension');
+  const casePicker = $('jl-case'), previousCase = $('jl-case-prev'), nextCase = $('jl-case-next');
+  function selectedPhases(data) {
+    return data.cases?.[Number(casePicker.value)]?.phases ?? data.phases;
+  }
   function show(active) {
     $('jl-workspace').hidden = !active;
     $('tile-workspace').hidden = active;
@@ -214,30 +236,52 @@ export function setupJLStudy() {
     const data = selected.data;
     const requested = data.pairs_requested ?? data.pairs_completed;
     $('jl-source').textContent = `${data.synthetic ? 'Synthetic demo' : 'Recorded data'} · ${data.model} · ${data.pairs_completed}/${requested} pairs · width ${data.head_width} · λ ${data.lambda} · seed ${data.seed}`;
-    drawRates(data, data.phases[phase.value], $('jl-group').value);
-    drawGaps(data, data.phases[phase.value], dimension.value, +$('jl-window').value);
+    const result = selectedPhases(data)[phase.value];
+    drawRates(data, result, $('jl-group').value);
+    drawGaps(data, result, dimension.value, +$('jl-window').value);
     $('jl-content').hidden = false;
+  }
+  function selectCase() {
+    const {data} = datasets[Number(dataset.value)];
+    const phases = selectedPhases(data);
+    options(phase, Object.keys(phases), value => value === 'prefill' ? 'Prefill' : 'Decode');
+    previousCase.disabled = casePicker.selectedIndex <= 0;
+    nextCase.disabled = casePicker.selectedIndex >= casePicker.options.length - 1;
+    draw();
   }
   function selectDataset() {
     const {data} = datasets[Number(dataset.value)];
-    options(phase, Object.keys(data.phases), value => value === 'prefill' ? 'Prefill' : 'Decode');
+    const cases = data.cases ?? [];
+    options(casePicker, [-1, ...cases.keys()], index => {
+      if (index === -1) return `All ${data.pairs_completed} pairs`;
+      const item = cases[index];
+      return `Case ${item.sample_index + 1}${item.sample_id ? ` · ${item.sample_id}` : ''}`;
+    });
+    casePicker.value = '-1';
+    casePicker.disabled = cases.length === 0;
+    $('jl-case-note').hidden = cases.length > 0;
     options(dimension, data.dimensions);
     if (data.dimensions.includes(32) && !dimension.dataset.initialized) dimension.value = '32';
     dimension.dataset.initialized = 'true';
-    draw();
+    selectCase();
   }
   $('show-tiles').addEventListener('click', () => show(false));
   $('show-jl').addEventListener('click', () => show(true));
   dataset.addEventListener('change', selectDataset);
+  casePicker.addEventListener('change', selectCase);
+  previousCase.addEventListener('click', () => { casePicker.selectedIndex -= 1; selectCase(); });
+  nextCase.addEventListener('click', () => { casePicker.selectedIndex += 1; selectCase(); });
   for (const control of [phase, dimension, $('jl-group'), $('jl-window')]) control.addEventListener('change', draw);
   return {
     add(name, input, activate = true) {
       const data = validateJLSweep(input);
       datasets.push({name, data});
       options(dataset, datasets.map((_, index) => index), index => datasets[index].name);
-      if (activate || datasets.length === 1) dataset.value = datasets.length - 1;
+      if (activate || datasets.length === 1) {
+        dataset.value = datasets.length - 1;
+        selectDataset();
+      }
       $('jl-error').hidden = true;
-      selectDataset();
       if (activate) show(true);
     },
     demoFailed() {

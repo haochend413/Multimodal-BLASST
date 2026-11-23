@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +14,12 @@ REGIONS = ("T->T", "T->V", "V->T", "V->V")
 TILE_GROUPS = ("all", *REGIONS, "mixed")
 OVERFLOW = 80
 COUNTS = ("tiles", "full_skips", "projected_skips", "matched_skips", "false_skips", "missed_skips")
+
+
+def nested_basis(width, dim, seed, device):
+    rng = torch.Generator().manual_seed(seed)
+    rotation = torch.randn(width, width, generator=rng, dtype=torch.float64)
+    return torch.linalg.qr(rotation).Q[:, :dim].to(device)
 
 
 def gap_histograms(tiles, q_visual, k_visual):
@@ -68,9 +75,7 @@ class JLGapStudy:
         if self.dimensions[-1] >= self.width:
             raise ValueError(f"JL sweep dimensions must be smaller than head width {self.width}")
         if not hasattr(self, "basis"):
-            rng = torch.Generator().manual_seed(self.seed)
-            rotation = torch.randn(self.width, self.width, generator=rng, dtype=torch.float64)
-            self.basis = torch.linalg.qr(rotation).Q[:, :self.dimensions[-1]].to(query.device)
+            self.basis = nested_basis(self.width, self.dimensions[-1], self.seed, query.device)
         groups = query.shape[1] // key.shape[1]
         self.q_short = query[:, self.heads].double() @ self.basis
         self.k_short = key[:, [head // groups for head in self.heads]].double() @ self.basis
@@ -143,13 +148,13 @@ class JLGapStudy:
 def merge_sweeps(total, sample):
     """Pool histogram and decision counts across fresh prompts on identical settings."""
     if total is None:
-        return sample
+        return deepcopy(sample)
     identity = ("model", "synthetic", "head_width", "dimensions", "lambda", "seed", "histogram", "layers", "heads")
     if any(total[key] != sample[key] for key in identity):
         raise ValueError("JL sweep settings must match before pooling")
     for phase, sample_phase in sample["phases"].items():
         if phase not in total["phases"]:
-            total["phases"][phase] = sample_phase
+            total["phases"][phase] = deepcopy(sample_phase)
             continue
         merged = total["phases"][phase]
         for region in REGIONS:

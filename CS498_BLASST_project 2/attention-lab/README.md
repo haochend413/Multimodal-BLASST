@@ -25,6 +25,8 @@ Open **JL ablation** to see the synthetic dimension sweep or use **Load experime
 to open a report collected with `attention_study.py --jl-sweep`. The phase selector
 updates the skip-rate chart and the four modality gap distributions. The dimension
 selector changes the projected distribution overlaid on the full-score distribution.
+Use **Case** to view the pooled results or one sample. Older sweep exports contain the
+pooled view and need a fresh collection to include cases.
 See the [JL run guide](../code/README.md#jl-precheck-for-blasst).
 
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.

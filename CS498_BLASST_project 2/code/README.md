@@ -46,6 +46,33 @@ in [Attention Lab](../attention-lab/README.md).
 
 ### JL precheck for BLASST
 
+To compare modality packing and resetting the BLASST bar at key-region boundaries,
+run the paired region audit:
+
+```bash
+python attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-30.json" --sample-count 30 \
+  --layers 0,14,27 --heads 0,4 --decode-tokens 2 \
+  --jl-region-audit --jl-dim 32 --jl-lambda 0.1 --jl-seed 0 \
+  --output "$HOME/blasst-results/jl-vqav2-30-regions.json"
+```
+
+For both prefill and decode, the report contains `original_shared`,
+`packed_shared`, and `packed_reset`. The packed layout starts each contiguous
+text or visual run at a tile boundary on both axes and masks the remaining lanes
+of each run's final tile. It preserves sequence order, positions, and causal masks.
+The reset layout uses the packed tiles and restarts the running max independently
+for each query row on each contiguous key run. With text→visual→text keys, the
+last text run gets a fresh bar. The first valid tile in a run starts with a zero
+gap; its actual score sets the bar even when negative.
+
+Compare `tiles` between original and packed to measure the added decisions. Compare
+`full_skips`, `projected_skips`, `false_skips`, `missed_skips`, and the corresponding
+dense-weight totals between the two packed policies. The full and projected paths
+use their own score maxima under each policy and share the same underlying model
+inputs. Score weight is measured against global dense softmax over all valid keys.
+This audit measures masks and attention weight on a dense trajectory.
+
 For a paired dimension ablation and gap distributions, run a dense-trajectory
 sweep on the original tiles:
 
@@ -57,7 +84,9 @@ python attention_study.py \
   --output "$HOME/blasst-results/jl-vqav2-30-sweep.json"
 ```
 
-Load the resulting JSON in Attention Lab. The **JL ablation** view overlays full and
+Load the resulting JSON in Attention Lab. Use **Case** in the **JL ablation** view
+to switch between all pairs and an individual manifest entry. The report includes
+both the pooled counts and each case's histograms and skip counts. The view overlays full and
 projected gap histograms for text→text, text→visual, visual→text and visual→visual,
 with prefill and decode selectable. A gap is the row's running max through the current
 tile minus its best key of the selected modality inside that tile. Mixed tiles contribute
