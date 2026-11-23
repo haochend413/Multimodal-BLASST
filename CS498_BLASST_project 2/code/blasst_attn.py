@@ -72,6 +72,7 @@ STATE: Dict = {
     "decode_a": None,
     "phase_stats": {},
     "observer": None,         # optional synchronous callback; must not retain GPU tensors
+    "qkv_hook": None,         # optional post-RoPE callback returning an output or None
     "decode_records": {},    # layer -> list of [B,H,1,key_tiles], one tensor per step
 }
 
@@ -169,13 +170,20 @@ def blasst_attention_forward(
         STATE["qk"][layer_idx] = (query.detach().to(torch.bfloat16).cpu(),
                                   key.detach().to(torch.bfloat16).cpu())
 
+    # ---------------- decode: one query token, standard SDPA ----------------
+    phase = "decode" if Sq == 1 else "prefill"
+    qkv_hook = STATE["qkv_hook"]
+    if qkv_hook is not None:
+        override = qkv_hook(layer=layer_idx, phase=phase, query=query, key=key, value=value,
+                            attention_mask=attention_mask, scaling=scaling)
+        if override is not None:
+            return override, None
+
     n_rep = Hq // Hkv
     if n_rep > 1:                      # GQA: same ordering as transformers' repeat_kv
         key = key.repeat_interleave(n_rep, dim=1)
         value = value.repeat_interleave(n_rep, dim=1)
 
-    # ---------------- decode: one query token, standard SDPA ----------------
-    phase = "decode" if Sq == 1 else "prefill"
     if Sq == 1 and not STATE["decode_enabled"]:
         mask = attention_mask
         if mask is not None and mask.dtype != torch.bool:

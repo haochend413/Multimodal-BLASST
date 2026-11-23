@@ -44,6 +44,55 @@ The new `attention_study.py`, `prepare_videomme_study.py`, `prepare_vqav2_study.
 and their tests are documented
 in [Attention Lab](../attention-lab/README.md).
 
+### JL precheck for BLASST
+
+Start with a CPU smoke test from this directory. The demo has 32-dimensional heads.
+
+```bash
+python attention_study.py --demo --decode-tokens 1 --jl-dim 8 \
+  --jl-lambda 0.1 --output /tmp/jl-demo.json
+```
+
+For an image on CUDA, use the same collector and select a few layers and query heads.
+The command also accepts `--video` or an existing VQA v2/Video-MME `--manifest`.
+
+```bash
+python attention_study.py --image /absolute/path/to/image.jpg \
+  --question "What is shown in the image?" --layers 0,14,27 --heads 0,4 \
+  --decode-tokens 2 --jl-dim 32 --jl-lambda 0.1 --output /tmp/jl-image-audit.json
+
+jq '.metadata.jl_precheck.phases' /tmp/jl-image-audit.json
+```
+
+Each row compares its maximum projected upper score against its exact running max plus
+`ln(lambda)`. Every eligible row must pass before the tile skips full QK. Otherwise the
+ordinary BLASST rule decides whether to use V.
+
+- **Default residual bound.** For the random orthonormal basis `P`, use
+  `(Pᵀq)·(Pᵀk) + ||q − PPᵀq|| ||k − PPᵀk||`, scaled as an attention logit.
+  Orthogonal decomposition and Cauchy–Schwarz give this upper bound in exact arithmetic.
+- **JL margin.** Add `--jl-epsilon 0.5` to try
+  `(d/m)(Pᵀq)·(Pᵀk) + epsilon ||q|| ||k||`, where `m` is the sketch dimension and
+  `d` the head dimension. This tunable margin can miss. Compare seeds with `--jl-seed`
+  and inspect `upper_violations`, `false_early_skips`, and `skip_mask_disagreements`.
+
+Audit mode uses exact scores to verify decisions on the same Q/K inputs and leaves
+generation unchanged. Compare `baseline_skips_caught` and `fallback_rate` for pure text,
+pure visual, and mixed key tiles. The token-pair section splits even mixed tiles into
+T→T, T→V, V→T, and V→V. It reports mean absolute JL logit error and pair-weighted
+Q/K norms separately for prefill and decode. Compare T→T with T→V to hold query
+modality fixed. Groups with zero observations are omitted.
+
+For live generation, repeat the CUDA command with `--jl-live --lambda 0.1` and a new
+output filename. Live applies JL to every head in the selected layers and ordinary
+BLASST to the other layers. Match both lambda flags when comparing against a run
+of ordinary BLASST. Live output contains generation metadata and skip counts. Use audit
+mode for the full scores and modality breakdowns.
+
+The PyTorch prototype builds sketches from full keys on each call, including decode.
+Live early skips bypass the tile's full QK matmul and value computation after that
+setup. Tile counts are per query head and do not measure kernel speed or HBM traffic.
+
 **`blasst_regions.py`**: the region-aware version for the VLM study (`attn_implementation="blasst_regions"`;
 prefill only, batch size 1).
 - Same tiles, skip rule and margins as `blasst_attn.py`.

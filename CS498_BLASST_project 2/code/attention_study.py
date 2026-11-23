@@ -13,6 +13,7 @@ from uuid import uuid4
 import torch
 
 import blasst_attn as ba
+from jl_blasst import JLPrecheck, JLStudy
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -195,6 +196,14 @@ def main() -> None:
     parser.add_argument("--raw-dir", type=Path)
     parser.add_argument("--score-data", action="store_true",
                         help="write exact token scores to a browser-readable .scores.bin companion")
+    parser.add_argument("--jl-dim", type=int, help="audit a JL precheck at this sketch dimension")
+    parser.add_argument("--jl-epsilon", type=float,
+                        help="use a JL norm-product margin instead of the orthogonal residual bound")
+    parser.add_argument("--jl-lambda", type=float, default=0.1,
+                        help="fixed lambda for the JL audit and its exact baseline")
+    parser.add_argument("--jl-seed", type=int, default=0)
+    parser.add_argument("--jl-live", action="store_true",
+                        help="use the precheck during generation in selected layers, for all heads")
     parser.add_argument("--demo", action="store_true", help="synthetic CPU Q/K; no model downloads")
     parser.add_argument("--manifest", type=Path, help="Video-MME or VQA v2 benchmark manifest")
     parser.add_argument("--sample-index", type=int, default=0)
@@ -223,6 +232,21 @@ def main() -> None:
         parser.error("frames must be a positive even number >= 2; max-tiles must be positive")
     if args.image_max_pixels < 4 * 28 * 28:
         parser.error("image-max-pixels must be at least 3136")
+    if (args.jl_epsilon is not None or args.jl_live) and args.jl_dim is None:
+        parser.error("--jl-epsilon and --jl-live require --jl-dim")
+    if args.jl_live and (args.score_data or args.raw_dir):
+        parser.error("--jl-live cannot export full scores; use audit mode for score exports")
+    if args.jl_dim is not None:
+        if not 0 < args.jl_lambda <= 1:
+            parser.error("--jl-lambda must be in (0, 1]")
+        if args.demo and args.jl_dim >= 32:
+            parser.error("--jl-dim must be below 32 in the synthetic demo")
+        try:
+            args.jl_probe = JLPrecheck(args.jl_dim, epsilon=args.jl_epsilon, seed=args.jl_seed)
+        except ValueError as error:
+            parser.error(str(error))
+    else:
+        args.jl_probe = None
     if not args.demo:
         if (args.image is None) == (args.video is None):
             parser.error("provide exactly one --image or --video, or use --manifest")
@@ -244,6 +268,28 @@ def main() -> None:
 
 
 def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = None) -> None:
+    old_observers = ba.STATE["observer"], ba.STATE["qkv_hook"]
+    precision = torch.get_float32_matmul_precision()
+    try:
+        if args.jl_probe is not None:
+            torch.set_float32_matmul_precision("highest")
+        _collect(args, parser, benchmark, sample_id, score_stream)
+    finally:
+        ba.STATE["observer"], ba.STATE["qkv_hook"] = old_observers
+        if args.jl_probe is not None:
+            torch.set_float32_matmul_precision(precision)
+
+
+def _attach_study(args, recorder):
+    if args.jl_probe is None:
+        return None
+    study = JLStudy(args.jl_probe, recorder.visual, recorder.layers, recorder.heads,
+                    args.jl_lambda, ba.TILE, live=args.jl_live)
+    ba.STATE["qkv_hook"] = study.observe
+    return study
+
+
+def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) -> None:
     ba.set_threshold(args.lam or None)
     ba.set_decode_threshold(args.decode_lambda or None, inherit=args.decode_lambda is None)
     if args.demo:
@@ -253,7 +299,8 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
         visual[128:512] = True
         recorder = AttentionRecorder(visual, {0, 1, 2}, {0, 1}, args.raw_dir, args.max_tiles,
                                      score_stream)
-        ba.STATE["observer"] = recorder.observe
+        ba.STATE["observer"] = None if args.jl_live else recorder.observe
+        jl_study = _attach_study(args, recorder)
         from types import SimpleNamespace
         for layer in range(3):
             k, v = torch.randn(1, 2, length, 32), torch.randn(1, 2, length, 32)
@@ -292,23 +339,31 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
             raise ValueError("Processor produced no image/video tokens; check the media input")
         recorder = AttentionRecorder(visual, selected_layers, selected_heads,
                                      args.raw_dir, args.max_tiles, score_stream)
-        ba.STATE["observer"] = recorder.observe
+        ba.STATE["observer"] = None if args.jl_live else recorder.observe
+        jl_study = _attach_study(args, recorder)
         with torch.inference_mode():
             generated = model.generate(**inputs, max_new_tokens=args.decode_tokens + 1,
                                        min_new_tokens=args.decode_tokens + 1, do_sample=False)
         metadata = {"model": args.model, "synthetic": False, "prompt_tokens": length,
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
-    ba.STATE["observer"] = None
+    if jl_study is not None:
+        metadata["jl_precheck"] = jl_study.summary()
     if benchmark is not None:
         metadata.update(benchmark=benchmark, sample_id=sample_id)
     metadata.update(lambda_prefill=args.lam, lambda_decode=args.decode_lambda,
-                    recorded_trajectory="dense" if not args.lam and not args.decode_lambda else "live_sparse",
+                    recorded_trajectory="live_sparse" if args.jl_live or args.lam or args.decode_lambda else "dense",
                     score_definition="QK^T / sqrt(head_dim), causal-masked, before softmax",
                     region_definition="query modality → key modality; token pairs, not mixed tile labels",
                     sampling="selected layers and query heads only", tile_size=128)
-    recorder.export(args.output, metadata)
-    print(f"Wrote {len(recorder.views)} views and {recorder.tile_count} tiles to {args.output}")
+    if args.jl_live:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps({"schema": "blasst-jl-live-v1", "metadata": metadata},
+                                         indent=2, allow_nan=False))
+        print(f"Wrote JL decisions from live attention to {args.output}")
+    else:
+        recorder.export(args.output, metadata)
+        print(f"Wrote {len(recorder.views)} views and {recorder.tile_count} tiles to {args.output}")
 
 
 if __name__ == "__main__":
