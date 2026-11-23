@@ -165,10 +165,12 @@ def score_tiles(scores, allowed, mask=None):
 
 def tile_margins(tiles):
     """Reduce each tile against its own row-wise running maximum."""
-    tile_max = tiles.amax(dim=-1)
+    return row_tile_margins(tiles.amax(dim=-1)).amax(dim=-2)
+
+
+def row_tile_margins(tile_max):
     running = torch.cummax(tile_max, dim=-1).values
-    diff = torch.where(torch.isfinite(running), tile_max - running, NEG_INF)
-    return diff.amax(dim=-2)
+    return torch.where(torch.isfinite(running), tile_max - running, NEG_INF)
 
 
 def mask_chunk(mask, start, end, query_len, key_len):

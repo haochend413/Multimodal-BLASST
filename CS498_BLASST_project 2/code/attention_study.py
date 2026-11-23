@@ -67,11 +67,15 @@ class AttentionRecorder:
                     r: {"count": 0, "sum": 0.0, "abs_sum": 0.0, "mass": 0.0,
                         "hist": [0] * 80, "underflow": 0, "overflow": 0} for r in REGIONS}})
             s = scores[0, head].detach().float().cpu()
+            probabilities = torch.softmax(s, -1).nan_to_num()
+            if self.projected_study is not None and self.projected_study.split and phase == "prefill":
+                view.setdefault("split_tiles", []).extend(
+                    self.projected_study.record_split(head_index, q_start, s, probabilities, visual)
+                )
             if self.score_stream is not None:
                 cols = min(key_length, q_start + rows)
                 view.setdefault("score_chunks", {})[q_start] = self.score_stream.tell()
                 self.score_stream.write(s[:, :cols].numpy().astype("<f4", copy=False).tobytes())
-            probabilities = torch.softmax(s, -1)
             if self.raw_dir:
                 torch.save({"scores": s, "q_start": q_start, "visual": visual,
                             "layer": layer, "head": head, "phase": phase, "step": step},
@@ -88,10 +92,11 @@ class AttentionRecorder:
                     raise ValueError("Export exceeds --max-tiles; select fewer layers/heads or tokens")
                 values = block[valid]
                 tile_index = key_start // ba.TILE
+                dense_weight = float(probabilities[:, key_start:key_end].sum())
                 measurement = {
                     "q": q_start, "k": key_start, "rows": rows, "cols": key_end - key_start,
                     "mean": float(values.mean()), "abs": float(values.abs().mean()),
-                    "max": float(values.max()), "mass": float(probabilities[:, key_start:key_end].sum() / rows),
+                    "max": float(values.max()), "mass": dense_weight / rows,
                     "margin": float(margin[0, head, tile_index]),
                     "skipped": bool(skip[0, head, tile_index]),
                     "q_visual": float(q_visual.float().mean()),
@@ -101,7 +106,8 @@ class AttentionRecorder:
                     measurement.update(self.projected_study.record(
                         phase=phase, head_index=head_index, q_start=q_start, tile_index=tile_index,
                         full_margin=measurement["margin"], q_visual=q_visual[valid.any(-1)],
-                        k_visual=visual[key_start:key_end][valid.any(-2)],
+                        k_visual=visual[key_start:key_end][valid.any(-2)], valid_pairs=values.numel(),
+                        dense_weight=dense_weight,
                     ))
                 view["tiles"].append(measurement)
                 for qv in (False, True):
@@ -227,6 +233,8 @@ def main() -> None:
                         help="use the precheck during generation in selected layers, for all heads")
     parser.add_argument("--jl-projected-only", action="store_true",
                         help="compare projected-only BLASST masks with full BLASST on the same inputs")
+    parser.add_argument("--jl-split-tiles", choices=("query", "key", "both"),
+                        help="also audit prefill tiles split at text/visual boundaries")
     parser.add_argument("--demo", action="store_true", help="synthetic CPU Q/K; no model downloads")
     parser.add_argument("--manifest", type=Path, help="Video-MME or VQA v2 benchmark manifest")
     parser.add_argument("--sample-index", type=int, default=0)
@@ -266,6 +274,8 @@ def main() -> None:
         parser.error("JL modes require --jl-dim")
     if args.jl_projected_only and (args.jl_epsilon is not None or args.jl_live):
         parser.error("--jl-projected-only cannot be combined with --jl-epsilon or --jl-live")
+    if args.jl_split_tiles is not None and not args.jl_projected_only:
+        parser.error("--jl-split-tiles requires --jl-projected-only")
     if args.jl_live and (args.score_data or args.raw_dir):
         parser.error("--jl-live cannot export full scores; use audit mode for score exports")
     if args.jl_dim is not None:
@@ -302,12 +312,22 @@ def main() -> None:
         collect(args, parser, benchmark, sample_id)
 
 
+def _add_pair_counts(totals_by_group, groups):
+    for group, counts in groups.items():
+        totals = totals_by_group[group]
+        for name, count in counts.items():
+            totals[name] += count
+        totals["pairs_observed"] += 1
+        totals["pairs_with_false_skips"] += int(counts["false_skips"] > 0)
+
+
 def _collect_batch(args, parser, samples):
     """Write individual audits and refresh the aggregate after every completed pair."""
     output = args.output
     output.parent.mkdir(parents=True, exist_ok=True)
     details = output.parent / f"{output.stem}-samples"
     phases = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    split_prefill = defaultdict(lambda: defaultdict(int))
     completed = []
     for index, sample in enumerate(samples, start=args.sample_index):
         _select_sample(args, parser, sample)
@@ -315,17 +335,16 @@ def _collect_batch(args, parser, samples):
         metadata = collect(args, parser, sample["benchmark"], sample["id"])
         projected = metadata["jl_projected"]
         for phase, groups in projected["phases"].items():
-            for group, counts in groups.items():
-                totals = phases[phase][group]
-                for name, count in counts.items():
-                    totals[name] += count
-                totals["pairs_observed"] += 1
-                totals["pairs_with_false_skips"] += int(counts["false_skips"] > 0)
-        completed.append({
+            _add_pair_counts(phases[phase], groups)
+        pair = {
             "sample_index": index, "sample_id": sample["id"],
             "audit": str(args.output.relative_to(output.parent)),
             "phases": {phase: groups["all"] for phase, groups in projected["phases"].items()},
-        })
+        }
+        if "split_prefill" in projected:
+            _add_pair_counts(split_prefill, projected["split_prefill"])
+            pair["split_prefill"] = projected["split_prefill"]["all"]
+        completed.append(pair)
         summary = {
             "schema": "blasst-jl-projected-batch-v1", "model": args.model,
             "manifest": str(args.manifest), "sample_index": args.sample_index,
@@ -335,6 +354,8 @@ def _collect_batch(args, parser, samples):
             "heads": sorted(_indices(args.heads)), "decode_tokens": args.decode_tokens,
             "phases": phases, "samples": completed,
         }
+        if "split_prefill" in projected:
+            summary.update(split=projected["split"], split_prefill=split_prefill)
         pending = output.with_suffix(output.suffix + ".tmp")
         pending.write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
         pending.replace(output)
@@ -358,7 +379,8 @@ def _attach_study(args, recorder):
     if args.jl_probe is None:
         return None
     if args.jl_projected_only:
-        study = ProjectedJLStudy(args.jl_probe, recorder.layers, recorder.heads, args.jl_lambda)
+        study = ProjectedJLStudy(args.jl_probe, recorder.layers, recorder.heads, args.jl_lambda,
+                                 split=args.jl_split_tiles, visual=recorder.visual)
         recorder.projected_study = study
     else:
         study = JLStudy(args.jl_probe, recorder.visual, recorder.layers, recorder.heads,

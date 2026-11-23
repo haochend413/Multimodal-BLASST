@@ -187,16 +187,58 @@ def _tile_kind(visual):
     return "V" if count == visual.numel() else "mixed"
 
 
+def _tile_spans(visual, split):
+    """Split each original tile internally, preserving position and traversal order."""
+    spans = []
+    for start in range(0, len(visual), ba.TILE):
+        end = min(start + ba.TILE, len(visual))
+        cuts = [start]
+        if split:
+            changes = visual[start + 1:end] != visual[start:end - 1]
+            cuts.extend(start + 1 + i for i in changes.nonzero().flatten().tolist())
+        cuts.append(end)
+        spans.extend(zip(cuts, cuts[1:]))
+    return spans
+
+
+def _split_margins(scores, query_spans, key_spans):
+    """Reduce real lanes only, equivalent to padding each score tile with -inf."""
+    maxima = torch.stack([scores[..., lo:hi].amax(-1) for lo, hi in key_spans], dim=-1)
+    margins = ba.row_tile_margins(maxima)
+    return torch.stack([margins[..., lo:hi, :].amax(-2) for lo, hi in query_spans], dim=-2)
+
+
+def _record_mask_decision(groups, q_kind, k_kind, full_skip, projected_skip, valid_pairs, dense_weight):
+    false_skip = projected_skip and not full_skip
+    for name in ("all", f"key:{k_kind}", f"{q_kind}->{k_kind}"):
+        counts = groups[name]
+        counts["tiles"] += 1
+        counts["valid_pairs"] += valid_pairs
+        counts["false_skip_valid_pairs"] += valid_pairs if false_skip else 0
+        counts["dense_weight"] += dense_weight
+        counts["full_skipped_dense_weight"] += dense_weight if full_skip else 0.0
+        counts["projected_skipped_dense_weight"] += dense_weight if projected_skip else 0.0
+        counts["false_skip_dense_weight"] += dense_weight if false_skip else 0.0
+        counts["full_skips"] += int(full_skip)
+        counts["projected_skips"] += int(projected_skip)
+        counts["matched_skips"] += int(full_skip and projected_skip)
+        counts["false_skips"] += int(false_skip)
+        counts["missed_skips"] += int(full_skip and not projected_skip)
+
+
 class ProjectedJLStudy:
     """Build a skip mask from projected logits alone and compare it to full BLASST."""
 
-    def __init__(self, probe, layers, heads, lam):
+    def __init__(self, probe, layers, heads, lam, *, split=None, visual=None):
         self.probe, self.layers = probe, layers
         self.heads = sorted(heads)
         self.lam = lam
         self.ln_lam = torch.tensor(math.log(lam), dtype=torch.float32).item()
         self.margins = {}
         self.phases = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        self.split, self.visual = split, visual
+        self.split_chunks = {}
+        self.split_prefill = defaultdict(lambda: defaultdict(int))
 
     @torch.no_grad()
     def observe(self, *, layer, phase, query, key, value, attention_mask, scaling):
@@ -214,6 +256,12 @@ class ProjectedJLStudy:
         offset = key_len - query_len
         key_positions = torch.arange(key_len, device=query.device)
         self.margins.clear()
+        self.split_chunks.clear()
+        split_prefill = self.split is not None and phase == "prefill"
+        if split_prefill:
+            visual = torch.zeros(key_len, dtype=torch.bool)
+            visual[:min(len(self.visual), key_len)] = self.visual[:key_len]
+            key_spans = _tile_spans(visual, self.split in ("key", "both"))
         for start in range(0, query_len, ba.TILE):
             end = min(start + ba.TILE, query_len)
             q_pos = torch.arange(start + offset, end + offset, device=query.device)
@@ -221,35 +269,69 @@ class ProjectedJLStudy:
             mask = ba.mask_chunk(attention_mask, start, end, query_len, key_len)
             logits = (q_short[:, :, start:end] @ k_short.transpose(-1, -2))
             logits = (logits * (scaling * width / self.probe.dim)).float()
-            self.margins[start + offset] = ba.tile_margins(ba.score_tiles(logits, allowed, mask))[0].cpu()
+            tiles = ba.score_tiles(logits, allowed, mask)
+            q_start = start + offset
+            self.margins[q_start] = ba.tile_margins(tiles)[0].cpu()
+            if split_prefill:
+                query_spans = _tile_spans(visual[q_start:end + offset], self.split in ("query", "both"))
+                split_margins = _split_margins(
+                    tiles.flatten(-2)[..., :key_len], query_spans, key_spans,
+                )[0].cpu()
+                self.split_chunks[q_start] = (query_spans, key_spans, split_margins)
 
-    def record(self, *, phase, head_index, q_start, tile_index, full_margin, q_visual, k_visual):
+    def record(self, *, phase, head_index, q_start, tile_index, full_margin, q_visual, k_visual,
+               valid_pairs, dense_weight):
         projected_margin = float(self.margins[q_start][head_index, tile_index])
         projected_skip = projected_margin < self.ln_lam
         full_skip = full_margin < self.ln_lam
         q_kind, k_kind = _tile_kind(q_visual), _tile_kind(k_visual)
-        for name in ("all", f"key:{k_kind}", f"{q_kind}->{k_kind}"):
-            counts = self.phases[phase][name]
-            counts["tiles"] += 1
-            counts["full_skips"] += int(full_skip)
-            counts["projected_skips"] += int(projected_skip)
-            counts["matched_skips"] += int(full_skip and projected_skip)
-            counts["false_skips"] += int(projected_skip and not full_skip)
-            counts["missed_skips"] += int(full_skip and not projected_skip)
+        _record_mask_decision(self.phases[phase], q_kind, k_kind, full_skip, projected_skip,
+                              valid_pairs, dense_weight)
         return {
             "projected_margin": projected_margin,
             "projected_skipped": projected_skip,
             "full_skipped_at_jl_lambda": full_skip,
         }
 
+    def record_split(self, head_index, q_start, scores, probabilities, visual):
+        query_spans, key_spans, projected = self.split_chunks[q_start]
+        full = _split_margins(scores, query_spans, key_spans)
+        valid = torch.isfinite(scores)
+        measurements = []
+        for qi, (qlo, qhi) in enumerate(query_spans):
+            for ki, (klo, khi) in enumerate(key_spans):
+                block = valid[qlo:qhi, klo:khi]
+                count = int(block.sum())
+                if count == 0:
+                    continue
+                q_kind = _tile_kind(visual[q_start + qlo:q_start + qhi][block.any(-1)])
+                k_kind = _tile_kind(visual[klo:khi][block.any(-2)])
+                full_margin, projected_margin = float(full[qi, ki]), float(projected[head_index, qi, ki])
+                full_skip, projected_skip = full_margin < self.ln_lam, projected_margin < self.ln_lam
+                weight = float(probabilities[qlo:qhi, klo:khi].sum())
+                _record_mask_decision(self.split_prefill, q_kind, k_kind, full_skip, projected_skip,
+                                      count, weight)
+                measurements.append({
+                    "q": q_start + qlo, "k": klo, "rows": qhi - qlo, "cols": khi - klo,
+                    "q_kind": q_kind, "k_kind": k_kind, "margin": full_margin,
+                    "mass": weight / (qhi - qlo),
+                    "projected_margin": projected_margin, "projected_skipped": projected_skip,
+                    "full_skipped_at_jl_lambda": full_skip,
+                })
+        return measurements
+
     def summary(self):
-        return {
+        summary = {
             "dimension": self.probe.dim,
             "seed": self.probe.seed,
             "lambda": self.lam,
             "phases": {phase: {name: dict(counts) for name, counts in groups.items()}
                        for phase, groups in self.phases.items()},
         }
+        if self.split is not None:
+            summary["split"] = self.split
+            summary["split_prefill"] = {name: dict(counts) for name, counts in self.split_prefill.items()}
+        return summary
 
 
 class JLStudy:

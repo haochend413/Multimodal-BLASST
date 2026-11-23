@@ -9,7 +9,7 @@ import torch
 import blasst_attn as ba
 import attention_study
 from attention_study import AttentionRecorder
-from jl_blasst import JLAudit, JLPrecheck, JLStudy, ProjectedJLStudy
+from jl_blasst import JLAudit, JLPrecheck, JLStudy, ProjectedJLStudy, _split_margins
 
 
 @pytest.mark.parametrize("query_len,epsilon", [(258, None), (1, None), (1, 0.5)])
@@ -106,6 +106,47 @@ def test_projected_only_uses_its_own_running_max(monkeypatch):
     counts = projected.summary()["phases"]["decode"]
     assert counts["all"]["missed_skips"] == counts["all"]["false_skips"] == 1
     assert counts["key:V"]["false_skips"] == 1
+
+
+def test_split_margins_match_explicit_masked_padding():
+    scores = torch.tensor([[3.0, -torch.inf, -torch.inf], [2.0, -1.0, 0.5]])
+    query_spans, key_spans = [(0, 1), (1, 2)], [(0, 1), (1, 3)]
+    expected = []
+    for qlo, qhi in query_spans:
+        padded = []
+        for klo, khi in key_spans:
+            tile = scores[qlo:qhi, klo:khi]
+            padded.append(torch.nn.functional.pad(tile, (0, 128 - tile.shape[1],
+                                                         0, 128 - tile.shape[0]), value=-torch.inf))
+        expected.append(ba.tile_margins(torch.stack(padded, dim=-2)))
+    torch.testing.assert_close(_split_margins(scores, query_spans, key_spans), torch.stack(expected))
+
+
+@pytest.mark.parametrize("split", ["query", "key", "both"])
+def test_split_prefill_preserves_positions_and_valid_pairs(monkeypatch, split):
+    rng = torch.Generator().manual_seed(5)
+    n = 132
+    q, k = (torch.randn(1, 1, n, 16, generator=rng) for _ in range(2))
+    visual = (torch.arange(n) >= 15) & (torch.arange(n) < 130)
+    recorder = AttentionRecorder(visual, {1}, {0})
+    projected = ProjectedJLStudy(JLPrecheck(8), {1}, {0}, 0.1, split=split, visual=visual)
+    recorder.projected_study = projected
+    monkeypatch.setitem(ba.STATE, "observer", recorder.observe)
+    monkeypatch.setitem(ba.STATE, "qkv_hook", projected.observe)
+    module = SimpleNamespace(layer_idx=1)
+    ba.blasst_attention_forward(module, q, k, k, None)
+    view = recorder.views["prefill:-1:1:0"]
+    for tile in view["split_tiles"]:
+        if split in ("query", "both"):
+            q_mod = visual[tile["q"]:tile["q"] + tile["rows"]]
+            assert q_mod.all() or not q_mod.any()
+        if split in ("key", "both"):
+            k_mod = visual[tile["k"]:tile["k"] + tile["cols"]]
+            assert k_mod.all() or not k_mod.any()
+    assert len(view["split_tiles"]) > len(view["tiles"])
+    counts = projected.summary()
+    assert counts["split_prefill"]["all"]["valid_pairs"] == n * (n + 1) // 2
+    assert counts["phases"]["prefill"]["all"]["valid_pairs"] == n * (n + 1) // 2
 
 
 def test_projected_batch_counts_pairs_with_false_skips(tmp_path, monkeypatch):

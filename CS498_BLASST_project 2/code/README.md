@@ -67,6 +67,21 @@ and modality. Individual Attention Lab audits are in a sibling directory named
 `<output-stem>-samples`. Use a different output filename for a different projection width
 or seed.
 
+Add `--jl-split-tiles query` to audit splitting mixed prefill query tiles into
+contiguous text and visual subtiles within each original 128-token span. Use
+`--jl-split-tiles both` to split both axes so each query and key side is homogeneous,
+or `key` to isolate key-side splitting. Original token positions and causal masks
+are used throughout. The reference reduces valid lanes directly, which has the
+same skip decisions as padding each subtile to 128 with masked score entries.
+
+The same run reports standard tiles under `phases.prefill` and the split layout
+under `split_prefill` in the batch report. For a single sample, both are under
+`metadata.jl_projected` and prefill views include `split_tiles`. Splitting changes
+the number of tile decisions, so compare the share of dense weight wrongly dropped
+(`false_skip_dense_weight / dense_weight`) and tile counts together. Full and
+projected BLASST are replayed independently on each layout. The split path is an
+audit of skip decisions and does not change model generation or measure kernel speed.
+
 Start with a CPU smoke test from this directory. The demo has 32-dimensional heads.
 
 ```bash
