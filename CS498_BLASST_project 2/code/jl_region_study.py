@@ -14,6 +14,7 @@ from jl_gap_study import TILE_GROUPS, nested_basis
 SCHEMA = "blasst-jl-region-audit-v1"
 METRICS = (
     "tiles", "full_skips", "projected_skips", "matched_skips", "false_skips", "missed_skips",
+    "false_skips_vs_shared_full", "missed_skips_vs_shared_full",
     "valid_pairs", "full_skipped_pairs", "projected_skipped_pairs", "dense_weight",
     "full_skipped_dense_weight", "projected_skipped_dense_weight", "false_skip_dense_weight",
     "missed_skip_dense_weight",
@@ -44,6 +45,35 @@ def region_margins(tile_max, keys):
                       for lo, hi in zip(cuts, cuts[1:])], dim=-1)
 
 
+def key_segments(physical_tiles, visual):
+    """Find contiguous modality spans inside each physical key tile."""
+    runs = iter(axis_tiles(visual, len(visual), packed=True))
+    run = next(runs)
+    groups = []
+    for lo, hi, _ in physical_tiles:
+        segments = []
+        while lo < hi:
+            if lo == run.end:
+                run = next(runs)
+            end = min(hi, run.end)
+            segments.append(Span(lo, end, run.region))
+            lo = end
+        groups.append(segments)
+    return groups
+
+
+def physical_reset_margins(scores, tile_max, segments_by_tile):
+    """Reduce regional margins to one margin per row and physical tile."""
+    segments, segment_maxima, stops = [], [], [0]
+    for index, group in enumerate(segments_by_tile):
+        segments.extend(group)
+        segment_maxima.append(tile_max[..., index:index + 1] if len(group) == 1 else _row_max(scores, group))
+        stops.append(len(segments))
+    margins = region_margins(torch.cat(segment_maxima, dim=-1), segments)
+    # Every visible segment must pass the test for the physical tile to skip.
+    return torch.stack([margins[..., lo:hi].amax(-1) for lo, hi in zip(stops, stops[1:])], dim=-1)
+
+
 def _tile_geometry(scores, probabilities, q_visual, key_visual, keys):
     groups, pairs, weights = [], [], []
     for lo, hi, _ in keys:
@@ -59,13 +89,15 @@ def _tile_geometry(scores, probabilities, q_visual, key_visual, keys):
     return (torch.stack(groups, dim=-1), torch.stack(pairs, dim=-1), torch.stack(weights, dim=-1))
 
 
-def _counts(geometry, margins, projected_margins, ln_lam):
+def _counts(geometry, margins, projected_margins, ln_lam, *, shared_margins=None):
     groups, pairs, weights = geometry
     full = margins.amax(-2) < ln_lam
     projected = projected_margins.amax(-2) < ln_lam
+    shared = full if shared_margins is None else shared_margins.amax(-2) < ln_lam
     all_tiles = torch.ones_like(full)
     false_skips, missed = projected & ~full, full & ~projected
-    counts = torch.stack([all_tiles, full, projected, full & projected, false_skips, missed])
+    counts = torch.stack([all_tiles, full, projected, full & projected, false_skips, missed,
+                          projected & ~shared, shared & ~projected])
     weighted = torch.stack([pairs, pairs * full, pairs * projected, weights,
                             weights * full, weights * projected, weights * false_skips, weights * missed])
     return torch.cat(((groups[:, None] & counts).sum(dim=(-2, -1)),
@@ -108,6 +140,7 @@ class JLRegionStudy:
         for packed in (False, True):
             keys = axis_tiles(visual, ba.TILE, packed=packed)
             queries = axis_tiles(visual[offset:], ba.TILE, packed=packed)
+            segments = None if packed else key_segments(keys, visual)
             for start, end, _ in queries:
                 # Future-only tiles receive no vote. Keep the full last eligible tile's span.
                 limit = end + offset
@@ -123,12 +156,18 @@ class JLRegionStudy:
                 probabilities = torch.softmax(exact, dim=-1).nan_to_num()
                 geometry = _tile_geometry(exact, probabilities, q_visual[start:end], k_visual, active_keys)
                 exact_max, jl_max = (_row_max(scores, active_keys) for scores in (exact, jl))
-                name = "packed_shared" if packed else "original_shared"
-                self._add(results, name, _counts(geometry, ba.row_tile_margins(exact_max),
-                                                ba.row_tile_margins(jl_max), ln_lam))
+                shared_full = ba.row_tile_margins(exact_max)
+                shared_jl = ba.row_tile_margins(jl_max)
+                layout = "packed" if packed else "original"
+                self._add(results, f"{layout}_shared", _counts(geometry, shared_full, shared_jl, ln_lam))
                 if packed:
-                    self._add(results, "packed_reset", _counts(geometry, region_margins(exact_max, active_keys),
-                                                               region_margins(jl_max, active_keys), ln_lam))
+                    reset_full, reset_jl = (region_margins(maxima, active_keys) for maxima in (exact_max, jl_max))
+                else:
+                    active_segments = segments[:len(active_keys)]
+                    reset_full = physical_reset_margins(exact, exact_max, active_segments)
+                    reset_jl = physical_reset_margins(jl, jl_max, active_segments)
+                self._add(results, f"{layout}_reset", _counts(geometry, reset_full, reset_jl, ln_lam,
+                                                             shared_margins=shared_full))
 
     @staticmethod
     def _add(results, name, counts):

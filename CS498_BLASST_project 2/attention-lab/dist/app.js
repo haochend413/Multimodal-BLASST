@@ -1,9 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 import {validate, summary, regions, colors, scoreFileId, tileScores} from './data.mjs?v=token-scores';
-import {isJLSweep, setupJLStudy} from './jl.mjs?v=jl-cases';
+import {isJLSweep, setupJLStudy} from './jl.mjs?v=region-audit';
+import {isRegionAudit, setupRegionAudit} from './region.mjs?v=region-reset';
 const $ = id => document.getElementById(id);
-const jlStudy = setupJLStudy();
+const workspaces = {tiles:'tile-workspace', jl:'jl-workspace', region:'region-workspace'};
+function showView(view) {
+  for (const [name, panel] of Object.entries(workspaces)) {
+    $(panel).hidden = name !== view;
+    $(`show-${name}`).setAttribute('aria-pressed', name === view);
+  }
+  if (view === 'tiles') window.dispatchEvent(new Event('resize'));
+}
+for (const view of Object.keys(workspaces)) $(`show-${view}`).addEventListener('click', () => showView(view));
+const jlStudy = setupJLStudy(showView);
+const regionAudit = setupRegionAudit(showView);
 const datasets = []; let data, current, region = 'All', hits = [];
 const scoreFiles = new Map();
 let demoScoreId, demoScores, selectedTile, inspection = 0;
@@ -185,7 +196,11 @@ $('upload').addEventListener('change', async event => {
         if (file.size > 100 * 1024 * 1024) throw new Error('JSON exceeds 100 MB; collect fewer layers or heads.');
         const input = JSON.parse(await file.text());
         if (isJLSweep(input)) jlStudy.add(file.name, input);
-        else add(file.name, input);
+        else if (isRegionAudit(input)) regionAudit.add(file.name, input);
+        else {
+          showView('tiles');
+          add(file.name, input);
+        }
       }
     } catch (error) {
       errors.push(error.message);
@@ -202,4 +217,10 @@ try {
   jlStudy.add('Synthetic demonstration', await response.json(), false);
 } catch {
   jlStudy.demoFailed();
+}
+try {
+  const response = await fetch('region-demo.json?v=region-reset');
+  if (response.ok) regionAudit.add('Synthetic demonstration', await response.json(), false);
+} catch {
+  // A local report can still be loaded if the demonstration is unavailable.
 }

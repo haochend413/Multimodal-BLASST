@@ -29,6 +29,12 @@ Use **Case** to view the pooled results or one sample. Older sweep exports conta
 pooled view and need a fresh collection to include cases.
 See the [JL run guide](../code/README.md#jl-precheck-for-blasst).
 
+Load a JSON from `attention_study.py --jl-region-audit` to open **Region audit**.
+Its charts compare tile decisions, JL skip rate, dropped dense attention weight,
+and dense weight on false skips for original and packed tiles with a shared or
+reset max. Use the phase, case, and tile-group filters
+to inspect each part of the audit.
+
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.
 It is explicitly synthetic, not measured Qwen, Video-MME, or accuracy data.
 

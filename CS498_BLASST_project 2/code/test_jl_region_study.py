@@ -1,7 +1,7 @@
 import torch
 
 import blasst_attn as ba
-from jl_region_study import JLRegionStudy, Span, axis_tiles, region_margins
+from jl_region_study import JLRegionStudy, Span, axis_tiles, key_segments, physical_reset_margins, region_margins
 
 
 def test_pack_restarts_tiles_only_at_modality_boundaries():
@@ -21,6 +21,19 @@ def test_reset_uses_first_valid_score_in_each_contiguous_run():
     assert torch.all(margins >= ba.row_tile_margins(scores))
 
 
+def test_reset_inside_a_physical_tile_waits_for_each_rows_first_valid_key():
+    visual = torch.tensor([False, False, False, True, True, True, True, False])
+    keys = axis_tiles(visual, 2, packed=False)
+    scores = torch.tensor([[10., 9., 2., 3., 2., 1., 2., 4.],
+                           [10., 9., 2., -torch.inf, 1., 0.5, -torch.inf, -torch.inf]])
+    tile_max = scores.unflatten(-1, (-1, 2)).amax(-1)
+    margins = physical_reset_margins(scores, tile_max, key_segments(keys, visual))
+    torch.testing.assert_close(margins, torch.tensor([[0., 0., -1., 0.],
+                                                     [0., -8., 0., -torch.inf]]))
+    assert margins.shape == tile_max.shape
+    assert torch.all(margins >= ba.row_tile_margins(tile_max))
+
+
 def test_same_dense_inputs_preserve_coverage_and_reset_only_removes_skips(monkeypatch):
     monkeypatch.setattr(ba, "TILE", 2)
     rng = torch.Generator().manual_seed(11)
@@ -33,13 +46,17 @@ def test_same_dense_inputs_preserve_coverage_and_reset_only_removes_skips(monkey
     study.observe(layer=0, phase="prefill", query=q, key=k, value=k,
                   attention_mask=causal_mask, scaling=8**-.5)
     results = study.summary({"model": "test", "synthetic": True})["phases"]["prefill"]
-    original, packed, reset = (results[policy]["all"] for policy in
-                               ("original_shared", "packed_shared", "packed_reset"))
+    original, original_reset, packed, reset = (results[policy]["all"] for policy in
+        ("original_shared", "original_reset", "packed_shared", "packed_reset"))
     assert original["tiles"] == 30
+    assert original_reset["tiles"] == original["tiles"]
     assert packed["tiles"] == reset["tiles"] == 30
-    assert original["valid_pairs"] == packed["valid_pairs"] == reset["valid_pairs"] == 88
+    assert original["valid_pairs"] == original_reset["valid_pairs"] == packed["valid_pairs"] == reset["valid_pairs"] == 88
     assert results["packed_shared"]["mixed"]["tiles"] == 0
     assert results["original_shared"]["mixed"]["tiles"] > 0
     for score in ("full", "projected"):
+        assert original_reset[f"{score}_skips"] <= original[f"{score}_skips"]
         assert reset[f"{score}_skips"] <= packed[f"{score}_skips"]
         assert reset[f"{score}_skipped_dense_weight"] <= packed[f"{score}_skipped_dense_weight"]
+    assert original_reset["false_skips_vs_shared_full"] <= original["false_skips"]
+    assert original_reset["missed_skips_vs_shared_full"] >= original["missed_skips"]

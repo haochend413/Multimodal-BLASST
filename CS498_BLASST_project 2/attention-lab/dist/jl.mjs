@@ -216,19 +216,12 @@ function options(select, values, label = String) {
   if (values.some(value => String(value) === previous)) select.value = previous;
 }
 
-export function setupJLStudy() {
+export function setupJLStudy(show) {
   const datasets = [];
   const dataset = $('jl-dataset'), phase = $('jl-phase'), dimension = $('jl-dimension');
   const casePicker = $('jl-case'), previousCase = $('jl-case-prev'), nextCase = $('jl-case-next');
   function selectedPhases(data) {
     return data.cases?.[Number(casePicker.value)]?.phases ?? data.phases;
-  }
-  function show(active) {
-    $('jl-workspace').hidden = !active;
-    $('tile-workspace').hidden = active;
-    $('show-jl').setAttribute('aria-pressed', active);
-    $('show-tiles').setAttribute('aria-pressed', !active);
-    if (!active) window.dispatchEvent(new Event('resize'));
   }
   function draw() {
     const selected = datasets[Number(dataset.value)];
@@ -265,8 +258,6 @@ export function setupJLStudy() {
     dimension.dataset.initialized = 'true';
     selectCase();
   }
-  $('show-tiles').addEventListener('click', () => show(false));
-  $('show-jl').addEventListener('click', () => show(true));
   dataset.addEventListener('change', selectDataset);
   casePicker.addEventListener('change', selectCase);
   previousCase.addEventListener('click', () => { casePicker.selectedIndex -= 1; selectCase(); });
@@ -282,7 +273,7 @@ export function setupJLStudy() {
         selectDataset();
       }
       $('jl-error').hidden = true;
-      if (activate) show(true);
+      if (activate) show('jl');
     },
     demoFailed() {
       if (datasets.length) return;

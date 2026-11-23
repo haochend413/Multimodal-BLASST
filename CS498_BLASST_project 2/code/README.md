@@ -58,17 +58,19 @@ python attention_study.py \
 ```
 
 For both prefill and decode, the report contains `original_shared`,
-`packed_shared`, and `packed_reset`. The packed layout starts each contiguous
+`original_reset`, `packed_shared`, and `packed_reset`. The packed layout starts each contiguous
 text or visual run at a tile boundary on both axes and masks the remaining lanes
 of each run's final tile. It preserves sequence order, positions, and causal masks.
-The reset layout uses the packed tiles and restarts the running max independently
-for each query row on each contiguous key run. With text→visual→text keys, the
+Both reset policies restart the running max independently for each query row on each
+contiguous key run. `original_reset` reduces the key runs inside boundary tiles and
+emits one decision per original physical tile. With text→visual→text keys, the
 last text run gets a fresh bar. The first valid tile in a run starts with a zero
 gap; its actual score sets the bar even when negative.
 
-Compare `tiles` between original and packed to measure the added decisions. Compare
-`full_skips`, `projected_skips`, `false_skips`, `missed_skips`, and the corresponding
-dense-weight totals between the two packed policies. The full and projected paths
+Compare `original_shared` with `original_reset` to isolate the reset on the original
+tiles. `false_skips` and `missed_skips` use full BLASST under the same policy as the
+reference. `false_skips_vs_shared_full` and `missed_skips_vs_shared_full` keep the full-score
+reference fixed to the shared max for that layout. The full and projected paths
 use their own score maxima under each policy and share the same underlying model
 inputs. Score weight is measured against global dense softmax over all valid keys.
 This audit measures masks and attention weight on a dense trajectory.
