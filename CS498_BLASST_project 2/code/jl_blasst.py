@@ -6,6 +6,8 @@ from collections import defaultdict
 
 import torch
 
+import blasst_attn as ba
+
 
 class JLPrecheck:
     """A seeded random orthogonal sketch, shared by queries and keys."""
@@ -183,6 +185,71 @@ def _tile_kind(visual):
     if count == 0:
         return "T"
     return "V" if count == visual.numel() else "mixed"
+
+
+class ProjectedJLStudy:
+    """Build a skip mask from projected logits alone and compare it to full BLASST."""
+
+    def __init__(self, probe, layers, heads, lam):
+        self.probe, self.layers = probe, layers
+        self.heads = sorted(heads)
+        self.lam = lam
+        self.ln_lam = torch.tensor(math.log(lam), dtype=torch.float32).item()
+        self.margins = {}
+        self.phases = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+
+    @torch.no_grad()
+    def observe(self, *, layer, phase, query, key, value, attention_mask, scaling):
+        if layer not in self.layers:
+            return
+        query_len, width = query.shape[-2:]
+        key_len = key.shape[-2]
+        groups = query.shape[1] // key.shape[1]
+        kv_heads = [head // groups for head in self.heads]
+        basis = self.probe.basis(width, query.device)
+        q_short = query[:, self.heads].double() @ basis
+        k_short = key[:, kv_heads].double() @ basis
+        if attention_mask is not None and attention_mask.shape[1] != 1:
+            attention_mask = attention_mask[:, self.heads]
+        offset = key_len - query_len
+        key_positions = torch.arange(key_len, device=query.device)
+        self.margins.clear()
+        for start in range(0, query_len, ba.TILE):
+            end = min(start + ba.TILE, query_len)
+            q_pos = torch.arange(start + offset, end + offset, device=query.device)
+            allowed = key_positions[None, :] <= q_pos[:, None]
+            mask = ba.mask_chunk(attention_mask, start, end, query_len, key_len)
+            logits = (q_short[:, :, start:end] @ k_short.transpose(-1, -2))
+            logits = (logits * (scaling * width / self.probe.dim)).float()
+            self.margins[start + offset] = ba.tile_margins(ba.score_tiles(logits, allowed, mask))[0].cpu()
+
+    def record(self, *, phase, head_index, q_start, tile_index, full_margin, q_visual, k_visual):
+        projected_margin = float(self.margins[q_start][head_index, tile_index])
+        projected_skip = projected_margin < self.ln_lam
+        full_skip = full_margin < self.ln_lam
+        q_kind, k_kind = _tile_kind(q_visual), _tile_kind(k_visual)
+        for name in ("all", f"key:{k_kind}", f"{q_kind}->{k_kind}"):
+            counts = self.phases[phase][name]
+            counts["tiles"] += 1
+            counts["full_skips"] += int(full_skip)
+            counts["projected_skips"] += int(projected_skip)
+            counts["matched_skips"] += int(full_skip and projected_skip)
+            counts["false_skips"] += int(projected_skip and not full_skip)
+            counts["missed_skips"] += int(full_skip and not projected_skip)
+        return {
+            "projected_margin": projected_margin,
+            "projected_skipped": projected_skip,
+            "full_skipped_at_jl_lambda": full_skip,
+        }
+
+    def summary(self):
+        return {
+            "dimension": self.probe.dim,
+            "seed": self.probe.seed,
+            "lambda": self.lam,
+            "phases": {phase: {name: dict(counts) for name, counts in groups.items()}
+                       for phase, groups in self.phases.items()},
+        }
 
 
 class JLStudy:

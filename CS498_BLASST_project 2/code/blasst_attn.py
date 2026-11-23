@@ -149,6 +149,35 @@ def causal_tiles(Sq: int, Skv: int, offset: int) -> torch.Tensor:
     return k_first[None, :] <= q_last[:, None]
 
 
+def score_tiles(scores, allowed, mask=None):
+    """Apply the attention masks and partition scores along the key axis."""
+    scores = scores.masked_fill(~allowed, NEG_INF)
+    if mask is not None:
+        if mask.dtype == torch.bool:
+            scores = scores.masked_fill(~mask, NEG_INF)
+        else:
+            scores = scores + mask.to(torch.float32)
+    pad = -scores.shape[-1] % TILE
+    if pad:
+        scores = F.pad(scores, (0, pad), value=NEG_INF)
+    return scores.unflatten(-1, (-1, TILE))
+
+
+def tile_margins(tiles):
+    """Reduce each tile against its own row-wise running maximum."""
+    tile_max = tiles.amax(dim=-1)
+    running = torch.cummax(tile_max, dim=-1).values
+    diff = torch.where(torch.isfinite(running), tile_max - running, NEG_INF)
+    return diff.amax(dim=-2)
+
+
+def mask_chunk(mask, start, end, query_len, key_len):
+    if mask is None:
+        return None
+    mask = mask[..., -query_len:, :key_len]
+    return mask if mask.shape[-2] == 1 else mask[..., start:end, :]
+
+
 # ----------------------------------------------------------------------------- the kernel
 def blasst_attention_forward(
     module,
@@ -205,7 +234,6 @@ def blasst_attention_forward(
     ln_lam = min(ln_lam, 0.0)
     offset = Skv - Sq                 # queries are the LAST Sq positions of the key axis
     n_kt = math.ceil(Skv / TILE)
-    pad = n_kt * TILE - Skv
     key32 = key.to(torch.float32)
     kpos = torch.arange(Skv, device=query.device)
     out = torch.empty_like(query)
@@ -223,21 +251,8 @@ def blasst_attention_forward(
         s = torch.matmul(q32, key32.transpose(-1, -2)) * scaling          # [B, H, r, Skv] fp32
         qpos = torch.arange(r0, r1, device=query.device) + offset
         allowed = kpos[None, :] <= qpos[:, None]                            # [r, Skv] causal
-        s = s.masked_fill(~allowed, NEG_INF)
-        if attention_mask is not None:                                      # honour an explicit mask too
-            m = attention_mask[:, :, r0:r1, :Skv] if attention_mask.shape[-2] == Sq else attention_mask[:, :, -Sq:, :Skv][:, :, r0:r1]
-            if m.dtype == torch.bool:
-                s = s.masked_fill(~m, NEG_INF)
-            else:
-                s = s + m.to(torch.float32)
-        if pad:
-            s = F.pad(s, (0, pad), value=NEG_INF)
-        s_t = s.view(B, Hq, r1 - r0, n_kt, TILE)
-        tile_max = s_t.amax(dim=-1)                                         # [B, H, r, n_kt]
-        running = torch.cummax(tile_max, dim=-1).values                     # includes current tile
-        diff = tile_max - running                                           # <= 0, -inf past causal edge
-        diff = torch.where(torch.isfinite(running), diff, torch.full_like(diff, NEG_INF))
-        margin = diff.amax(dim=2)                                           # max over rows -> [B, H, n_kt]
+        s_t = score_tiles(s, allowed, mask_chunk(attention_mask, r0, r1, Sq, Skv))
+        margin = tile_margins(s_t)
         skip = margin < ln_lam                                              # all rows far below running max
         if STATE["record"] and phase == "decode":
             STATE["decode_records"].setdefault(layer_idx, []).append(
@@ -245,7 +260,7 @@ def blasst_attention_forward(
         observer = STATE["observer"]
         if observer is not None:
             observer(layer=layer_idx, phase=phase, q_start=r0 + offset,
-                     scores=s[..., :Skv], margin=margin, skip=skip,
+                     scores=s_t.flatten(-2)[..., :Skv], margin=margin, skip=skip,
                      ln_lambda=ln_lam, key_length=Skv)
 
         # bookkeeping (causal tiles only; fully-masked tiles are not "skipped", they do not exist)

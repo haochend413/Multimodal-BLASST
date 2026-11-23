@@ -13,7 +13,7 @@ from uuid import uuid4
 import torch
 
 import blasst_attn as ba
-from jl_blasst import JLPrecheck, JLStudy
+from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -36,6 +36,7 @@ class AttentionRecorder:
         self.views: dict[str, dict] = {}
         self.tile_count = 0
         self.raw_index = 0
+        self.projected_study: ProjectedJLStudy | None = None
         self.score_stream = score_stream
         self.score_id = uuid4().hex if score_stream is not None else None
         if score_stream is not None:
@@ -54,7 +55,7 @@ class AttentionRecorder:
         visual = torch.cat((self.visual, torch.zeros(max(0, key_length - len(self.visual)),
                                                      dtype=torch.bool)))[:key_length]
         q_visual = visual[q_start:q_start + rows]
-        for head in sorted(self.heads):
+        for head_index, head in enumerate(sorted(self.heads)):
             if head >= scores.shape[1]:
                 raise ValueError(f"head {head} exceeds model's {scores.shape[1]} query heads")
             identity = f"{phase}:{step}:{layer}:{head}"
@@ -85,7 +86,7 @@ class AttentionRecorder:
                     raise ValueError("Export exceeds --max-tiles; select fewer layers/heads or tokens")
                 values = block[valid]
                 tile_index = key_start // ba.TILE
-                view["tiles"].append({
+                measurement = {
                     "q": q_start, "k": key_start, "rows": rows, "cols": key_end - key_start,
                     "mean": float(values.mean()), "abs": float(values.abs().mean()),
                     "max": float(values.max()), "mass": float(probabilities[:, key_start:key_end].sum() / rows),
@@ -93,7 +94,14 @@ class AttentionRecorder:
                     "skipped": bool(skip[0, head, tile_index]),
                     "q_visual": float(q_visual.float().mean()),
                     "k_visual": float(visual[key_start:key_end].float().mean()),
-                })
+                }
+                if self.projected_study is not None:
+                    measurement.update(self.projected_study.record(
+                        phase=phase, head_index=head_index, q_start=q_start, tile_index=tile_index,
+                        full_margin=measurement["margin"], q_visual=q_visual[valid.any(-1)],
+                        k_visual=visual[key_start:key_end][valid.any(-2)],
+                    ))
+                view["tiles"].append(measurement)
                 for qv in (False, True):
                     for kv in (False, True):
                         region = f"{'V' if qv else 'T'}→{'V' if kv else 'T'}"
@@ -204,6 +212,8 @@ def main() -> None:
     parser.add_argument("--jl-seed", type=int, default=0)
     parser.add_argument("--jl-live", action="store_true",
                         help="use the precheck during generation in selected layers, for all heads")
+    parser.add_argument("--jl-projected-only", action="store_true",
+                        help="compare projected-only BLASST masks with full BLASST on the same inputs")
     parser.add_argument("--demo", action="store_true", help="synthetic CPU Q/K; no model downloads")
     parser.add_argument("--manifest", type=Path, help="Video-MME or VQA v2 benchmark manifest")
     parser.add_argument("--sample-index", type=int, default=0)
@@ -232,8 +242,10 @@ def main() -> None:
         parser.error("frames must be a positive even number >= 2; max-tiles must be positive")
     if args.image_max_pixels < 4 * 28 * 28:
         parser.error("image-max-pixels must be at least 3136")
-    if (args.jl_epsilon is not None or args.jl_live) and args.jl_dim is None:
-        parser.error("--jl-epsilon and --jl-live require --jl-dim")
+    if (args.jl_epsilon is not None or args.jl_live or args.jl_projected_only) and args.jl_dim is None:
+        parser.error("JL modes require --jl-dim")
+    if args.jl_projected_only and (args.jl_epsilon is not None or args.jl_live):
+        parser.error("--jl-projected-only cannot be combined with --jl-epsilon or --jl-live")
     if args.jl_live and (args.score_data or args.raw_dir):
         parser.error("--jl-live cannot export full scores; use audit mode for score exports")
     if args.jl_dim is not None:
@@ -283,8 +295,12 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
 def _attach_study(args, recorder):
     if args.jl_probe is None:
         return None
-    study = JLStudy(args.jl_probe, recorder.visual, recorder.layers, recorder.heads,
-                    args.jl_lambda, ba.TILE, live=args.jl_live)
+    if args.jl_projected_only:
+        study = ProjectedJLStudy(args.jl_probe, recorder.layers, recorder.heads, args.jl_lambda)
+        recorder.projected_study = study
+    else:
+        study = JLStudy(args.jl_probe, recorder.visual, recorder.layers, recorder.heads,
+                        args.jl_lambda, ba.TILE, live=args.jl_live)
     ba.STATE["qkv_hook"] = study.observe
     return study
 
@@ -348,7 +364,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
     if jl_study is not None:
-        metadata["jl_precheck"] = jl_study.summary()
+        key = "jl_projected" if args.jl_projected_only else "jl_precheck"
+        metadata[key] = jl_study.summary()
     if benchmark is not None:
         metadata.update(benchmark=benchmark, sample_id=sample_id)
     metadata.update(lambda_prefill=args.lam, lambda_decode=args.decode_lambda,

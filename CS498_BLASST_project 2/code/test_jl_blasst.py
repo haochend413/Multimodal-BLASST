@@ -5,7 +5,8 @@ import pytest
 import torch
 
 import blasst_attn as ba
-from jl_blasst import JLAudit, JLPrecheck, JLStudy
+from attention_study import AttentionRecorder
+from jl_blasst import JLAudit, JLPrecheck, JLStudy, ProjectedJLStudy
 
 
 @pytest.mark.parametrize("query_len,epsilon", [(258, None), (1, None), (1, 0.5)])
@@ -74,3 +75,31 @@ def test_live_hook_preserves_grouped_query_attention(monkeypatch):
     actual, _ = ba.blasst_attention_forward(module, q, k, v, mask)
     torch.testing.assert_close(actual, expected)
     assert live.summary()["phases"]["decode"]["tiles"] == 8
+
+
+def test_projected_only_uses_its_own_running_max(monkeypatch):
+    probe = JLPrecheck(1)
+    basis = probe.basis(4, torch.device("cpu"))
+    p, residual = torch.linalg.qr(basis, mode="complete").Q[:, :2].T
+    q = (2 * (p + residual)).float()[None, None, None, :]
+    # Tile scores are approximately [0, 2, -1] in full and [12, 0, 16] in projection.
+    centers = torch.stack((3 * p - 3 * residual, 2 * residual, 4 * p - 5 * residual))
+    k = centers.float().repeat_interleave(torch.tensor([128, 128, 1]), dim=0)[None, None]
+    visual = torch.tensor([False] * 128 + [True] * 128)
+    recorder = AttentionRecorder(visual, {1}, {0})
+    projected = ProjectedJLStudy(probe, {1}, {0}, 0.1)
+    recorder.projected_study = projected
+    monkeypatch.setitem(ba.STATE, "ln_lam", math.log(0.1))
+    monkeypatch.setitem(ba.STATE, "a", None)
+    monkeypatch.setitem(ba.STATE, "decode_override", False)
+    monkeypatch.setitem(ba.STATE, "decode_enabled", True)
+    monkeypatch.setitem(ba.STATE, "observer", recorder.observe)
+    monkeypatch.setitem(ba.STATE, "qkv_hook", projected.observe)
+    ba.blasst_attention_forward(SimpleNamespace(layer_idx=1), q, k, k, None)
+    tiles = recorder.views["decode:0:1:0"]["tiles"]
+    assert [t["full_skipped_at_jl_lambda"] for t in tiles] == [False, False, True]
+    assert [t["full_skipped_at_jl_lambda"] for t in tiles] == [t["skipped"] for t in tiles]
+    assert [t["projected_skipped"] for t in tiles] == [False, True, False]
+    counts = projected.summary()["phases"]["decode"]
+    assert counts["all"]["missed_skips"] == counts["all"]["false_skips"] == 1
+    assert counts["key:V"]["false_skips"] == 1

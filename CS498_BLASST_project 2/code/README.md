@@ -46,6 +46,18 @@ in [Attention Lab](../attention-lab/README.md).
 
 ### JL precheck for BLASST
 
+Use `--jl-projected-only` with `--jl-dim` to test whether projected scores alone reproduce
+full BLASST's skip mask. Both passes use the same inputs, tile order, masks, and
+`--jl-lambda`. Each pass builds its own running max. The projected score uses the
+original score scaling multiplied by `d/m`, where `d` is the head width and `m`
+the sketch width. The full pass is the reference and supplies model generation.
+There is no bound or full-score fallback in the projected skip decision.
+
+Read `metadata.jl_projected.phases` for full and projected skip counts, matched
+skips, false skips (only projected skips), and missed skips (only full skips). Counts
+are broken down by phase and tile modality. Each exported tile includes
+`projected_margin`, `projected_skipped`, and `full_skipped_at_jl_lambda`.
+
 Start with a CPU smoke test from this directory. The demo has 32-dimensional heads.
 
 ```bash
