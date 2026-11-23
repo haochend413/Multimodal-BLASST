@@ -81,6 +81,26 @@ These six Video-MME prompts cover two videos and seven sampled layers. Distance 
 all-layer run for a fuller distance comparison. For a CPU smoke test of the collector,
 replace the manifest flags with `--demo`.
 
+To track the indices that determine each margin, add `--study-max-indices` and use a
+new output name. It records the query with the largest tile margin, the best key for
+that query inside the tile, and its best key across tiles visited so far, including
+the current tile. Indices are zero-based token positions. Exact ties use the first
+query and key within a tile and the latest tile for ties in the running max.
+
+The report measures which indices match across layer pairs. It also replays the first
+recorded layer's indices using the current layer's scores at those two positions.
+This estimates the skip decision from two dot products. The false-skip rate divides
+by fresh full-score BLASST keeps, and the missed-skip rate divides by fresh skips.
+Actual attention on kept tiles still uses the usual computation.
+
+If a dense export already has its matching `.scores.bin` file, reconstruct the same
+statistics locally without rerunning the model:
+
+```bash
+OMP_NUM_THREADS=1 python tile_layer_study.py ../results/vqav2-image0-question0.json \
+  --study-max-indices --output /tmp/blasst-max-index-vqa-pilot.json
+```
+
 ### JL precheck for BLASST
 
 To compare modality packing and resetting the BLASST bar at key-region boundaries,

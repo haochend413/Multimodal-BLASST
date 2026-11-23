@@ -39,6 +39,9 @@ Load a JSON from `attention_study.py --tile-layer-study` or `tile_layer_study.py
 **Cross-layer tiles**. Compare agreement and skip persistence against layer distance,
 inspect the keep/skip transitions for specific layer pairs, and choose a case, head,
 and tile to display its layer-by-layer decisions and margins.
+Reports collected with `--study-max-indices` add the decisive query, tile-max key,
+running-max key, and first-layer replay to the tile timeline. The similarity
+selector also offers index match rates and replay errors by modality.
 See the [cross-layer run guide](../code/README.md#cross-layer-tile-decisions).
 
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.

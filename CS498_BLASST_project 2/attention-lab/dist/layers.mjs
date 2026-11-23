@@ -5,6 +5,18 @@ const percent = value => value == null ? '—' : new Intl.NumberFormat(undefined
   style:'percent', maximumFractionDigits:1,
 }).format(value);
 const unique = values => [...new Set(values)].sort((a,b) => a-b);
+const decisionMetrics = {
+  skip_persistence: 'Earlier skips still skipped', agreement: 'Same decision',
+  later_skips_recovered: 'Later skips covered',
+};
+const indexMetrics = {
+  same_all_indices: 'Same query and both keys', same_query: 'Same decisive query',
+  same_tile_pair: 'Same query and tile key', same_running_pair: 'Same query and running key',
+  false_skip_rate: 'First-layer replay · false skip rate',
+  missed_skip_rate: 'First-layer replay · missed skip rate',
+};
+const metricValue = (point, metric) => point[metric] ?? point.anchor_replay?.[metric];
+const logit = value => value == null ? '—' : value.toFixed(3);
 
 export const isLayerStudy = data => data?.schema === 'blasst-tile-layer-study-v1';
 
@@ -51,13 +63,13 @@ function similarityChart(svg, data, metric) {
     draw('text', {x:52+112*index, y:225, fill:color, 'font-size':13}, labels[group]);
     let previous;
     for (const point of points) {
-      const value = point[metric];
+      const value = metricValue(point, metric);
       if (value == null) {
         previous = undefined;
         continue;
       }
       if (previous?.lag === point.lag - 1) {
-        draw('line', {x1:x(previous.lag), y1:y(previous[metric]), x2:x(point.lag),
+        draw('line', {x1:x(previous.lag), y1:y(metricValue(previous, metric)), x2:x(point.lag),
           y2:y(value), stroke:color, 'stroke-width':2});
       }
       const dot = draw('circle', {cx:x(point.lag), cy:y(value), r:4, fill:color});
@@ -101,7 +113,18 @@ export function setupLayerStudy(showView) {
     const decisions = margins.map(value => value === null ? '—' : value < data.metadata.cutoff ? 'Skip' : 'Keep');
     const decisionRow = row(body, ['Decision', ...decisions]);
     decisions.forEach((decision, index) => decisionRow.cells[index+1].dataset.decision = decision);
-    row(body, ['Margin', ...margins.map(value => value === null ? '—' : value.toFixed(3))]);
+    row(body, ['Margin', ...margins.map(logit)]);
+    const indices = tile[9];
+    if (indices) {
+      row(body, ['Decisive query', ...indices.map(entry => entry?.[0] ?? '—')]);
+      row(body, ['Tile-max key', ...indices.map(entry => entry?.[1] ?? '—')]);
+      row(body, ['Running-max key', ...indices.map(entry => entry?.[2] ?? '—')]);
+      row(body, ['Tile-max score', ...indices.map(entry => logit(entry?.[3]))]);
+      row(body, ['Running-max score', ...indices.map(entry => logit(entry?.[4]))]);
+      row(body, [`Layer ${sample.layers[0]} replay margin`, ...indices.map(entry => logit(entry?.[5]))]);
+      row(body, ['Replay decision', ...indices.map(entry =>
+        entry == null ? '—' : entry[5] < data.metadata.cutoff ? 'Skip' : 'Keep')]);
+    }
   }
 
   function renderPairs() {
@@ -110,9 +133,20 @@ export function setupLayerStudy(showView) {
     const rows = group.by_layer_pair.filter(point => point.later - point.earlier === Number($('lag').value));
     $('pairs').replaceChildren();
     const metric = $('metric').value;
+    const replay = metric === 'false_skip_rate' || metric === 'missed_skip_rate';
+    const header = $('pair-head').cells;
+    header[1].textContent = replay ? 'Replay comparisons' : 'Both keep';
+    header[2].textContent = replay ? 'Missed skips' : 'Keep → skip';
+    header[3].textContent = replay ? 'False skips' : 'Skip → keep';
+    header[4].textContent = replay ? 'Mean |margin error|' : 'Both skip';
     for (const point of rows) {
-      row($('pairs'), [`${point.earlier} → ${point.later}`, point.keep_keep, point.keep_skip,
-        point.skip_keep, point.skip_skip, percent(point[metric]), percent(point.later_skip_rate)]);
+      const counts = point.anchor_replay;
+      if (replay && !counts) continue;
+      const cells = replay ? [counts.observations, counts.missed_skips, counts.false_skips,
+        logit(counts.mean_absolute_margin_error)] :
+        [point.keep_keep, point.keep_skip, point.skip_keep, point.skip_skip];
+      row($('pairs'), [`${point.earlier} → ${point.later}`, ...cells,
+        percent(metricValue(point, metric)), percent(point.later_skip_rate)]);
     }
     renderTile();
   }
@@ -128,6 +162,9 @@ export function setupLayerStudy(showView) {
     const {model, synthetic, lambda} = data.metadata;
     $('source').textContent = `${synthetic ? 'Synthetic · ' : ''}${model} · ${data.pairs_completed}/${data.pairs_requested} cases · λ = ${lambda} · full scores on a dense trajectory`;
     $('content').hidden = false;
+    $('index-note').hidden = !data.metadata.max_indices;
+    const metrics = data.metadata.max_indices ? {...decisionMetrics, ...indexMetrics} : decisionMetrics;
+    options($('metric'), Object.keys(metrics), id => metrics[id]);
     options($('phase'), Object.keys(data.phases).sort().reverse());
     options($('case'), data.cases.map((_, index) => index),
       index => data.cases[index].sample_id ?? `Case ${data.cases[index].sample_index + 1}`);

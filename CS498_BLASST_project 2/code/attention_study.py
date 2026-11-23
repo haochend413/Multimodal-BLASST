@@ -235,6 +235,8 @@ def main() -> None:
                         help="track full-score BLASST decisions on the same physical tile across layers")
     parser.add_argument("--study-lambda", type=float, default=0.1,
                         help="offline threshold for the tile layer study")
+    parser.add_argument("--study-max-indices", action="store_true",
+                        help="track tile and running-max indices, and replay the first layer's indices")
     parser.add_argument("--jl-epsilon", type=float,
                         help="use a JL norm-product margin instead of the orthogonal residual bound")
     parser.add_argument("--jl-lambda", type=float, default=0.1,
@@ -255,6 +257,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.sample_index < 0:
         parser.error("--sample-index must be nonnegative")
+    if args.study_max_indices and not args.tile_layer_study:
+        parser.error("--study-max-indices requires --tile-layer-study")
     if args.tile_layer_study:
         if not 0 < args.study_lambda <= 1:
             parser.error("--study-lambda must be in (0, 1]")
@@ -382,7 +386,8 @@ def _collect_layer_study(args, parser, samples):
             benchmark, sample_id = sample["benchmark"], sample["id"]
         metadata, case = collect(run, parser, benchmark, sample_id)
         if report is None:
-            report = LayerReport(metadata["model"], metadata["synthetic"], args.study_lambda, ba.TILE)
+            report = LayerReport(metadata["model"], metadata["synthetic"], args.study_lambda, ba.TILE,
+                                 track_indices=args.study_max_indices)
         report.add(case)
         report.write(args.output, len(samples))
         print(f"Collected layer trajectories for {len(report.cases)}/{len(samples)} cases", flush=True)
@@ -471,7 +476,7 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
 
 def _attach_study(args, recorder):
     if args.tile_layer_study:
-        study = TileLayerRecorder(recorder)
+        study = TileLayerRecorder(recorder, track_indices=args.study_max_indices)
         ba.STATE["observer"] = study.observe
         ba.STATE["qkv_hook"] = None
         return study
