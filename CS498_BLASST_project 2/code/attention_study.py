@@ -19,7 +19,7 @@ from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy, VISUAL_KEY_QUERY_SP
 from jl_gap_study import JLGapStudy, merge_sweeps
 from jl_region_study import JLRegionStudy, merge_region_audits
 from tile_layer_study import LayerReport, TileLayerRecorder
-from tile_calibration import add_threshold_arguments, selected_calibration
+from tile_calibration import add_threshold_arguments, selected_calibration, write_json
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -247,6 +247,8 @@ def main() -> None:
                         help="compare original, modality-packed, and per-key-region max policies")
     parser.add_argument("--tile-layer-study", action="store_true",
                         help="track full-score BLASST decisions on the same physical tile across layers")
+    parser.add_argument("--score-distributions", action="store_true",
+                        help="collect causal score and margin histograms by modality")
     add_threshold_arguments(parser)
     parser.add_argument("--study-max-indices", action="store_true",
                         help="track tile and running-max indices, and replay the first layer's indices")
@@ -275,8 +277,12 @@ def main() -> None:
     if args.study_max_indices and not args.tile_layer_study:
         parser.error("--study-max-indices requires --tile-layer-study")
     calibration = selected_calibration(args, parser)
-    if (calibration or args.study_lambda is not None) and not args.tile_layer_study:
-        parser.error("study thresholds require --tile-layer-study")
+    if (calibration or args.study_lambda is not None) and not (args.tile_layer_study or args.score_distributions):
+        parser.error("study thresholds require --tile-layer-study or --score-distributions")
+    if args.score_distributions and (args.tile_layer_study or args.vv_prefix_attention or args.jl_sweep
+                                     or args.jl_region_audit or args.jl_dim is not None or args.lam
+                                     or args.decode_lambda or args.score_data or args.raw_dir):
+        parser.error("--score-distributions collects histograms from a dense causal trajectory")
     if args.tile_layer_study:
         if (args.jl_sweep or args.jl_region_audit or args.jl_dim is not None or args.lam
                 or args.decode_lambda or args.score_data or args.raw_dir):
@@ -304,7 +310,7 @@ def main() -> None:
         if (args.jl_epsilon is not None or args.jl_live or args.jl_projected_only or
                 args.jl_split_tiles or args.score_data or args.raw_dir or args.lam or args.decode_lambda):
             parser.error("--jl-region-audit uses a dense trajectory and its own report; set --jl-lambda")
-    paired_audit = args.jl_sweep or args.jl_region_audit or args.tile_layer_study
+    paired_audit = args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
     if args.sample_count > 1 and not (
@@ -364,7 +370,9 @@ def main() -> None:
                 parser.error(f"Missing input media: {media_path}")
         if not torch.cuda.is_available():
             parser.error("Real model collection requires CUDA; use --demo for CPU verification")
-    if args.tile_layer_study:
+    if args.score_distributions:
+        _collect_score_distributions(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
+    elif args.tile_layer_study:
         _collect_layer_study(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
     elif paired_audit:
         merge = merge_region_audits if args.jl_region_audit else merge_sweeps
@@ -390,6 +398,24 @@ def _add_pair_counts(totals_by_group, groups):
             totals[name] += count
         totals["pairs_observed"] += 1
         totals["pairs_with_false_skips"] += int(counts["false_skips"] > 0)
+
+
+def _collect_score_distributions(args, parser, samples, calibration):
+    from score_distribution_study import ScoreDistributions
+
+    study = ScoreDistributions(args.study_lambda or .1, calibration)
+    for index, sample in enumerate(samples, start=args.sample_index):
+        run = argparse.Namespace(**dict(vars(args), sample_index=index, score_study=study))
+        benchmark, sample_id = None, None
+        if sample is not None:
+            _select_sample(run, parser, sample)
+            benchmark, sample_id = sample["benchmark"], sample["id"]
+        run.score_case = sample_id or str(index)
+        metadata = collect(run, parser, benchmark, sample_id)
+        study.cases[run.score_case].update(model=metadata["model"], synthetic=metadata["synthetic"])
+        write_json(args.output, study.report())
+        print(f"Collected score distributions for {len(study.cases)}/{len(samples)} cases", flush=True)
+    print(f"Wrote score distributions to {args.output}")
 
 
 def _collect_layer_study(args, parser, samples, calibration):
@@ -497,6 +523,10 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
 
 
 def _attach_study(args, recorder):
+    if args.score_distributions:
+        ba.STATE["observer"] = args.score_study.observer(recorder, ba.TILE, args.score_case)
+        ba.STATE["qkv_hook"] = None
+        return None
     if args.tile_layer_study:
         study = TileLayerRecorder(recorder, track_indices=args.study_max_indices)
         ba.STATE["observer"] = study.observe
@@ -551,7 +581,7 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
     ba.STATE["vv_prefix_visual"] = None
     if args.demo:
         torch.manual_seed(98 + args.sample_index
-                          if args.jl_sweep or args.jl_region_audit or args.tile_layer_study else 98)
+                          if args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions else 98)
         length = 640
         visual = torch.zeros(length, dtype=torch.bool)
         if args.jl_region_audit:
@@ -609,6 +639,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         metadata = {"model": args.model, "synthetic": False, "prompt_tokens": length,
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
+    if args.score_distributions:
+        return metadata
     if args.vv_prefix_attention:
         metadata["attention_mask_policy"] = "vv_prefix"
     if args.tile_layer_study:

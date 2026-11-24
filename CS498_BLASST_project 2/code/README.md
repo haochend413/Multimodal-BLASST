@@ -44,6 +44,39 @@ The new `attention_study.py`, `prepare_videomme_study.py`, `prepare_vqav2_study.
 and their tests are documented
 in [Attention Lab](../attention-lab/README.md).
 
+### Causal score distributions around the skip cutoff
+
+Collect compact histograms for the 30 VQA cases without exporting full score matrices:
+
+```bash
+python attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-30.json" --sample-count 30 \
+  --layers 0,14,27 --heads 0,4 --decode-tokens 2 \
+  --score-distributions --study-lambda 0.1 \
+  --output "$HOME/blasst-results/vqav2-30-score-distributions.json"
+```
+
+The score excess is each finite score minus its own row's cutoff, which is the
+causal running max through the current tile plus `ln(lambda)`. Zero or greater
+reaches the cutoff. The report records raw logits, score and row-max excess,
+tile-max excess, and per-tile fractions of valid rows or scores reaching the
+cutoff. Pure physical tiles and token-pair scores inside mixed tiles have
+separate summaries. Existing calibrated thresholds can be used with
+`--calibration FILE --target-keep 50` in place of `--study-lambda`.
+
+To combine score-level analysis from a saved causal score companion with a
+larger set of saved tile margins and create a figure, install Matplotlib locally:
+
+```bash
+python score_distribution_study.py \
+  --score-export ../results/vqav2-image0-question0.json \
+  --tile-report ../results/vqav2-30-row-keys.json \
+  --output /tmp/vqav2-distributions.json --plot /tmp/vqav2-prefill.png
+```
+
+Use `python plot_score_distributions.py REPORT.json --phase decode --output DECODE.png`
+to plot decode, or omit `--phase decode` to plot prefill from a newly collected report.
+
 ### Bidirectional masking for pure V→V tiles
 
 To test bidirectional V→V attention on one manifest case:
