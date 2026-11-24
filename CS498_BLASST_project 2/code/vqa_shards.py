@@ -107,7 +107,7 @@ def merge(paths, output):
         if not shard:
             raise ValueError(f"{path} is not a VQA shard report")
         expected_config = {key: report[key] for key in config_keys}
-        for key in MAX_POLICIES:
+        for key in (*MAX_POLICIES, "variant_labels"):
             if key in report:
                 expected_config[key] = report[key]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}

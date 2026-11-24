@@ -268,8 +268,8 @@ def main() -> None:
     parser.add_argument("--budget-config", type=Path, help="save or reuse matched-study calibration settings")
     parser.add_argument("--budget-keep-percent", type=float, default=50.,
                         help="requested post-QK tile keep percentage in each phase")
-    parser.add_argument("--gate-lambda", type=float, default=1.,
-                        help="prefill lambda used to record the fixed gate for the matched study")
+    parser.add_argument("--gate-lambda", type=float,
+                        help="prefill lambda for recording votes in fixed-gate runs (default: 1)")
     parser.add_argument("--gate-distribution", action="store_true",
                         help="run only the fixed prefill gate and count tokens and causal pairs by modality")
     parser.add_argument("--vqa-shards", type=int, help="split the whole VQA manifest into this many shards")
@@ -304,13 +304,21 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int,
                         help="number of manifest cases to test, before splitting into shards")
     args = parser.parse_args()
+    args.tv_vv_top_accuracy = (args.vqa_accuracy and args.tv_vv_top_percent is not None
+                               and not (args.matched_region_study or args.gate_distribution))
+    if args.tv_vv_top_accuracy and (args.prefill_region_max or args.decode_region_max):
+        parser.error("The paired top-k accuracy run uses shared running maxima in both variants")
     if args.matched_region_study or args.gate_distribution:
         from matched_region_study import validate_args
 
+        if args.gate_lambda is None:
+            args.gate_lambda = 1.
         validate_args(args, parser)
         args.vqa_accuracy = True
     elif args.budget_config is not None:
         parser.error("--budget-config requires --matched-region-study")
+    elif args.gate_lambda is not None:
+        parser.error("--gate-lambda requires a fixed-gate run. Use --lambda for live T→V votes.")
     requested_sample_count = args.sample_count
     if args.sample_count is None:
         args.sample_count = 1
@@ -319,7 +327,7 @@ def main() -> None:
         or args.tile_layer_study or args.score_distributions
     ):
         parser.error("The live region-max switches cannot be used with audits that compute their own running max")
-    if args.vqa_accuracy and not (args.manifest and (args.tv_vv_sweep is not None
+    if args.vqa_accuracy and not (args.manifest and (args.tv_vv_sweep is not None or args.tv_vv_top_accuracy
                                                     or args.matched_region_study or args.gate_distribution)):
         parser.error("--vqa-accuracy requires a VQA v2 manifest and a paired study")
     args.vqa_shard = None
@@ -344,8 +352,8 @@ def main() -> None:
             parser.error("T→V-guided V→V compares live causal BLASST masks; omit separate mask audits")
         if not (args.matched_region_study or args.gate_distribution) and not 0 < args.lam <= 1:
             parser.error("set the BLASST vote threshold with --lambda in (0, 1]")
-    if args.tv_vv_sweep and (args.score_data or args.raw_dir):
-        parser.error("--tv-vv-sweep collects a paired answer and tile-count report")
+    if (args.tv_vv_sweep or args.tv_vv_top_accuracy) and (args.score_data or args.raw_dir):
+        parser.error("The paired T→V-guided study collects answers and tile counts")
     if args.vv_prefix_attention and (args.jl_dim is not None or args.jl_sweep or args.jl_region_audit):
         parser.error("JL audits use causal QK reconstruction; omit JL flags with --vv-prefix-attention")
     if args.sample_index < 0:
@@ -388,7 +396,7 @@ def main() -> None:
             parser.error("--jl-region-audit uses a dense trajectory and its own report; set --jl-lambda")
     paired_audit = (
         args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions
-        or args.tv_vv_sweep or args.matched_region_study or args.gate_distribution
+        or args.tv_vv_sweep or args.tv_vv_top_accuracy or args.matched_region_study or args.gate_distribution
     )
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
@@ -477,7 +485,7 @@ def main() -> None:
                 run(args, parser, samples, collect, _select_sample, ba.STATE, ba.TILE)
         except (ValueError, KeyError, OSError) as error:
             parser.error(str(error))
-    elif args.tv_vv_sweep:
+    elif args.tv_vv_sweep or args.tv_vv_top_accuracy:
         _collect_tv_vv_sweep(args, parser, samples if args.manifest else [None] * args.sample_count)
     elif args.score_distributions:
         _collect_score_distributions(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
@@ -543,7 +551,12 @@ def _collect_tv_vv_sweep(args, parser, samples):
 
 
 def _run_tv_vv_sweep(args, parser, samples):
-    variants = [("baseline", None), *((str(value), value) for value in args.tv_vv_sweep)]
+    top_percent = getattr(args, "tv_vv_top_percent", None)
+    variants = [("baseline", None)]
+    if top_percent is None:
+        variants.extend((str(value), value) for value in args.tv_vv_sweep)
+    else:
+        variants.append((f"top_{top_percent:g}", top_percent))
     report = dict(schema=TV_VV_SCHEMA, model=args.model, synthetic=args.demo, tile_size=ba.TILE,
                   blasst_lambda=args.lam, decode_lambda=args.decode_lambda, pairs_requested=len(samples),
                   answer_metric="normalized full-response exact match to any supplied reference",
@@ -553,6 +566,11 @@ def _run_tv_vv_sweep(args, parser, samples):
         report[f"{phase}_max_policies"] = {
             name: "shared" if threshold is None else "per_region" for name, threshold in variants
         }
+    if top_percent is not None:
+        report["variant_labels"] = {"baseline": "Original BLASST", variants[1][0]: f"Top {top_percent:g}% visual rows"}
+        for phase in ("prefill", "decode"):
+            report[f"{phase}_max_policies"] = dict.fromkeys(dict(variants), "shared")
+    measured_phases = ("prefill", "decode") if top_percent is not None else region_phases
     if args.vqa_accuracy:
         report["answer_metric"] = "VQA v2 consensus"
         report["answer_protocol"] = dict(instruction=SHORT_ANSWER_INSTRUCTION,
@@ -577,25 +595,29 @@ def _run_tv_vv_sweep(args, parser, samples):
             case["question_id"] = benchmark["question_id"]
             if not shard:
                 case.update(question=benchmark["question_text"], reference_answers=references)
-        for name, threshold in variants:
+        for name, value in variants:
             # An ungated vote trace provides the baseline's causal V→V denominator.
-            run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold))
+            threshold = value if top_percent is None else None
+            run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold,
+                                            tv_vv_top_percent=value if top_percent is not None else None))
             for phase in region_phases:
                 setattr(run, f"{phase}_region_max", threshold is not None)
             if sample:
                 _select_sample(run, parser, sample)
             if args.vqa_accuracy:
                 run.question = f"{benchmark['question_text']}\n{SHORT_ANSWER_INSTRUCTION}"
-            before = {phase: ba.STATE["phase_stats"].get(phase, {}).copy() for phase in region_phases}
+            before = {phase: ba.STATE["phase_stats"].get(phase, {}).copy() for phase in measured_phases}
             metadata = collect(run, parser, benchmark, sample_id)
             trace = metadata["tv_guided_vv"]
             answer = metadata.get("answer")
             normalized = _normalized_answer(answer) if answer is not None else None
             result = dict(answer=answer, **trace)
-            for phase in region_phases:
+            for phase in measured_phases:
                 after = ba.STATE["phase_stats"].get(phase, {})
                 result[f"{phase}_tiles"] = after.get("causal", 0) - before[phase].get("causal", 0)
                 result[f"{phase}_tiles_skipped"] = after.get("skipped", 0) - before[phase].get("skipped", 0)
+                if phase == "prefill" and top_percent is not None:
+                    result["prefill_qk_bypassed"] = after.get("qk_bypassed", 0) - before[phase].get("qk_bypassed", 0)
             if args.vqa_accuracy:
                 result["vqa_score"] = score_answer(answer, references)
             else:
@@ -754,12 +776,13 @@ def _attach_study(args, recorder):
         ba.STATE["prefill_region_max"] = regions if args.prefill_region_max else None
         ba.STATE["decode_region_max"] = regions if args.decode_region_max else None
     top_percent = getattr(args, "tv_vv_top_percent", None)
-    if (args.tv_vv_threshold is not None or top_percent is not None
-            or args.tv_vv_sweep or args.matched_region_study or args.gate_distribution):
+    paired = args.tv_vv_sweep or getattr(args, "tv_vv_top_accuracy", False)
+    if (args.tv_vv_threshold is not None or top_percent is not None or paired
+            or args.matched_region_study or args.gate_distribution):
         ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold,
                                             replay=getattr(args, "gate_replay", None), top_percent=top_percent)
         ba.STATE["qkv_hook"] = None
-        if args.tv_vv_sweep or args.matched_region_study or args.gate_distribution:
+        if paired or args.matched_region_study or args.gate_distribution:
             ba.STATE["observer"] = None
         return None
     if args.score_distributions:
@@ -908,7 +931,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
             metadata["tv_guided_vv"]["top_percent"] = policy.top_percent
         if args.gate_distribution:
             metadata["gate_distribution"] = policy.distribution()
-        if args.tv_vv_sweep or args.matched_region_study or args.gate_distribution:
+        if (args.tv_vv_sweep or getattr(args, "tv_vv_top_accuracy", False)
+                or args.matched_region_study or args.gate_distribution):
             return metadata
     if args.vv_prefix_attention:
         metadata["attention_mask_policy"] = "vv_prefix"

@@ -190,6 +190,23 @@ Use a fresh budget config path for this comparison. The config can then be
 reused with the same calibration settings and a fresh output path for a
 different evaluation size.
 
+#### Top-k gate accuracy against original BLASST
+
+```bash
+python code/attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-1000.json" \
+  --sample-index 20 --sample-count 100 --decode-tokens 16 \
+  --lambda 0.1 --decode-lambda 0.1 \
+  --tv-vv-top-percent 50 --vqa-accuracy \
+  --output "$HOME/blasst-results/vqav2-100-top50-vs-blasst.json"
+```
+
+Each question runs once with original BLASST and once with the top-k V→V
+gate. Both variants use the same prefill and decode lambdas and shared running
+maxima. The top-k gate ranks live T→V votes from the previous layer using the
+prefill `--lambda`. The separate `--gate-lambda` applies to the pass that
+records the gate in a matched study or gate distribution audit.
+
 #### Measure the token and attention mix after the V→V gate
 
 Run one prefill per question with the same gate settings and sample range as the

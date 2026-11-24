@@ -17,7 +17,8 @@ def test_official_consensus_and_normalization():
     assert references[:3] == ["two", "2", "two"]
 
 
-def test_paired_short_answers_are_scored_and_saved(tmp_path, monkeypatch):
+@pytest.mark.parametrize("top_percent, guided_name", [(None, "0.5"), (50., "top_50")])
+def test_paired_short_answers_are_scored_and_saved(tmp_path, monkeypatch, top_percent, guided_name):
     image = tmp_path / "image.jpg"
     image.touch()
     benchmark = {"question_id": 7, "name": "VQA v2", "question_text": "How many?",
@@ -30,20 +31,24 @@ def test_paired_short_answers_are_scored_and_saved(tmp_path, monkeypatch):
     def collect(run, *_):
         assert run.question == "How many?\nAnswer with a single word or short phrase."
         assert run.vqa_accuracy
-        baseline = run.tv_vv_threshold is None
+        assert run.lam == .1 and run.decode_lambda == .2
+        baseline = run.tv_vv_threshold is None and run.tv_vv_top_percent is None
+        if top_percent is not None:
+            assert run.tv_vv_threshold is None
         return {"answer": "two" if baseline else "three",
                 "tv_guided_vv": dict(pure_vv_tiles=4, vv_tiles_bypassed=0 if baseline else 2, layers=[])}
 
     monkeypatch.setattr(attention_study, "collect", collect)
     output = tmp_path / "report.json"
-    args = Namespace(tv_vv_sweep=[.5], model="test", demo=False, lam=.1, decode_lambda=None,
+    args = Namespace(tv_vv_sweep=[.5] if top_percent is None else None, tv_vv_top_percent=top_percent,
+                     model="test", demo=False, lam=.1, decode_lambda=.2,
                      sample_index=0, output=output, vqa_accuracy=True, decode_tokens=16)
     attention_study._collect_tv_vv_sweep(args, ArgumentParser(), [sample])
     report = json.loads(output.read_text())
     assert report["answer_protocol"]["min_new_tokens"] == 0
     assert report["summary"]["baseline"]["vqa_accuracy"] == 100
-    assert report["summary"]["0.5"]["vqa_accuracy"] == 60
-    assert report["summary"]["0.5"]["vqa_delta_pp"] == -40
-    assert report["summary"]["0.5"]["vqa_worse"] == 1
-    predictions = json.loads((tmp_path / "report-0.5-predictions.json").read_text())
+    assert report["summary"][guided_name]["vqa_accuracy"] == 60
+    assert report["summary"][guided_name]["vqa_delta_pp"] == -40
+    assert report["summary"][guided_name]["vqa_worse"] == 1
+    predictions = json.loads((tmp_path / f"report-{guided_name}-predictions.json").read_text())
     assert predictions == [{"question_id": 7, "answer": "three"}]
