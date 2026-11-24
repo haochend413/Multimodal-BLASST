@@ -30,7 +30,7 @@ def _tail(ax, data, edges, metric, limit):
     ax.set(xlim=(-12, min(10, max(1, math.ceil(limit)))), ylim=(0, 103),
            xlabel="Score minus row cutoff (logits)", ylabel="At or above x (%)")
     if ax.get_legend_handles_labels()[0]:
-        ax.legend(loc="upper right", frameon=False, fontsize=9)
+        ax.legend(loc="lower left", frameon=False, fontsize=9)
 
 
 def _support(ax, records, metric, xlabel):
@@ -58,7 +58,7 @@ def plot_report(report, path, phase="prefill"):
     regions = sources.get("token_regions", {}).get(phase, {})
     n_exact = len(report["exact_score_cases"])
     exact_label = f"{n_exact} exact {'case' if n_exact == 1 else 'cases'}"
-    n_margins = report["saved_tile_margin_cases"] or n_exact
+    n_margins = report.get("saved_tile_margin_cases") or n_exact
     desired = ("T->T", "T->V", "V->V") if phase == "prefill" else ("T->T", "T->V")
     pure_scores = all(group in physical for group in desired)
     lam = report["lambda_by_phase"][phase]

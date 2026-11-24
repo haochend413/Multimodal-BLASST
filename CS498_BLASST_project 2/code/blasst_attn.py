@@ -74,6 +74,7 @@ STATE: Dict = {
     "observer": None,         # optional synchronous callback; must not retain GPU tensors
     "qkv_hook": None,         # optional post-RoPE callback returning an output or None
     "vv_prefix_visual": None, # opt-in prompt mask for bidirectional V→V tiles
+    "tv_guided_vv": None,    # prompt-local previous-layer text vote policy
     "decode_records": {},    # layer -> list of [B,H,1,key_tiles], one tensor per step
 }
 
@@ -241,6 +242,14 @@ def blasst_attention_forward(
     kpos = torch.arange(Skv, device=query.device)
     out = torch.empty_like(query)
     vv_prefix = STATE["vv_prefix_visual"] if phase == "prefill" else None
+    policy = STATE["tv_guided_vv"] if phase == "prefill" else None
+    tv_layer = None
+    if policy is not None:
+        if B != 1 or Sq != Skv or len(policy.visual) != Skv or layer_idx < 0:
+            raise ValueError("T→V-guided V→V requires one uncached prompt and indexed layers")
+        if vv_prefix is not None:
+            raise ValueError("T→V-guided V→V uses causal attention")
+        tv_layer = policy.start_layer(layer_idx, query.device)
     if vv_prefix is not None:
         if B != 1 or Sq != Skv or vv_prefix.shape != (Skv,):
             raise ValueError("V→V prefix attention requires one unpadded, uncached prompt")
@@ -257,15 +266,42 @@ def blasst_attention_forward(
     for r0 in range(0, Sq, TILE):
         r1 = min(r0 + TILE, Sq)
         q32 = query[:, :, r0:r1].to(torch.float32)
-        s = torch.matmul(q32, key32.transpose(-1, -2)) * scaling          # [B, H, r, Skv] fp32
         qpos = torch.arange(r0, r1, device=query.device) + offset
         allowed = kpos[None, :] <= qpos[:, None]                            # [r, Skv] causal
         if vv_prefix is not None:
             full_vv = pure_visual_tiles[r0 // TILE] & pure_visual_tiles
             allowed = allowed | full_vv.repeat_interleave(TILE)[:Skv]
-        s_t = score_tiles(s, allowed, mask_chunk(attention_mask, r0, r1, Sq, Skv))
+        query_tile = r0 // TILE
+        mask = mask_chunk(attention_mask, r0, r1, Sq, Skv)
+        bypass = tv_layer.bypass_keys(query_tile) if tv_layer is not None else []
+        if bypass:
+            omitted = set(bypass)
+            columns = torch.cat([kpos[index * TILE:(index + 1) * TILE]
+                                 for index in range(query_tile + 1) if index not in omitted])
+            retained = key32.index_select(-2, columns)
+            computed = torch.matmul(q32, retained.transpose(-1, -2)) * scaling
+            s = computed.new_full((B, Hq, r1 - r0, Skv), NEG_INF)
+            s.index_copy_(-1, columns, computed)
+            s_t = score_tiles(s, allowed, mask)
+            if mask is not None and not s_t.isfinite().flatten(-2).any(-1).all():
+                # An extra mask can hide the protected key. Revert this query tile.
+                bypass = []
+                tv_layer.mask_fallback.add(query_tile)
+            else:
+                tv_layer.bypassed[query_tile] = len(bypass)
+        if not bypass:
+            s = torch.matmul(q32, key32.transpose(-1, -2)) * scaling      # [B, H, r, Skv] fp32
+            s_t = score_tiles(s, allowed, mask)
         margin = tile_margins(s_t)
         skip = margin < ln_lam                                              # all rows far below running max
+        if tv_layer is not None:
+            tv_layer.observe_text(query_tile, s_t, ln_lam)
+            if bypass:
+                skip[..., bypass] = True
+            if (policy.threshold is not None and tv_layer.previous is not None and query_tile in policy.visual_set
+                    and query_tile not in tv_layer.dropped):
+                # An accepted visual query keeps all causally visible pure V→V tiles.
+                skip[..., [index for index in policy.pure_visual if index <= query_tile]] = False
         if STATE["record"] and phase == "decode":
             STATE["decode_records"].setdefault(layer_idx, []).append(
                 margin.detach().float().cpu().unsqueeze(2))
@@ -297,6 +333,8 @@ def blasst_attention_forward(
         p = torch.softmax(s_t.view(B, Hq, r1 - r0, n_kt * TILE)[..., :Skv], dim=-1)
         out[:, :, r0:r1] = torch.matmul(p.to(value.dtype), value)
 
+    if tv_layer is not None:
+        tv_layer.finish()
     return out.transpose(1, 2).contiguous(), None
 
 

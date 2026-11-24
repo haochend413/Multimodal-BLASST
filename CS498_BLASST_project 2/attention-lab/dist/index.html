@@ -10,7 +10,34 @@
   <button id="show-jl" type="button" aria-pressed="false" aria-controls="jl-workspace">JL ablation</button>
   <button id="show-region" type="button" aria-pressed="false" aria-controls="region-workspace">Region audit</button>
   <button id="show-layers" type="button" aria-pressed="false" aria-controls="layers-workspace">Cross-layer tiles</button>
+  <button id="show-tv-vv" type="button" aria-pressed="false" aria-controls="tv-vv-workspace">T→V-guided V→V</button>
 </nav>
+<section id="tv-vv-workspace" class="chart-panel" aria-labelledby="tv-vv-title" hidden>
+  <h2 id="tv-vv-title">T→V-guided V→V</h2>
+  <p class="hint" id="tv-vv-status">Load a T→V-guided V→V sweep JSON to compare with standard BLASST.</p>
+  <div id="tv-vv-content" hidden>
+    <div class="jl-controls"><label>Experiment<select id="tv-vv-report"></select></label></div>
+    <div class="jl-table-wrap"><table class="jl-table">
+      <thead><tr><th scope="col">Policy</th><th scope="col">Pure V→V QK tiles bypassed</th>
+        <th scope="col">Reference exact matches</th><th scope="col">Answers changed vs baseline</th></tr></thead>
+      <tbody id="tv-vv-summary"></tbody>
+    </table></div>
+    <h3>Follow the votes</h3>
+    <div class="jl-controls">
+      <label>Case<select id="tv-vv-case"></select></label>
+      <label>Policy<select id="tv-vv-variant"></select></label>
+      <label>Layer<select id="tv-vv-layer"></select></label>
+    </div>
+    <p class="hint" id="tv-vv-coverage" aria-live="polite"></p>
+    <p class="hint" id="tv-vv-answer"></p>
+    <div class="jl-table-wrap"><table class="jl-table">
+      <thead><tr><th scope="col">Visual tile start</th><th scope="col">Previous layer relevance</th>
+        <th scope="col">V→V query decision</th><th scope="col">QK tiles bypassed</th>
+        <th scope="col">Current T→V keep votes</th></tr></thead>
+      <tbody id="tv-vv-votes"></tbody>
+    </table></div>
+  </div>
+</section>
 <section id="layers-workspace" class="chart-panel" aria-labelledby="layers-title" hidden>
   <h2 id="layers-title">Cross-layer tile decisions</h2>
   <p class="hint" id="layers-source">Load a cross-layer study JSON to compare decisions.</p>
@@ -154,4 +181,4 @@
   </div>
 </section></section>
 <section class="chart-panel distribution"><div class="chart-header"><div><p class="eyebrow">REGION DISTRIBUTIONS</p><h2>How large are the scores?</h2></div><span class="muted">Each region normalized separately</span></div><svg id="histogram" viewBox="0 0 850 220" role="img" aria-label="Raw attention score histogram by query and key modality"></svg><p id="hist-note" class="hint"></p><div id="region-cards" class="region-cards"></div></section>
-<section class="method"><h3>Read the measurements correctly</h3><p><strong>Score</strong> is scaled QKᵀ before softmax; a large absolute negative score is not a large attention weight. <strong>Weight</strong> is the dense row-normalized softmax on the current recorded trajectory. <strong>Margin</strong> compares a tile’s row maxima with running row maxima. Masked future positions are excluded. All summaries cover only the selected layers and heads.</p><p>Dense recordings support offline threshold exploration. Live sparse recordings contain inputs already changed by earlier skipping. Neither the simulation nor this explorer measures kernel speedup.</p></section></div></section><footer><span>BLASST / ATTENTION LAB</span><span>Local file analysis · uploaded datasets stay in this browser</span></footer></main><script type="module" src="app.js?v=vv-prefix-skips"></script></body></html>
+<section class="method"><h3>Read the measurements correctly</h3><p><strong>Score</strong> is scaled QKᵀ before softmax; a large absolute negative score is not a large attention weight. <strong>Weight</strong> is the dense row-normalized softmax on the current recorded trajectory. <strong>Margin</strong> compares a tile’s row maxima with running row maxima. Masked future positions are excluded. All summaries cover only the selected layers and heads.</p><p>Dense recordings support offline threshold exploration. Live sparse recordings contain inputs already changed by earlier skipping. Neither the simulation nor this explorer measures kernel speedup.</p></section></div></section><footer><span>BLASST / ATTENTION LAB</span><span>Local file analysis · uploaded datasets stay in this browser</span></footer></main><script type="module" src="app.js?v=tv-guided-vv"></script></body></html>

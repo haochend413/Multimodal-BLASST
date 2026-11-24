@@ -5,8 +5,9 @@ import {isJLSweep, setupJLStudy} from './jl.mjs?v=region-audit';
 import {isRegionAudit, setupRegionAudit} from './region.mjs?v=region-reset';
 import {isLayerStudy, setupLayerStudy} from './layers.mjs?v=vv-prefix-skips';
 import {runningMaxTrace, drawRunningMax} from './running-max.mjs';
+import {isTVVVSweep, setupTVVVSweep} from './tv-vv.mjs';
 const $ = id => document.getElementById(id);
-const workspaces = {tiles:'tile-workspace', jl:'jl-workspace', region:'region-workspace', layers:'layers-workspace'};
+const workspaces = {tiles:'tile-workspace', jl:'jl-workspace', region:'region-workspace', layers:'layers-workspace', 'tv-vv':'tv-vv-workspace'};
 function showView(view) {
   for (const [name, panel] of Object.entries(workspaces)) {
     $(panel).hidden = name !== view;
@@ -18,6 +19,7 @@ for (const view of Object.keys(workspaces)) $(`show-${view}`).addEventListener('
 const jlStudy = setupJLStudy(showView);
 const regionAudit = setupRegionAudit(showView);
 const layerStudy = setupLayerStudy(showView);
+const tvVVSweep = setupTVVVSweep(showView);
 const datasets = []; let data, current, region = 'All', hits = [];
 const scoreFiles = new Map();
 let demoScoreId, demoScores, selectedTile, selectedScores, inspection = 0;
@@ -243,6 +245,7 @@ $('upload').addEventListener('change', async event => {
         if (isJLSweep(input)) jlStudy.add(file.name, input);
         else if (isRegionAudit(input)) regionAudit.add(file.name, input);
         else if (isLayerStudy(input)) layerStudy.add(file.name, input);
+        else if (isTVVVSweep(input)) tvVVSweep.add(file.name, input);
         else {
           showView('tiles');
           add(file.name, input);

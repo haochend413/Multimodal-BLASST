@@ -77,6 +77,34 @@ python score_distribution_study.py \
 Use `python plot_score_distributions.py REPORT.json --phase decode --output DECODE.png`
 to plot decode, or omit `--phase decode` to plot prefill from a newly collected report.
 
+### Previous-layer T→V votes for V→V queries
+
+Run a paired comparison against standard BLASST on the same VQA cases:
+
+```bash
+python attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-30.json" --sample-count 30 \
+  --lambda 0.1 --decode-tokens 16 \
+  --tv-vv-sweep 0.25,0.5,0.75 \
+  --output "$HOME/blasst-results/vqav2-tv-guided-vv.json"
+```
+
+Layer 0 uses standard causal BLASST. Each eligible text query tile and head can cast one
+keep vote for a pure visual key tile. Mixed query tiles contribute votes from their text
+rows only, using each row's original causal running max. At layer L, the keep fraction
+from layer L-1 gates the pure V→V tiles in each visual query tile. Accepted queries can
+read all causal pure visual keys. Rejected queries omit those key columns from the QK
+matmul. Visual tokens remain available as keys to other queries. The policy keeps queries
+with no eligible text votes and protects a first key tile when an entirely visual
+prefix would otherwise leave the rows without any key. The mask is recomputed at every
+layer. Decode keeps its regular attention policy.
+
+Load the sweep JSON in **T→V-guided V→V** to inspect votes, reactivation, bypasses, and
+generated answers. Answer comparison uses normalized full-response exact match against
+the available references, and the report also counts changes relative to the baseline.
+These are tile workload counts in the PyTorch reference. For a single-run tile and
+score export, use `--tv-vv-threshold 0.5 --score-data` in place of the sweep flag.
+
 ### Bidirectional masking for pure V→V tiles
 
 To test bidirectional V→V attention on one manifest case:

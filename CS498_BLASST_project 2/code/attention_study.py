@@ -20,6 +20,7 @@ from jl_gap_study import JLGapStudy, merge_sweeps
 from jl_region_study import JLRegionStudy, merge_region_audits
 from tile_layer_study import LayerReport, TileLayerRecorder
 from tile_calibration import add_threshold_arguments, selected_calibration, write_json
+from tv_guided_vv import SWEEP_SCHEMA as TV_VV_SCHEMA, TVGuidedVV
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -240,6 +241,11 @@ def main() -> None:
                         help="write exact token scores to a browser-readable .scores.bin companion")
     parser.add_argument("--vv-prefix-attention", action="store_true",
                         help="use full bidirectional attention in pure V→V prefill tiles")
+    tv_vv = parser.add_mutually_exclusive_group()
+    tv_vv.add_argument("--tv-vv-threshold", type=float,
+                       help="gate causal V→V query tiles using the preceding layer's T→V keep fraction")
+    tv_vv.add_argument("--tv-vv-sweep", metavar="FRACTIONS",
+                       help="compare standard BLASST and comma-separated T→V relevance thresholds")
     parser.add_argument("--jl-dim", type=int, help="audit a JL precheck at this sketch dimension")
     parser.add_argument("--jl-sweep", metavar="DIMS",
                         help="comma-separated JL widths for a paired skip-rate and gap histogram study")
@@ -270,6 +276,24 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int, default=1,
                         help="number of consecutive manifest pairs for a projected-only audit")
     args = parser.parse_args()
+    if args.tv_vv_sweep is not None:
+        try:
+            args.tv_vv_sweep = sorted({float(value) for value in args.tv_vv_sweep.split(",")})
+        except ValueError:
+            parser.error("--tv-vv-sweep expects comma-separated fractions")
+    tv_vv_thresholds = args.tv_vv_sweep or (
+        [args.tv_vv_threshold] if args.tv_vv_threshold is not None else []
+    )
+    if tv_vv_thresholds:
+        if any(not 0 <= threshold <= 1 for threshold in tv_vv_thresholds):
+            parser.error("T→V relevance thresholds must be in [0, 1]")
+        if (args.vv_prefix_attention or args.jl_dim is not None or args.jl_sweep
+                or args.tile_layer_study or args.score_distributions):
+            parser.error("T→V-guided V→V compares live causal BLASST masks; omit separate mask audits")
+        if not 0 < args.lam <= 1:
+            parser.error("set the BLASST vote threshold with --lambda in (0, 1]")
+    if args.tv_vv_sweep and (args.score_data or args.raw_dir):
+        parser.error("--tv-vv-sweep collects a paired answer and tile-count report")
     if args.vv_prefix_attention and (args.jl_dim is not None or args.jl_sweep or args.jl_region_audit):
         parser.error("JL audits use causal QK reconstruction; omit JL flags with --vv-prefix-attention")
     if args.sample_index < 0:
@@ -310,7 +334,9 @@ def main() -> None:
         if (args.jl_epsilon is not None or args.jl_live or args.jl_projected_only or
                 args.jl_split_tiles or args.score_data or args.raw_dir or args.lam or args.decode_lambda):
             parser.error("--jl-region-audit uses a dense trajectory and its own report; set --jl-lambda")
-    paired_audit = args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions
+    paired_audit = (
+        args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions or args.tv_vv_sweep
+    )
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
     if args.sample_count > 1 and not (
@@ -370,7 +396,9 @@ def main() -> None:
                 parser.error(f"Missing input media: {media_path}")
         if not torch.cuda.is_available():
             parser.error("Real model collection requires CUDA; use --demo for CPU verification")
-    if args.score_distributions:
+    if args.tv_vv_sweep:
+        _collect_tv_vv_sweep(args, parser, samples if args.manifest else [None] * args.sample_count)
+    elif args.score_distributions:
         _collect_score_distributions(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
     elif args.tile_layer_study:
         _collect_layer_study(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
@@ -416,6 +444,51 @@ def _collect_score_distributions(args, parser, samples, calibration):
         write_json(args.output, study.report())
         print(f"Collected score distributions for {len(study.cases)}/{len(samples)} cases", flush=True)
     print(f"Wrote score distributions to {args.output}")
+
+
+def _normalized_answer(answer):
+    return " ".join("".join(char if char.isalnum() else " " for char in answer.casefold()).split())
+
+
+def _collect_tv_vv_sweep(args, parser, samples):
+    variants = [("baseline", None), *((str(value), value) for value in args.tv_vv_sweep)]
+    report = dict(schema=TV_VV_SCHEMA, model=args.model, synthetic=args.demo, tile_size=ba.TILE,
+                  blasst_lambda=args.lam, decode_lambda=args.decode_lambda, pairs_requested=len(samples),
+                  answer_metric="normalized full-response exact match to any supplied reference",
+                  variants=dict(variants), cases=[])
+    totals = {name: defaultdict(int) for name, _ in variants}
+    for index, sample in enumerate(samples, start=args.sample_index):
+        benchmark, sample_id = (sample["benchmark"], sample["id"]) if sample else ({}, str(index))
+        case = dict(sample_index=index, sample_id=sample_id, results={})
+        references = benchmark.get("reference_answers") or [benchmark.get("ground_truth", "")]
+        answers = {normalized for answer in references if (normalized := _normalized_answer(answer))}
+        for name, threshold in variants:
+            # An ungated vote trace provides the baseline's causal V→V denominator.
+            run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold))
+            if sample:
+                _select_sample(run, parser, sample)
+            metadata = collect(run, parser, benchmark, sample_id)
+            trace = metadata["tv_guided_vv"]
+            answer = metadata.get("answer")
+            normalized = _normalized_answer(answer) if answer is not None else None
+            match = normalized in answers if answers and normalized is not None else None
+            result = dict(answer=answer, reference_exact_match=match, **trace)
+            if name != "baseline" and answer is not None:
+                base_answer = case["results"]["baseline"]["answer"]
+                result["answer_changed"] = normalized != _normalized_answer(base_answer)
+            case["results"][name] = result
+            totals[name]["pure_vv_tiles"] += trace["pure_vv_tiles"]
+            totals[name]["vv_tiles_bypassed"] += trace["vv_tiles_bypassed"]
+            if match is not None:
+                totals[name]["answers_scored"] += 1
+                totals[name]["reference_exact_matches"] += match
+            if "answer_changed" in result:
+                totals[name]["answers_changed"] += result["answer_changed"]
+        report["cases"].append(case)
+        report["summary"] = totals
+        write_json(args.output, report)
+        print(f"Compared T→V-guided V→V for {len(report['cases'])}/{len(samples)} cases", flush=True)
+    print(f"Wrote paired T→V-guided V→V report to {args.output}")
 
 
 def _collect_layer_study(args, parser, samples, calibration):
@@ -510,6 +583,7 @@ def _collect_batch(args, parser, samples):
 def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = None) -> dict:
     old_observers = ba.STATE["observer"], ba.STATE["qkv_hook"]
     old_prefix = ba.STATE["vv_prefix_visual"]
+    old_tv_vv = ba.STATE["tv_guided_vv"]
     precision = torch.get_float32_matmul_precision()
     try:
         if args.jl_probe is not None or args.jl_sweep:
@@ -518,11 +592,18 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
     finally:
         ba.STATE["observer"], ba.STATE["qkv_hook"] = old_observers
         ba.STATE["vv_prefix_visual"] = old_prefix
+        ba.STATE["tv_guided_vv"] = old_tv_vv
         if args.jl_probe is not None or args.jl_sweep:
             torch.set_float32_matmul_precision(precision)
 
 
 def _attach_study(args, recorder):
+    if args.tv_vv_threshold is not None or args.tv_vv_sweep:
+        ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold)
+        ba.STATE["qkv_hook"] = None
+        if args.tv_vv_sweep:
+            ba.STATE["observer"] = None
+        return None
     if args.score_distributions:
         ba.STATE["observer"] = args.score_study.observer(recorder, ba.TILE, args.score_case)
         ba.STATE["qkv_hook"] = None
@@ -579,13 +660,17 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
     ba.set_threshold(args.lam or None)
     ba.set_decode_threshold(args.decode_lambda or None, inherit=args.decode_lambda is None)
     ba.STATE["vv_prefix_visual"] = None
+    ba.STATE["tv_guided_vv"] = None
     if args.demo:
-        torch.manual_seed(98 + args.sample_index
-                          if args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions else 98)
+        sweep = args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions or args.tv_vv_sweep
+        torch.manual_seed(98 + args.sample_index if sweep else 98)
         length = 640
         visual = torch.zeros(length, dtype=torch.bool)
+        tv_demo = args.tv_vv_sweep or args.tv_vv_threshold is not None
         if args.jl_region_audit:
             visual[15:544] = True
+        elif tv_demo:
+            visual[128:544] = True
         else:
             visual[128:512] = True
         recorder = AttentionRecorder(visual, {0, 1, 2}, {0, 1}, args.raw_dir, args.max_tiles,
@@ -601,6 +686,13 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
             for step in range(min(args.decode_tokens, 8) + 1):
                 q = torch.randn(1, 2, length if step == 0 else 1, 32)
                 q[..., 0] += 4
+                if tv_demo and step == 0:
+                    q[..., 544:, :] = 0
+                    q[..., 544:, -1] = math.sqrt(32)
+                    k[..., -1] = 3
+                    k[..., 0, -1] = 8
+                    for head, visual_tile in enumerate((layer + 1, (layer + 1) % 3 + 1)):
+                        k[:, head, visual_tile * ba.TILE:(visual_tile + 1) * ba.TILE, -1] = 9
                 ba.blasst_attention_forward(SimpleNamespace(layer_idx=layer), q, k, v, None)
                 k = torch.cat((k, torch.randn(1, 2, 1, 32)), dim=2)
                 v = torch.cat((v, torch.randn(1, 2, 1, 32)), dim=2)
@@ -641,6 +733,12 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
     if args.score_distributions:
         return metadata
+    if (policy := ba.STATE["tv_guided_vv"]) is not None:
+        metadata["tv_guided_vv"] = dict(threshold=policy.threshold, layers=policy.layers,
+                                        pure_vv_tiles=sum(layer["pure_vv_tiles"] for layer in policy.layers),
+                                        vv_tiles_bypassed=sum(layer["vv_tiles_bypassed"] for layer in policy.layers))
+        if args.tv_vv_sweep:
+            return metadata
     if args.vv_prefix_attention:
         metadata["attention_mask_policy"] = "vv_prefix"
     if args.tile_layer_study:

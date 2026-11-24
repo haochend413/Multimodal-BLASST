@@ -59,6 +59,10 @@ Calibrated reports show the saved threshold, target keep rate, and achieved rate
 for the selected phase, tile group, and case.
 See the [cross-layer run guide](../code/README.md#cross-layer-tile-decisions).
 
+Load an `attention_study.py --tv-vv-sweep` report into **T→V-guided V→V**.
+Choose a case, threshold, and layer to compare the preceding layer's relevance with the
+current layer's votes and see which V→V query tiles bypassed QK.
+
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.
 It is explicitly synthetic, not measured Qwen, Video-MME, or accuracy data.
 
