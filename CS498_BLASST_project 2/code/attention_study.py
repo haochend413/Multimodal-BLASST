@@ -262,6 +262,8 @@ def main() -> None:
                        help="compare standard BLASST and comma-separated T→V relevance thresholds")
     tv_vv.add_argument("--decode-visual-links", action="store_true",
                        help="compare BLASST with decode that selects visual keys using prefill T→V links")
+    tv_vv.add_argument("--decode-visual-history-study", action="store_true",
+                       help="compare BLASST, fixed prefill T→V links, and links extended during decode")
     tv_vv.add_argument("--binary-tv-pipeline", action="store_true",
                        help="compare BLASST, binary T→T-guided T→V, and the full T→V-guided V→V pipeline")
     tv_vv.add_argument("--binary-tv-phase-study", action="store_true",
@@ -322,8 +324,11 @@ def main() -> None:
     if args.answer_protocol is not VQAV2:
         args.vqa_accuracy = True
     binary_study = args.binary_tv_pipeline or args.binary_tv_phase_study
-    if args.decode_visual_links or binary_study:
+    decode_link_study = args.decode_visual_links or args.decode_visual_history_study
+    if decode_link_study or binary_study:
         flag = "--decode-visual-links"
+        if args.decode_visual_history_study:
+            flag = "--decode-visual-history-study"
         if binary_study:
             flag = "--binary-tv-phase-study" if args.binary_tv_phase_study else "--binary-tv-pipeline"
         if not args.manifest or args.demo or args.decode_tokens < 2:
@@ -359,7 +364,7 @@ def main() -> None:
     ):
         parser.error("The live region-max switches cannot be used with audits that compute their own running max")
     if args.vqa_accuracy and not (args.manifest and (args.tv_vv_sweep is not None or args.tv_vv_top_accuracy
-                                                    or args.decode_visual_links or binary_study
+                                                    or decode_link_study or binary_study
                                                     or args.matched_region_study or args.gate_distribution)):
         parser.error("Answer scoring requires a compatible benchmark manifest and a paired study")
     args.vqa_shard = None
@@ -430,7 +435,7 @@ def main() -> None:
     paired_audit = (
         args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions
         or args.tv_vv_sweep or args.tv_vv_top_accuracy or args.matched_region_study or args.gate_distribution
-        or args.decode_visual_links or binary_study
+        or decode_link_study or binary_study
     )
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
@@ -524,7 +529,7 @@ def main() -> None:
                 run(args, parser, samples, collect, _select_sample, ba.STATE, ba.TILE)
         except (ValueError, KeyError, OSError) as error:
             parser.error(str(error))
-    elif args.tv_vv_sweep or args.tv_vv_top_accuracy or args.decode_visual_links or binary_study:
+    elif args.tv_vv_sweep or args.tv_vv_top_accuracy or decode_link_study or binary_study:
         _collect_tv_vv_sweep(args, parser, samples if args.manifest else [None] * args.sample_count)
     elif args.score_distributions:
         _collect_score_distributions(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
@@ -594,7 +599,8 @@ def _run_tv_vv_sweep(args, parser, samples):
     top_percent = getattr(args, "tv_vv_top_percent", None)
     token_percent = getattr(args, "tv_vv_token_percent", None)
     has_top_k = top_percent is not None or token_percent is not None
-    decode_links = getattr(args, "decode_visual_links", False)
+    extend_decode_links = getattr(args, "decode_visual_history_study", False)
+    decode_links = getattr(args, "decode_visual_links", False) or extend_decode_links
     phase_study = getattr(args, "binary_tv_phase_study", False)
     binary = getattr(args, "binary_tv_pipeline", False) or phase_study
     variants = [("baseline", None)]
@@ -604,6 +610,8 @@ def _run_tv_vv_sweep(args, parser, samples):
         variants.extend((("binary_tv", "tv"), ("binary_tv_vv", "tv_vv")))
     elif decode_links:
         variants.append(("decode_links", True))
+        if extend_decode_links:
+            variants.append(("decode_links_growing", "generated_history"))
     elif token_percent is not None:
         variants.append((f"top_token_{token_percent:g}", token_percent))
     elif top_percent is None:
@@ -630,6 +638,9 @@ def _run_tv_vv_sweep(args, parser, samples):
     elif decode_links:
         report["decode_visual_link_study"] = True
         report["variant_labels"] = {"baseline": "Original BLASST", "decode_links": "Decode with prefill T→V links"}
+        if extend_decode_links:
+            report["variant_labels"]["decode_links"] = "Decode with fixed prefill T→V links"
+            report["variant_labels"]["decode_links_growing"] = "Decode with prefill and generated-token T→V links"
     elif has_top_k:
         amount, unit = ((token_percent, "tokens") if token_percent is not None else (top_percent, "tile rows"))
         report["variant_labels"] = {"baseline": "Original BLASST", variants[1][0]: f"Top {amount:g}% visual {unit}"}
@@ -672,6 +683,7 @@ def _run_tv_vv_sweep(args, parser, samples):
                                             tv_vv_token_percent=value if token_percent is not None else None,
                                             decode_visual_links=decode_links and name != "baseline",
                                             decode_visual_link_study=decode_links,
+                                            extend_decode_links=name == "decode_links_growing",
                                             binary_tv_pipeline=binary,
                                             binary_tv_mode=value if binary else None))
             for phase in region_phases:
@@ -867,7 +879,8 @@ def _attach_study(args, recorder):
         return None
     if getattr(args, "decode_visual_link_study", False):
         if args.decode_visual_links:
-            ba.STATE["decode_visual_links"] = DecodeVisualLinks(recorder.visual, ba.TILE)
+            ba.STATE["decode_visual_links"] = DecodeVisualLinks(
+                recorder.visual, ba.TILE, extend_history=getattr(args, "extend_decode_links", False))
         ba.STATE["observer"] = ba.STATE["qkv_hook"] = None
         return None
     if args.prefill_region_max or args.decode_region_max:

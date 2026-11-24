@@ -9,14 +9,14 @@ from contextlib import contextmanager
 
 from answer_benchmarks import ANSWER_BENCHMARKS, VQAV2
 from binary_tv_pipeline import BINARY_TV_COUNTS
-from decode_visual_links import DECODE_LINK_COUNTS
+from decode_visual_links import DECODE_HISTORY_COUNTS, DECODE_LINK_COUNTS
 from tile_calibration import write_json
 from tv_guided_vv import TOKEN_GATE_COUNTS
 
 CHECKPOINT_INTERVAL = 25
 MAX_POLICIES = ("prefill_max_policies", "decode_max_policies")
 TILE_COUNTS = ("prefill_tiles", "prefill_tiles_skipped", "decode_tiles", "decode_tiles_skipped",
-               "prefill_qk_bypassed", *DECODE_LINK_COUNTS, *TOKEN_GATE_COUNTS, *BINARY_TV_COUNTS)
+               "prefill_qk_bypassed", *DECODE_LINK_COUNTS, *DECODE_HISTORY_COUNTS, *TOKEN_GATE_COUNTS, *BINARY_TV_COUNTS)
 CASE_FIELDS = ("answer", "vqa_score", "rouge_l", "generated_tokens", "pure_vv_tiles", "vv_tiles_bypassed",
                "answer_changed", *TILE_COUNTS)
 PROTOCOLS_BY_METRIC = {protocol.metric: protocol for protocol in ANSWER_BENCHMARKS.values()}

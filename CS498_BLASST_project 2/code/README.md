@@ -296,6 +296,27 @@ layer/head/decode-step observations that used fallback. Compare
 avoided by the reference implementation. Load the report in Attention Lab
 under **T→V-guided V→V** to compare accuracy and bypass counts.
 
+#### Compare fixed prefill links with growing decode history
+
+```bash
+python code/attention_study.py \
+  --benchmark vizwiz-lf --manifest "$HOME/blasst-results/vizwiz-lf-600.json" \
+  --sample-count 50 --decode-visual-history-study --lambda 0.1 --decode-lambda 0.1 \
+  --output "$HOME/blasst-results/vizwiz-lf-50-decode-history.json"
+```
+
+This compares original BLASST, the original decode-link policy with fixed
+prefill links, and a variant that extends those links at each decode step.
+The growing variant stores each step's retained visual tiles at the current
+text token's KV-cache position for that layer and head. On subsequent steps,
+the stored mask contributes only if T→T BLASST keeps that cached text key.
+Both decode-link variants start with the same prefill masks.
+
+The report includes paired answer quality, generated token counts, visual QK
+bypass, fallback, and how often at least one generated text key contributed its
+stored history (`decode_generated_history_head_steps`). Omit
+`--sample-count 50` to use all 600 questions.
+
 #### Binary T→T → T→V → V→V pipeline
 
 ```bash

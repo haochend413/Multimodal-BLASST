@@ -10,16 +10,20 @@ DECODE_LINK_COUNTS = (
     "decode_head_steps", "decode_link_fallback_heads", "decode_visual_tiles",
     "decode_visual_tiles_bypassed", "decode_visual_keys", "decode_visual_keys_bypassed",
 )
+DECODE_HISTORY_COUNTS = ("decode_generated_history_head_steps",)
 
 
 class DecodeVisualLinks:
     """Own per-prompt boolean masks indexed by layer, head, position, and visual tile."""
 
-    def __init__(self, visual, tile_size):
+    def __init__(self, visual, tile_size, *, extend_history=False):
         self.visual = visual.bool().cpu()
         self.tile_size = tile_size
+        self.extend_history = extend_history
         self.layers = {}
         self.counts = Counter(dict.fromkeys(DECODE_LINK_COUNTS, 0))
+        if extend_history:
+            self.counts.update(dict.fromkeys(DECODE_HISTORY_COUNTS, 0))
 
     def start_layer(self, layer, heads, device):
         visual = self.visual.to(device)
@@ -59,6 +63,9 @@ class DecodeVisualLinks:
         prompt_length = len(self.visual)
         n_tiles = (length + self.tile_size - 1) // self.tile_size
         links, history, visual_positions, visual_tiles, visual_columns = self.layers[layer]
+        history_length = history.shape[1]
+        if self.extend_history and history_length != length - 1:
+            raise ValueError("Growing decode links require a sequential, append-only KV cache")
         visual_positions = visual_positions.to(device)
         positions = torch.arange(length, device=device)
         is_visual = torch.zeros(length, dtype=torch.bool, device=device)
@@ -88,7 +95,7 @@ class DecodeVisualLinks:
         text_max = text_tiles.amax(-1)
         text_kept = torch.isfinite(text_max) & (row_tile_margins(text_max) >= ln_lambda)
         kept_keys = text_kept[:, positions // self.tile_size] & torch.isfinite(full)
-        usable = kept_keys[:, :prompt_length] & history
+        usable = kept_keys[:, :history_length] & history
         fallback = ~usable.any(-1)
         selected = (links & usable.unsqueeze(-1)).any(dim=1)
         visual_allowed = allowed[:, visual_positions]
@@ -109,13 +116,25 @@ class DecodeVisualLinks:
 
         pair_tiles = score_tiles(scores, allowed_positions)
         skip = ~torch.isfinite(pair_tiles.amax(-1))
-        tile_flags = torch.zeros((2, heads, n_tiles), dtype=torch.int32, device=device)
-        tile_flags.scatter_reduce_(2, visual_tiles[visual_columns].expand(2, heads, -1),
-                                   torch.stack((visual_allowed, compute)).int(), reduce="amax")
-        eligible_tiles, computed_tiles = tile_flags.sum(dim=(1, 2)).tolist()
+        flags = [visual_allowed, compute]
+        if self.extend_history:
+            flags.append(visual_kept & torch.isfinite(full[:, visual_positions]))
+        source = torch.stack(flags).int()
+        tile_flags = torch.zeros((len(flags), heads, n_tiles), dtype=torch.int32, device=device)
+        tile_flags.scatter_reduce_(2, visual_tiles[visual_columns].expand_as(source), source, reduce="amax")
+        eligible_tiles, computed_tiles = tile_flags[:2].sum(dim=(1, 2)).tolist()
         eligible_keys = int(visual_allowed.sum())
         self.counts.update(dict(zip(DECODE_LINK_COUNTS, (
             heads, int(fallback.sum()), eligible_tiles, eligible_tiles - computed_tiles,
             eligible_keys, eligible_keys - len(columns),
         ))))
+        if self.extend_history:
+            # Save the final visual decisions at this query's KV-cache position.
+            current_links = tile_flags[2].index_select(-1, visual_tiles).bool()
+            self.layers[layer] = (
+                torch.cat((links, current_links.unsqueeze(1)), dim=1),
+                torch.cat((history, visual_allowed.any(-1, keepdim=True)), dim=1),
+                visual_positions, visual_tiles, visual_columns,
+            )
+            self.counts["decode_generated_history_head_steps"] += int(usable[:, prompt_length:].any(-1).sum())
         return output.unsqueeze(0), skip

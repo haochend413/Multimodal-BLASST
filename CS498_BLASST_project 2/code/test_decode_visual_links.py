@@ -2,6 +2,7 @@
 import math
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import blasst_attn as ba
@@ -61,3 +62,41 @@ def test_mixed_key_tile_requires_visual_score_to_pass(monkeypatch):
     links, history, *_ = policy.layers[0]
     assert history[0, 2].item()
     assert not links[0, 2, 0].item()
+
+
+@pytest.mark.parametrize("keep_previous", [True, False])
+def test_generated_link_is_reused_only_for_a_kept_text_key(monkeypatch, keep_previous):
+    monkeypatch.setattr(ba, "TILE", 2)
+    visual = torch.tensor([False, False, True, True, True, True, False, False])
+    old = DecodeVisualLinks(visual, 2)
+    growing = DecodeVisualLinks(visual, 2, extend_history=True)
+    q = torch.ones(1, 3, 1, 1)
+    k = torch.tensor([10., 10., 0., 0., 12., 12., 0., 0., 10., 10.]).view(1, 1, 10, 1)
+    k = k.expand(1, 3, 10, 1)
+    v = torch.arange(10.).view(1, 1, 10, 1).expand_as(k)
+    cutoff = math.log(.1)
+    for policy in (old, growing):
+        policy.start_layer(0, 3, "cpu")
+        # Only late prompt text has history, and T→T drops its low-scoring tile.
+        links, history, *_ = policy.layers[0]
+        links[:, 6:8, 0] = True
+        history[:, 6:8] = True
+    fixed_first, _ = old.decode(0, q, k[..., :9, :], v[..., :9, :], None, 1., cutoff, ba.score_tiles)
+    growing_first, _ = growing.decode(0, q, k[..., :9, :], v[..., :9, :], None, 1., cutoff, ba.score_tiles)
+    torch.testing.assert_close(fixed_first, growing_first, atol=0, rtol=0)
+    links, history, *_ = growing.layers[0]
+    assert links[:, 8].tolist() == [[False, True]] * 3
+    assert history[:, 8].all()
+    assert old.layers[0][0].shape[1] == 8
+
+    if not keep_previous:
+        k = k.clone()
+        k[:, :, 8:, :] = 0  # The generated text tile now loses the T→T BLASST test.
+    mask = None
+    fixed_second, _ = old.decode(0, q, k, v, mask, 1., cutoff, ba.score_tiles)
+    growing_second, _ = growing.decode(0, q, k, v, mask, 1., cutoff, ba.score_tiles)
+    torch.testing.assert_close(fixed_second, growing_second, atol=0, rtol=0)
+    assert old.counts["decode_visual_tiles_bypassed"] == 0
+    assert growing.counts["decode_generated_history_head_steps"] == (3 if keep_previous else 0)
+    assert growing.counts["decode_visual_tiles_bypassed"] == (3 if keep_previous else 0)
+    assert growing.counts["decode_link_fallback_heads"] == (3 if keep_previous else 6)
