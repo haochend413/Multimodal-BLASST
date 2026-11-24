@@ -257,13 +257,17 @@ def main() -> None:
     parser.add_argument("--vqa-accuracy", action="store_true",
                         help="use short-answer generation and the official VQA score in a VQA v2 sweep")
     parser.add_argument("--matched-region-study", action="store_true",
-                        help="compare five VQA policies at calibrated per-phase skip rates")
+                        help="compare four running-max policies at matched post-QK keep rates")
     parser.add_argument("--calibration-count", type=int, default=20,
                         help="number of questions before the matched-study evaluation range")
     parser.add_argument("--budget-probes", type=int, default=8, help="maximum live calibration probes per stage")
     parser.add_argument("--budget-tolerance-pp", type=float, default=1.,
-                        help="allowed calibration skip-rate error in percentage points")
+                        help="allowed post-QK keep-rate error in percentage points")
     parser.add_argument("--budget-config", type=Path, help="save or reuse matched-study calibration settings")
+    parser.add_argument("--budget-keep-percent", type=float, default=50.,
+                        help="requested post-QK tile keep percentage in each phase")
+    parser.add_argument("--gate-lambda", type=float, default=1.,
+                        help="prefill lambda used to record the fixed gate for the matched study")
     parser.add_argument("--vqa-shards", type=int, help="split the whole VQA manifest into this many shards")
     parser.add_argument("--vqa-shard-index", type=int, help="zero-based index of this restartable shard")
     parser.add_argument("--jl-dim", type=int, help="audit a JL precheck at this sketch dimension")

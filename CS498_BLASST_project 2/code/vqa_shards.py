@@ -11,7 +11,8 @@ from tile_calibration import write_json
 
 CHECKPOINT_INTERVAL = 25
 MAX_POLICIES = ("prefill_max_policies", "decode_max_policies")
-TILE_COUNTS = ("prefill_tiles", "prefill_tiles_skipped", "decode_tiles", "decode_tiles_skipped")
+TILE_COUNTS = ("prefill_tiles", "prefill_tiles_skipped", "decode_tiles", "decode_tiles_skipped",
+               "prefill_qk_bypassed")
 CASE_FIELDS = ("answer", "vqa_score", "pure_vv_tiles", "vv_tiles_bypassed", "answer_changed", *TILE_COUNTS)
 
 
@@ -59,8 +60,8 @@ def resume(report, output, samples, start):
     report["cases"] = cases
 
 
-def accumulate(totals, case):
-    baseline = case["results"]["baseline"]["vqa_score"]
+def accumulate(totals, case, *, reference="baseline"):
+    baseline = case["results"][reference]["vqa_score"]
     for name, result in case["results"].items():
         counts = totals[name]
         counts["vqa_score_sum"] += result["vqa_score"]
@@ -70,19 +71,19 @@ def accumulate(totals, case):
         for key in TILE_COUNTS:
             if key in result:
                 counts[key] += result[key]
-        if name != "baseline":
+        if name != reference:
             counts["answers_changed"] += result["answer_changed"]
             counts["vqa_better"] += result["vqa_score"] > baseline
             counts["vqa_worse"] += result["vqa_score"] < baseline
 
 
-def summarize(totals):
+def summarize(totals, *, reference="baseline"):
     summary = {}
-    baseline = totals["baseline"]["vqa_score_sum"] / totals["baseline"]["answers_scored"]
+    baseline = totals[reference]["vqa_score_sum"] / totals[reference]["answers_scored"]
     for name, totals_for_variant in totals.items():
         score = totals_for_variant["vqa_score_sum"] / totals_for_variant["answers_scored"]
         summary[name] = dict(totals_for_variant, vqa_accuracy=score)
-        if name != "baseline":
+        if name != reference:
             summary[name]["vqa_delta_pp"] = score - baseline
     return summary
 

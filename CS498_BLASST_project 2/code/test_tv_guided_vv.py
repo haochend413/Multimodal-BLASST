@@ -15,7 +15,9 @@ def test_previous_text_votes_bypass_and_reactivate_visual_queries(monkeypatch):
     snapshots = {}
     monkeypatch.setitem(ba.STATE, "tv_guided_vv", policy)
     monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.1))
-    monkeypatch.setitem(ba.STATE, "collect_stats", False)
+    monkeypatch.setitem(ba.STATE, "collect_stats", True)
+    monkeypatch.setitem(ba.STATE, "stats", {})
+    monkeypatch.setitem(ba.STATE, "phase_stats", {})
 
     def observer(layer, q_start, scores, **_):
         snapshots[layer, q_start] = scores.clone()
@@ -45,6 +47,7 @@ def test_previous_text_votes_bypass_and_reactivate_visual_queries(monkeypatch):
     records = policy.layers
     assert [record["vote_layer"] for record in records] == [None, 0, 1]
     assert [record["vv_tiles_bypassed"] for record in records] == [0, 1, 2]
+    assert ba.STATE["phase_stats"]["prefill"]["qk_bypassed"] == 6
     assert [v["decision"] for v in records[1]["votes"]] == ["skip", "keep"]
     assert [v["decision"] for v in records[2]["votes"]] == ["keep", "skip"]
     assert records[0]["votes"][1]["kept"] == records[0]["votes"][1]["eligible"] == 2

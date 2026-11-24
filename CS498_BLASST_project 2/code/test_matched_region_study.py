@@ -9,9 +9,9 @@ from tv_guided_vv import TVGuidedVV
 
 
 def test_fit_reports_an_unreachable_target():
-    result = fit(lambda lam: .1 + .2 * lam, .5, .1, 8, .01)
+    result = fit(lambda lam: 1 - .3 * lam, .5, .7, 8, .01)
     assert result["lambda_"] == 1
-    assert result["measured_skip_rate"] == pytest.approx(.3)
+    assert result["measured_keep_rate"] == pytest.approx(.7)
     assert not result["within_tolerance"]
 
 
@@ -30,7 +30,7 @@ def test_replayed_gate_uses_recorded_query_tiles_instead_of_new_votes():
     assert layer.bypass_keys(1) == []
 
 
-def test_five_policies_preserve_case_gates_and_reuse_calibration(tmp_path):
+def test_four_policies_preserve_case_gates_and_reuse_calibration(tmp_path):
     phases = ("prefill", "decode")
     state = {"phase_stats": {phase: {"causal": 0, "skipped": 0} for phase in phases}}
     calls = []
@@ -52,8 +52,11 @@ def test_five_policies_preserve_case_gates_and_reuse_calibration(tmp_path):
                 continue
             lam = args.lam if phase == "prefill" else args.decode_lambda
             phase_reset = args.prefill_region_max if phase == "prefill" else args.decode_region_max
-            multiplier = 60 if phase_reset else 90
-            count = round(multiplier * lam) + (10 if guided and phase == "prefill" else 0)
+            multiplier = (36 if phase == "prefill" else 45) if phase_reset else 90
+            bypassed = 10 if guided and phase == "prefill" else 0
+            count = round(multiplier * lam) + bypassed
+            stats = state["phase_stats"][phase]
+            stats["qk_bypassed"] = stats.get("qk_bypassed", 0) + bypassed
             state["phase_stats"][phase]["causal"] += 100
             state["phase_stats"][phase]["skipped"] += count
         layers = [{"layer": 0, "votes": []}, {"layer": 1, "votes": [
@@ -64,17 +67,26 @@ def test_five_policies_preserve_case_gates_and_reuse_calibration(tmp_path):
     output = tmp_path / "report.json"
     config = tmp_path / "budget.json"
     args = Namespace(calibration_count=1, tv_vv_threshold=.5, budget_tolerance_pp=2.,
-                     budget_probes=10, output=output, budget_config=config, budget_manifest_sha="fixture",
+                     budget_probes=14, budget_keep_percent=50., gate_lambda=1., output=output, budget_config=config, budget_manifest_sha="fixture",
                      model="test", image_max_pixels=1280, max_tokens=8192, decode_tokens=4, sample_index=0)
     run(args, ArgumentParser(), samples, collect, lambda *_: None, state, 128)
     report = json.loads(output.read_text())
     budget = json.loads(config.read_text())
-    assert budget["lambdas"]["baseline"] == budget["lambdas"]["qk_skip"]
+    assert "baseline" not in report["variants"]
+    assert len(report["variants"]) == 4
+    assert budget["settings"]["requested_keep_rate"] == .5
+    assert budget["common_keep_targets"] == pytest.approx({"prefill": .6, "decode": .55})
     assert budget["lambdas"]["decode_region"]["prefill"] == budget["lambdas"]["qk_skip"]["prefill"]
     assert budget["lambdas"]["both_regions"]["prefill"] == budget["lambdas"]["prefill_region"]["prefill"]
     assert [case["question_id"] for case in report["cases"]] == [1, 2]
-    assert all(report["summary"][name]["vv_tiles_bypassed"] == 2 for name in report["variants"] if name != "baseline")
-    assert abs(report["summary"]["decode_region"]["decode_skip_delta_vs_qk_pp"]) <= 2
+    for result in report["summary"].values():
+        assert result["vv_tiles_bypassed"] == 2
+        assert result["prefill_tiles_after_qk"] == 180
+        assert result["prefill_kept_after_qk"] == 200 - result["prefill_tiles_skipped"]
+        assert result["decode_tiles_after_qk"] == 200
+    assert all(budget["status"] == "within tolerance" for budget in report["evaluation_budget"].values())
+    assert all(call[1] for call in calls)
+    assert sum(call[3] is None for call in calls) == len(samples)
     assert len([call for call in calls if call[0] != "0"]) == 10
     calls.clear()
     run(args, ArgumentParser(), samples, collect, lambda *_: None, state, 128)

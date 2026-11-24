@@ -58,7 +58,17 @@ export function setupTVVVSweep(showView) {
     const official = data.answer_metric === 'VQA v2 consensus';
     const budgets = data.budget_calibration;
     $('budget-note').hidden = !budgets;
-    if (budgets) {
+    const keepTargets = budgets?.common_keep_targets;
+    if (keepTargets) {
+      const requested = (100 * budgets.settings.requested_keep_rate).toFixed(1);
+      const phases = ['prefill', 'decode'].map(phase => {
+        const target = (100 * keepTargets[phase]).toFixed(1);
+        const achieved = data.evaluation_budget?.[phase];
+        const match = achieved ? `, held-out ${achieved.status}` : '';
+        return `${phase} ${target}%${match}`;
+      });
+      $('budget-note').textContent = `Requested ${requested}% kept after QK bypass. Common targets · ${phases.join(' · ')}.`;
+    } else if (budgets) {
       const targets = budgets.qk_skip_targets;
       $('budget-note').textContent = `Calibration targets from QK skip only · prefill ${(100 * targets.prefill).toFixed(1)}% skipped · decode ${(100 * targets.decode).toFixed(1)}% skipped. The table shows held-out skip rates.`;
     }
@@ -66,9 +76,13 @@ export function setupTVVVSweep(showView) {
     $('accuracy-header').textContent = budgets ? 'VQA v2 accuracy · Δ vs QK skip' :
       official ? 'VQA v2 accuracy' : 'Reference exact matches';
     for (const phase of ["prefill", "decode"]) {
-      $(`${phase}-header`).hidden = !maxPhases.includes(phase);
+      const header = $(`${phase}-header`);
+      header.hidden = !maxPhases.includes(phase);
+      const label = phase === 'prefill' ? 'Prefill' : 'Decode';
+      header.textContent = keepTargets ? `${label} kept after QK` : `${label} tiles skipped`;
     }
-    $('status').textContent = `${data.synthetic ? 'Synthetic · ' : ''}${data.pairs_completed ?? data.cases.length}/${data.pairs_requested} cases · BLASST λ = ${data.blasst_lambda}`;
+    const threshold = keepTargets ? `Gate λ = ${budgets.settings.gate_lambda}` : `BLASST λ = ${data.blasst_lambda}`;
+    $('status').textContent = `${data.synthetic ? 'Synthetic · ' : ''}${data.pairs_completed ?? data.cases.length}/${data.pairs_requested} cases · ${threshold}`;
     $('summary').replaceChildren();
     for (const variant of variants) {
       const result = data.summary[variant];
@@ -81,7 +95,10 @@ export function setupTVVVSweep(showView) {
       for (const phase of maxPhases) {
         const policy = data[`${phase}_max_policies`][variant] === 'per_region' ? 'Per region' : 'Shared';
         const lam = budgets ? ` · λ ${Number(budgets.lambdas[variant][phase].toPrecision(4))}` : '';
-        cells.push(`${policy}${lam} · ${fraction(result[`${phase}_tiles_skipped`], result[`${phase}_tiles`])}`);
+        const amount = keepTargets
+          ? fraction(result[`${phase}_kept_after_qk`], result[`${phase}_tiles_after_qk`])
+          : fraction(result[`${phase}_tiles_skipped`], result[`${phase}_tiles`]);
+        cells.push(`${policy}${lam} · ${amount}`);
       }
       row($('summary'), [...cells, accuracy, result.answers_changed]);
     }

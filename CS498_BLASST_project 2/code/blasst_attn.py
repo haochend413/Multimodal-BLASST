@@ -330,6 +330,8 @@ def blasst_attention_forward(
                     phase, {"skipped": 0, "causal": 0})
                 phase_stats["skipped"] += int(sk.sum())
                 phase_stats["causal"] += int(causal.sum()) * B * Hq
+                if bypass:
+                    phase_stats["qk_bypassed"] = phase_stats.get("qk_bypassed", 0) + len(bypass) * B * Hq
             if rec is not None:
                 rec.append(margin.detach().float().cpu())
 

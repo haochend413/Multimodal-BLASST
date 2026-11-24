@@ -155,7 +155,7 @@ BLASST skip decisions and its T→V votes for the next layer. The regular BLASST
 baseline uses a shared max. The prefill and decode switches are independent.
 Use different output paths for the on and off runs to preserve both checkpoints.
 
-#### Five-policy comparison at matched skip rates
+#### Four-policy comparison at matched post-QK keep rates
 
 From `CS498_BLASST_project 2`, select 20 calibration questions followed by
 100 held-out questions:
@@ -164,27 +164,31 @@ From `CS498_BLASST_project 2`, select 20 calibration questions followed by
 python code/attention_study.py \
   --manifest "$HOME/blasst-results/vqav2-1000.json" \
   --matched-region-study --calibration-count 20 --sample-count 100 \
-  --tv-vv-threshold 0.5 --decode-tokens 16 \
-  --budget-config "$HOME/blasst-results/vqav2-matched-region-budget.json" \
-  --output "$HOME/blasst-results/vqav2-matched-region-100.json"
+  --budget-keep-percent 50 --tv-vv-threshold 0.5 --gate-lambda 1 \
+  --decode-tokens 16 \
+  --budget-config "$HOME/blasst-results/vqav2-post-qk-keep50-budget.json" \
+  --output "$HOME/blasst-results/vqav2-post-qk-keep50-100.json"
 ```
 
-The study fits prefill and decode lambdas for a 50% skip target under original
-BLASST, then runs QK skip only at those same lambdas. Its measured prefill and
-decode skip rates become the targets for the three variants with region-local
-maxima in prefill, decode, or both. Each variant replays the QK-skip-only
-policy's gate for the same prompt and checks that its bypass count matches.
-The prefill count includes gated V→V tile skips. Decode counts cover the
-actual generated steps and may have different denominators.
+The four policies use shared running maxima, region-local maxima in prefill,
+region-local maxima in decode, or region-local maxima in both. For every prompt,
+a separate prefill pass records the V→V gate from previous-layer T→V votes at the
+fixed gate lambda. All four policies replay that gate while BLASST uses its
+calibrated thresholds. The keep rate is kept attention head-tiles divided by
+eligible head-tiles minus those bypassed before QK. Decode counts come from each
+policy's generated steps, so the comparison matches rates rather than raw counts.
 
-Calibration probes live generation and saves the closest measured lambda for
-each phase. The config records every probe and whether it reached the requested
-rate within tolerance. Some rates are unreachable at `lambda <= 1`. Tune
-`--budget-probes` or `--budget-tolerance-pp` for a different search budget or
-tolerance. Reuse the budget config with the same calibration window and settings,
-and a fresh output filename for a different evaluation size. The held-out report
-checkpoints and shows achieved skip rates and VQA score differences from QK skip
-only. Load it in Attention Lab under **T→V-guided V→V**.
+Prefill and decode each have a common target across all four policies. If
+a policy still keeps more than requested at `lambda=1`, that phase's target
+is raised to the highest keep rate measured across policies at that endpoint.
+Calibration saves each policy's closest measured lambda, trials, and tolerance
+status. The held-out report shows achieved rates, between-policy spread, and
+VQA score differences from QK skip only. The reported tile counts exclude the
+gate-recording pass. Load the report in Attention Lab under **T→V-guided V→V**.
+
+Use a fresh budget config path for this comparison. The config can then be
+reused with the same calibration settings and a fresh output path for a
+different evaluation size.
 
 #### Full VQA v2 validation
 
