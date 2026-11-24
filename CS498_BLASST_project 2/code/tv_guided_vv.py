@@ -53,15 +53,14 @@ class TVLayer:
             keys = keys[1:]
         return keys
 
-    def observe_text(self, query_tile, scores, cutoff):
+    def observe_text(self, query_tile, row_margins, cutoff):
         text = self.policy.text_rows[query_tile]
         if not text.any() or not self.policy.pure_visual:
             return
-        row_max = scores[:, :, text.to(scores.device), :, :].amax(-1)
-        running = row_max.cummax(-1).values
-        valid = row_max.isfinite()
+        margins = row_margins[:, :, text.to(row_margins.device), :]
+        valid = margins.isfinite()
         eligible = valid.any(-2)
-        vote = (valid & ((row_max - running) >= cutoff)).any(-2)
+        vote = (valid & (margins >= cutoff)).any(-2)
         self.eligible += eligible[0].sum(0)
         self.kept += vote[0].sum(0)
 

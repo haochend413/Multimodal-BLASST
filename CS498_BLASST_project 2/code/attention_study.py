@@ -23,7 +23,7 @@ from tile_layer_study import LayerReport, TileLayerRecorder
 from tile_calibration import add_threshold_arguments, selected_calibration, write_json
 from tv_guided_vv import SWEEP_SCHEMA as TV_VV_SCHEMA, TVGuidedVV
 from vqav2_accuracy import SHORT_ANSWER_INSTRUCTION, score_answer, validate_cases
-from region_max import DecodeRegionMax
+from region_max import RegionMax
 import vqa_shards
 
 if TYPE_CHECKING:
@@ -237,6 +237,8 @@ def main() -> None:
     parser.add_argument("--decode-tokens", type=int, default=16)
     parser.add_argument("--lambda", dest="lam", type=float, default=0)
     parser.add_argument("--decode-lambda", type=float)
+    parser.add_argument("--prefill-region-max", action=argparse.BooleanOptionalAction, default=False,
+                        help="reset the prefill skip-test running max at each text/vision key boundary")
     parser.add_argument("--decode-region-max", action="store_true",
                         help="reset the decode skip-test running max at each text/vision boundary")
     parser.add_argument("--max-tokens", type=int, default=8192)
@@ -289,9 +291,11 @@ def main() -> None:
     requested_sample_count = args.sample_count
     if args.sample_count is None:
         args.sample_count = 1
-    if args.decode_region_max and (args.jl_dim is not None or args.jl_sweep or args.jl_region_audit
-                                   or args.tile_layer_study or args.score_distributions):
-        parser.error("--decode-region-max changes live decode; the other audits use their own running max")
+    if (args.prefill_region_max or args.decode_region_max) and (
+        args.jl_dim is not None or args.jl_sweep or args.jl_region_audit
+        or args.tile_layer_study or args.score_distributions
+    ):
+        parser.error("The live region-max switches cannot be used with audits that compute their own running max")
     if args.vqa_accuracy and not (args.tv_vv_sweep is not None and args.manifest):
         parser.error("--vqa-accuracy requires --tv-vv-sweep and a VQA v2 manifest")
     args.vqa_shard = None
@@ -507,9 +511,9 @@ def _run_tv_vv_sweep(args, parser, samples):
                   blasst_lambda=args.lam, decode_lambda=args.decode_lambda, pairs_requested=len(samples),
                   answer_metric="normalized full-response exact match to any supplied reference",
                   variants=dict(variants), cases=[])
-    region_decode = getattr(args, "decode_region_max", False)
-    if region_decode:
-        report["decode_max_policies"] = {
+    region_phases = [phase for phase in ("prefill", "decode") if getattr(args, f"{phase}_region_max", False)]
+    for phase in region_phases:
+        report[f"{phase}_max_policies"] = {
             name: "shared" if threshold is None else "per_region" for name, threshold in variants
         }
     if args.vqa_accuracy:
@@ -539,21 +543,22 @@ def _run_tv_vv_sweep(args, parser, samples):
         for name, threshold in variants:
             # An ungated vote trace provides the baseline's causal V→V denominator.
             run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold))
-            run.decode_region_max = region_decode and threshold is not None
+            for phase in region_phases:
+                setattr(run, f"{phase}_region_max", threshold is not None)
             if sample:
                 _select_sample(run, parser, sample)
             if args.vqa_accuracy:
                 run.question = f"{benchmark['question_text']}\n{SHORT_ANSWER_INSTRUCTION}"
-            before_decode = ba.STATE["phase_stats"].get("decode", {}).copy() if region_decode else None
+            before = {phase: ba.STATE["phase_stats"].get(phase, {}).copy() for phase in region_phases}
             metadata = collect(run, parser, benchmark, sample_id)
             trace = metadata["tv_guided_vv"]
             answer = metadata.get("answer")
             normalized = _normalized_answer(answer) if answer is not None else None
             result = dict(answer=answer, **trace)
-            if region_decode:
-                after_decode = ba.STATE["phase_stats"].get("decode", {})
-                result["decode_tiles"] = after_decode.get("causal", 0) - before_decode.get("causal", 0)
-                result["decode_tiles_skipped"] = after_decode.get("skipped", 0) - before_decode.get("skipped", 0)
+            for phase in region_phases:
+                after = ba.STATE["phase_stats"].get(phase, {})
+                result[f"{phase}_tiles"] = after.get("causal", 0) - before[phase].get("causal", 0)
+                result[f"{phase}_tiles_skipped"] = after.get("skipped", 0) - before[phase].get("skipped", 0)
             if args.vqa_accuracy:
                 result["vqa_score"] = score_answer(answer, references)
             else:
@@ -573,8 +578,9 @@ def _run_tv_vv_sweep(args, parser, samples):
                 totals[name]["vv_tiles_bypassed"] += trace["vv_tiles_bypassed"]
                 if "answer_changed" in result:
                     totals[name]["answers_changed"] += result["answer_changed"]
-                for key in ("decode_tiles", "decode_tiles_skipped"):
-                    if key in result:
+                for phase in region_phases:
+                    for suffix in ("tiles", "tiles_skipped"):
+                        key = f"{phase}_{suffix}"
                         totals[name][key] += result[key]
         if args.vqa_accuracy:
             vqa_shards.accumulate(totals, case)
@@ -690,7 +696,7 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
     old_observers = ba.STATE["observer"], ba.STATE["qkv_hook"]
     old_prefix = ba.STATE["vv_prefix_visual"]
     old_tv_vv = ba.STATE["tv_guided_vv"]
-    old_decode = ba.STATE["decode_region_max"]
+    old_regions = ba.STATE["prefill_region_max"], ba.STATE["decode_region_max"]
     precision = torch.get_float32_matmul_precision()
     try:
         if args.jl_probe is not None or args.jl_sweep:
@@ -700,14 +706,16 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
         ba.STATE["observer"], ba.STATE["qkv_hook"] = old_observers
         ba.STATE["vv_prefix_visual"] = old_prefix
         ba.STATE["tv_guided_vv"] = old_tv_vv
-        ba.STATE["decode_region_max"] = old_decode
+        ba.STATE["prefill_region_max"], ba.STATE["decode_region_max"] = old_regions
         if args.jl_probe is not None or args.jl_sweep:
             torch.set_float32_matmul_precision(precision)
 
 
 def _attach_study(args, recorder):
-    if args.decode_region_max:
-        ba.STATE["decode_region_max"] = DecodeRegionMax(recorder.visual, ba.TILE)
+    if args.prefill_region_max or args.decode_region_max:
+        regions = RegionMax(recorder.visual, ba.TILE)
+        ba.STATE["prefill_region_max"] = regions if args.prefill_region_max else None
+        ba.STATE["decode_region_max"] = regions if args.decode_region_max else None
     if args.tv_vv_threshold is not None or args.tv_vv_sweep:
         ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold)
         ba.STATE["qkv_hook"] = None
@@ -771,7 +779,7 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
     ba.set_decode_threshold(args.decode_lambda or None, inherit=args.decode_lambda is None)
     ba.STATE["vv_prefix_visual"] = None
     ba.STATE["tv_guided_vv"] = None
-    ba.STATE["decode_region_max"] = None
+    ba.STATE["prefill_region_max"] = ba.STATE["decode_region_max"] = None
     if args.demo:
         sweep = args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions or args.tv_vv_sweep
         torch.manual_seed(98 + args.sample_index if sweep else 98)
@@ -850,6 +858,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         return metadata
     if args.decode_region_max:
         metadata["decode_max_policy"] = "per_region"
+    if args.prefill_region_max:
+        metadata["prefill_max_policy"] = "per_region"
     if (policy := ba.STATE["tv_guided_vv"]) is not None:
         metadata["tv_guided_vv"] = dict(threshold=policy.threshold, layers=policy.layers,
                                         pure_vv_tiles=sum(layer["pure_vv_tiles"] for layer in policy.layers),

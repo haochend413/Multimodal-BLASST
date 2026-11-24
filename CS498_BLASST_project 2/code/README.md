@@ -148,6 +148,13 @@ range in each report. `--sample-index` sets the starting offset, and `--sample-c
 is applied before splitting the range into shards. Omit both flags to shard the
 entire manifest. Use a different output path for a different sample range.
 
+Add `--prefill-region-max` to apply the same region-local skip test during prefill.
+Use `--no-prefill-region-max` or omit the flag for the shared prefill max. In a
+paired sweep, the guided variant uses the requested prefill max for both its
+BLASST skip decisions and its T→V votes for the next layer. The regular BLASST
+baseline uses a shared max. The prefill and decode switches are independent.
+Use different output paths for the on and off runs to preserve both checkpoints.
+
 #### Full VQA v2 validation
 
 The full validation split contains 214,354 questions. The same paired comparison

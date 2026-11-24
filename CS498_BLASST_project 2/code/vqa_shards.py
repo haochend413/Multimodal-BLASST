@@ -10,8 +10,9 @@ from contextlib import contextmanager
 from tile_calibration import write_json
 
 CHECKPOINT_INTERVAL = 25
-CASE_FIELDS = ("answer", "vqa_score", "pure_vv_tiles", "vv_tiles_bypassed", "answer_changed",
-               "decode_tiles", "decode_tiles_skipped")
+MAX_POLICIES = ("prefill_max_policies", "decode_max_policies")
+TILE_COUNTS = ("prefill_tiles", "prefill_tiles_skipped", "decode_tiles", "decode_tiles_skipped")
+CASE_FIELDS = ("answer", "vqa_score", "pure_vv_tiles", "vv_tiles_bypassed", "answer_changed", *TILE_COUNTS)
 
 
 @contextmanager
@@ -46,7 +47,7 @@ def resume(report, output, samples, start):
     saved = json.loads(output.read_text())
     expected = {key: value for key, value in report.items() if key != "cases"}
     if (any(saved.get(key) != value for key, value in expected.items())
-            or saved.get("decode_max_policies") != report.get("decode_max_policies")):
+            or any(saved.get(key) != report.get(key) for key in MAX_POLICIES)):
         raise ValueError("checkpoint settings differ from this run")
     cases = saved["cases"]
     if len(cases) > len(samples) or any(
@@ -66,7 +67,7 @@ def accumulate(totals, case):
         counts["answers_scored"] += 1
         counts["pure_vv_tiles"] += result["pure_vv_tiles"]
         counts["vv_tiles_bypassed"] += result["vv_tiles_bypassed"]
-        for key in ("decode_tiles", "decode_tiles_skipped"):
+        for key in TILE_COUNTS:
             if key in result:
                 counts[key] += result[key]
         if name != "baseline":
@@ -105,8 +106,9 @@ def merge(paths, output):
         if not shard:
             raise ValueError(f"{path} is not a VQA shard report")
         expected_config = {key: report[key] for key in config_keys}
-        if "decode_max_policies" in report:
-            expected_config["decode_max_policies"] = report["decode_max_policies"]
+        for key in MAX_POLICIES:
+            if key in report:
+                expected_config[key] = report[key]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}
         for key in ("selection_start", "selection_count"):
             if key in shard:

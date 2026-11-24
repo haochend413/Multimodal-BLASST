@@ -1,4 +1,4 @@
-"""Running-max reductions shared by live decode and offline region audits."""
+"""Running-max reductions shared by live attention and offline region audits."""
 from __future__ import annotations
 
 from typing import NamedTuple
@@ -68,19 +68,24 @@ def row_max(scores, keys):
     return torch.stack([scores[..., lo:hi].amax(-1) for lo, hi, _ in keys], dim=-1)
 
 
-class DecodeRegionMax:
-    """Cache prompt-local physical tile segments for each decode cache length."""
+class RegionMax:
+    """Cache prompt-local physical tile segments for each key length."""
 
     def __init__(self, visual, tile_size):
         self.visual = visual.cpu().bool()
         self.tile_size = tile_size
         self.segments = {}
 
-    def margins(self, tiles, key_length):
+    def row_margins(self, tiles, key_length):
         if key_length not in self.segments:
             visual = torch.zeros(key_length, dtype=torch.bool)
             visual[:len(self.visual)] = self.visual[:key_length]
             keys = axis_tiles(visual, self.tile_size, packed=False)
             self.segments[key_length] = key_segments(keys, visual)
-        regional = physical_reset_margins(tiles.flatten(-2), tiles.amax(-1), self.segments[key_length])
-        return regional.amax(-2)
+        return physical_reset_margins(tiles.flatten(-2), tiles.amax(-1), self.segments[key_length])
+
+    def margins(self, tiles, key_length):
+        return self.row_margins(tiles, key_length).amax(-2)
+
+
+DecodeRegionMax = RegionMax

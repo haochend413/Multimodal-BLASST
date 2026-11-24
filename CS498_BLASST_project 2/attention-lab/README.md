@@ -66,6 +66,7 @@ Reports collected with `--vqa-accuracy` show the VQA v2 consensus score and the
 percentage-point difference from standard BLASST.
 Combined reports collected with `--decode-region-max` also show each variant’s
 decode max policy and skipped tile count.
+Use `--prefill-region-max` to include the corresponding prefill comparison.
 
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.
 It is explicitly synthetic, not measured Qwen, Video-MME, or accuracy data.

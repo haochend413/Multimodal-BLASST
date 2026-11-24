@@ -55,9 +55,11 @@ export function setupTVVVSweep(showView) {
     const {data} = active();
     const variants = Object.keys(data.variants);
     const official = data.answer_metric === 'VQA v2 consensus';
-    const decode = data.decode_max_policies;
+    const maxPhases = ["prefill", "decode"].filter(phase => data[`${phase}_max_policies`]);
     $('accuracy-header').textContent = official ? 'VQA v2 accuracy' : 'Reference exact matches';
-    $('decode-header').hidden = !decode;
+    for (const phase of ["prefill", "decode"]) {
+      $(`${phase}-header`).hidden = !maxPhases.includes(phase);
+    }
     $('status').textContent = `${data.synthetic ? 'Synthetic · ' : ''}${data.pairs_completed ?? data.cases.length}/${data.pairs_requested} cases · BLASST λ = ${data.blasst_lambda}`;
     $('summary').replaceChildren();
     for (const variant of variants) {
@@ -67,9 +69,9 @@ export function setupTVVVSweep(showView) {
       const accuracy = official ? `${result.vqa_accuracy.toFixed(1)}%${delta}` :
         fraction(result.reference_exact_matches ?? 0, result.answers_scored);
       const cells = [variantLabel(variant), fraction(result.vv_tiles_bypassed, result.pure_vv_tiles)];
-      if (decode) {
-        const policy = decode[variant] === 'per_region' ? 'Per region' : 'Shared';
-        cells.push(`${policy} · ${fraction(result.decode_tiles_skipped, result.decode_tiles)}`);
+      for (const phase of maxPhases) {
+        const policy = data[`${phase}_max_policies`][variant] === 'per_region' ? 'Per region' : 'Shared';
+        cells.push(`${policy} · ${fraction(result[`${phase}_tiles_skipped`], result[`${phase}_tiles`])}`);
       }
       row($('summary'), [...cells, accuracy, result.answers_changed]);
     }

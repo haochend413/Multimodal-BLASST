@@ -74,6 +74,7 @@ STATE: Dict = {
     "decode_enabled": True,
     "decode_lam": None,
     "decode_a": None,
+    "prefill_region_max": None,
     "decode_region_max": None,  # optional prompt-local key-run layout
     "phase_stats": {},
     "observer": None,         # optional synchronous callback; must not retain GPU tensors
@@ -243,6 +244,7 @@ def blasst_attention_forward(
     out = torch.empty_like(query)
     vv_prefix = STATE["vv_prefix_visual"] if phase == "prefill" else None
     policy = STATE["tv_guided_vv"] if phase == "prefill" else None
+    regions = STATE["prefill_region_max"] if phase == "prefill" else STATE["decode_region_max"]
     tv_layer = None
     if policy is not None:
         if B != 1 or Sq != Skv or len(policy.visual) != Skv or layer_idx < 0:
@@ -292,11 +294,12 @@ def blasst_attention_forward(
         if not bypass:
             s = torch.matmul(q32, key32.transpose(-1, -2)) * scaling      # [B, H, r, Skv] fp32
             s_t = score_tiles(s, allowed, mask)
-        decode_regions = STATE["decode_region_max"] if phase == "decode" else None
-        margin = decode_regions.margins(s_t, Skv) if decode_regions is not None else tile_margins(s_t)
+        row_margins = (regions.row_margins(s_t, Skv) if regions is not None
+                       else row_tile_margins(s_t.amax(-1)))
+        margin = row_margins.amax(-2)
         skip = margin < ln_lam                                              # all rows far below running max
         if tv_layer is not None:
-            tv_layer.observe_text(query_tile, s_t, ln_lam)
+            tv_layer.observe_text(query_tile, row_margins, ln_lam)
             if bypass:
                 skip[..., bypass] = True
             if (policy.threshold is not None and tv_layer.previous is not None and query_tile in policy.visual_set
