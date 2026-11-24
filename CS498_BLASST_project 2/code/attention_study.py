@@ -19,6 +19,7 @@ from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy, VISUAL_KEY_QUERY_SP
 from jl_gap_study import JLGapStudy, merge_sweeps
 from jl_region_study import JLRegionStudy, merge_region_audits
 from tile_layer_study import LayerReport, TileLayerRecorder
+from tile_calibration import add_threshold_arguments, selected_calibration
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -75,8 +76,19 @@ class AttentionRecorder:
                 view.setdefault("split_tiles", []).extend(
                     self.projected_study.record_split(head_index, q_start, s, probabilities, visual)
                 )
+            pure_visual_query = (
+                phase == "prefill" and ba.STATE["vv_prefix_visual"] is not None and bool(q_visual.all())
+            )
             if self.score_stream is not None:
                 cols = min(key_length, q_start + rows)
+                if pure_visual_query:
+                    visible_keys = torch.isfinite(s).any(0).nonzero().flatten()
+                    if visible_keys.numel():
+                        last_tile_end = (int(visible_keys[-1]) // ba.TILE + 1) * ba.TILE
+                        wide_cols = min(key_length, last_tile_end)
+                        if wide_cols > cols:
+                            cols = wide_cols
+                            view.setdefault("score_widths", {})[q_start] = cols
                 view.setdefault("score_chunks", {})[q_start] = self.score_stream.tell()
                 self.score_stream.write(s[:, :cols].numpy().astype("<f4", copy=False).tobytes())
             if self.raw_dir:
@@ -226,6 +238,8 @@ def main() -> None:
     parser.add_argument("--raw-dir", type=Path)
     parser.add_argument("--score-data", action="store_true",
                         help="write exact token scores to a browser-readable .scores.bin companion")
+    parser.add_argument("--vv-prefix-attention", action="store_true",
+                        help="use full bidirectional attention in pure V→V prefill tiles")
     parser.add_argument("--jl-dim", type=int, help="audit a JL precheck at this sketch dimension")
     parser.add_argument("--jl-sweep", metavar="DIMS",
                         help="comma-separated JL widths for a paired skip-rate and gap histogram study")
@@ -233,8 +247,7 @@ def main() -> None:
                         help="compare original, modality-packed, and per-key-region max policies")
     parser.add_argument("--tile-layer-study", action="store_true",
                         help="track full-score BLASST decisions on the same physical tile across layers")
-    parser.add_argument("--study-lambda", type=float, default=0.1,
-                        help="offline threshold for the tile layer study")
+    add_threshold_arguments(parser)
     parser.add_argument("--study-max-indices", action="store_true",
                         help="track tile and running-max indices, and replay the first layer's indices")
     parser.add_argument("--jl-epsilon", type=float,
@@ -255,13 +268,16 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int, default=1,
                         help="number of consecutive manifest pairs for a projected-only audit")
     args = parser.parse_args()
+    if args.vv_prefix_attention and (args.jl_dim is not None or args.jl_sweep or args.jl_region_audit):
+        parser.error("JL audits use causal QK reconstruction; omit JL flags with --vv-prefix-attention")
     if args.sample_index < 0:
         parser.error("--sample-index must be nonnegative")
     if args.study_max_indices and not args.tile_layer_study:
         parser.error("--study-max-indices requires --tile-layer-study")
+    calibration = selected_calibration(args, parser)
+    if (calibration or args.study_lambda is not None) and not args.tile_layer_study:
+        parser.error("study thresholds require --tile-layer-study")
     if args.tile_layer_study:
-        if not 0 < args.study_lambda <= 1:
-            parser.error("--study-lambda must be in (0, 1]")
         if (args.jl_sweep or args.jl_region_audit or args.jl_dim is not None or args.lam
                 or args.decode_lambda or args.score_data or args.raw_dir):
             parser.error("--tile-layer-study uses dense attention and its own report; set --study-lambda")
@@ -349,7 +365,7 @@ def main() -> None:
         if not torch.cuda.is_available():
             parser.error("Real model collection requires CUDA; use --demo for CPU verification")
     if args.tile_layer_study:
-        _collect_layer_study(args, parser, samples if args.manifest else [None] * args.sample_count)
+        _collect_layer_study(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
     elif paired_audit:
         merge = merge_region_audits if args.jl_region_audit else merge_sweeps
         _collect_paired_audit(args, parser, samples if args.manifest else [None] * args.sample_count, merge)
@@ -376,7 +392,7 @@ def _add_pair_counts(totals_by_group, groups):
         totals["pairs_with_false_skips"] += int(counts["false_skips"] > 0)
 
 
-def _collect_layer_study(args, parser, samples):
+def _collect_layer_study(args, parser, samples, calibration):
     report = None
     for index, sample in enumerate(samples, start=args.sample_index):
         run = argparse.Namespace(**dict(vars(args), sample_index=index))
@@ -385,10 +401,14 @@ def _collect_layer_study(args, parser, samples):
             _select_sample(run, parser, sample)
             benchmark, sample_id = sample["benchmark"], sample["id"]
         metadata, case = collect(run, parser, benchmark, sample_id)
-        if report is None:
-            report = LayerReport(metadata["model"], metadata["synthetic"], args.study_lambda, ba.TILE,
-                                 track_indices=args.study_max_indices)
-        report.add(case)
+        try:
+            if report is None:
+                report = LayerReport(metadata["model"], metadata["synthetic"], args.study_lambda or 0.1,
+                                     ba.TILE, track_indices=args.study_max_indices, calibration=calibration,
+                                     mask_policy=metadata.get("attention_mask_policy", "causal"))
+            report.add(case)
+        except ValueError as error:
+            parser.error(str(error))
         report.write(args.output, len(samples))
         print(f"Collected layer trajectories for {len(report.cases)}/{len(samples)} cases", flush=True)
     print(f"Wrote the cross-layer report to {args.output}")
@@ -463,6 +483,7 @@ def _collect_batch(args, parser, samples):
 
 def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = None) -> dict:
     old_observers = ba.STATE["observer"], ba.STATE["qkv_hook"]
+    old_prefix = ba.STATE["vv_prefix_visual"]
     precision = torch.get_float32_matmul_precision()
     try:
         if args.jl_probe is not None or args.jl_sweep:
@@ -470,6 +491,7 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
         return _collect(args, parser, benchmark, sample_id, score_stream)
     finally:
         ba.STATE["observer"], ba.STATE["qkv_hook"] = old_observers
+        ba.STATE["vv_prefix_visual"] = old_prefix
         if args.jl_probe is not None or args.jl_sweep:
             torch.set_float32_matmul_precision(precision)
 
@@ -526,6 +548,7 @@ def _load_model(model_name):
 def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) -> dict:
     ba.set_threshold(args.lam or None)
     ba.set_decode_threshold(args.decode_lambda or None, inherit=args.decode_lambda is None)
+    ba.STATE["vv_prefix_visual"] = None
     if args.demo:
         torch.manual_seed(98 + args.sample_index
                           if args.jl_sweep or args.jl_region_audit or args.tile_layer_study else 98)
@@ -537,6 +560,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
             visual[128:512] = True
         recorder = AttentionRecorder(visual, {0, 1, 2}, {0, 1}, args.raw_dir, args.max_tiles,
                                      score_stream)
+        if args.vv_prefix_attention:
+            ba.STATE["vv_prefix_visual"] = visual
         ba.STATE["observer"] = None if args.jl_live else recorder.observe
         jl_study = _attach_study(args, recorder)
         from types import SimpleNamespace
@@ -574,6 +599,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
             raise ValueError("Processor produced no image/video tokens; check the media input")
         recorder = AttentionRecorder(visual, selected_layers, selected_heads,
                                      args.raw_dir, args.max_tiles, score_stream)
+        if args.vv_prefix_attention:
+            ba.STATE["vv_prefix_visual"] = visual.to(inputs.input_ids.device)
         ba.STATE["observer"] = None if args.jl_live else recorder.observe
         jl_study = _attach_study(args, recorder)
         with torch.inference_mode():
@@ -582,6 +609,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         metadata = {"model": args.model, "synthetic": False, "prompt_tokens": length,
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
+    if args.vv_prefix_attention:
+        metadata["attention_mask_policy"] = "vv_prefix"
     if args.tile_layer_study:
         return metadata, jl_study.case(args.sample_index, sample_id)
     if args.jl_sweep or args.jl_region_audit:
@@ -596,6 +625,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
                     score_definition="QK^T / sqrt(head_dim), causal-masked, before softmax",
                     region_definition="query modality → key modality; token pairs, not mixed tile labels",
                     sampling="selected layers and query heads only", tile_size=128)
+    if args.vv_prefix_attention:
+        metadata["score_definition"] = "QK^T / sqrt(head_dim), bidirectional for pure V→V prefill tiles, before softmax"
     if args.jl_live:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps({"schema": "blasst-jl-live-v1", "metadata": metadata},

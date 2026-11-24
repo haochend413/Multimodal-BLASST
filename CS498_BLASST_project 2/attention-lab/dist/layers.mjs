@@ -103,6 +103,8 @@ export function setupLayerStudy(showView) {
   const datasets = [];
   const current = () => datasets[Number($('dataset').value)]?.data;
   const phase = () => current()?.phases[$('phase').value];
+  const threshold = () => current().metadata.calibration?.thresholds[$('phase').value] ?? current().metadata;
+  const keepLabel = counts => `${percent(counts.keep_rate)} keep (${counts.kept}/${counts.tiles} tiles)`;
 
   function renderTile() {
     const data = current();
@@ -122,15 +124,19 @@ export function setupLayerStudy(showView) {
     const tile = choices.get($('tile').value);
     const table = $('timeline');
     table.replaceChildren();
+    const cutoff = threshold().cutoff;
+    const caseKeep = sample.keep_rates?.[$('phase').value]?.[$('group').value];
+    $('case-keep').hidden = !caseKeep;
+    $('case-keep').textContent = caseKeep ? `This case and tile group · ${keepLabel(caseKeep)}` : '';
     $('query-label').hidden = !tile || !data.metadata.row_key_replay;
     $('tile-status').textContent = tile
-      ? `Tile skips when margin < ${data.metadata.cutoff.toFixed(3)}. Token positions and layer numbers start at zero.`
+      ? `Tile skips when margin < ${cutoff.toFixed(3)}. Token positions and layer numbers start at zero.`
       : 'This case has no tiles for the selected phase and group.';
     if (!tile) return;
     row(table.createTHead(), ['Layer', ...sample.layers], 'th');
     const body = table.createTBody();
     const margins = tile[8];
-    const decisions = margins.map(value => value === null ? '—' : value < data.metadata.cutoff ? 'Skip' : 'Keep');
+    const decisions = margins.map(value => value === null ? '—' : value < cutoff ? 'Skip' : 'Keep');
     const decisionRow = row(body, ['Decision', ...decisions]);
     decisions.forEach((decision, index) => decisionRow.cells[index+1].dataset.decision = decision);
     row(body, ['Margin', ...margins.map(logit)]);
@@ -143,7 +149,7 @@ export function setupLayerStudy(showView) {
       row(body, ['Running-max score', ...indices.map(entry => logit(entry?.[4]))]);
       row(body, [`Layer ${sample.layers[0]} replay margin`, ...indices.map(entry => logit(entry?.[5]))]);
       row(body, ['Replay decision', ...indices.map(entry =>
-        entry == null ? '—' : entry[5] < data.metadata.cutoff ? 'Skip' : 'Keep')]);
+        entry == null ? '—' : entry[5] < cutoff ? 'Skip' : 'Keep')]);
     }
     if (data.metadata.row_key_replay && indices) {
       const qStart = tile[3];
@@ -162,13 +168,16 @@ export function setupLayerStudy(showView) {
       row(body, ['Previous-layer row-key replay margin', ...indices.map(entry => logit(entry?.[7]?.[3]))]);
       row(body, ['Previous-layer row-key replay decision', ...indices.map(entry => {
         const margin = entry?.[7]?.[3];
-        return margin == null ? '—' : margin < data.metadata.cutoff ? 'Skip' : 'Keep';
+        return margin == null ? '—' : margin < cutoff ? 'Skip' : 'Keep';
       })]);
     }
   }
 
   function renderPairs() {
     const group = phase()[$('group').value];
+    const keep = current().keep_rates?.[$('phase').value]?.[$('group').value];
+    $('group-keep').hidden = !keep;
+    $('group-keep').textContent = keep ? `Selected tile group · ${keepLabel(keep)}` : '';
     const metric = $('metric').value;
     const rowMetric = isRowMetric(metric);
     const replay = rowMetric || metric === 'false_skip_rate' || metric === 'missed_skip_rate';
@@ -195,6 +204,19 @@ export function setupLayerStudy(showView) {
   }
 
   function renderPhase() {
+    const data = current();
+    const {model, synthetic, calibration} = data.metadata;
+    const cutoff = threshold();
+    const lambda = calibration ? Number(cutoff.lambda.toPrecision(4)) : cutoff.lambda;
+    const mask = data.metadata.attention_mask_policy === 'vv_prefix' ? ' · Bidirectional V→V' : '';
+    $('source').textContent = `${synthetic ? 'Synthetic · ' : ''}${model} · ${data.pairs_completed}/${data.pairs_requested} cases · λ = ${lambda} · full scores on a dense trajectory${mask}`;
+    const keep = data.keep_rates?.[$('phase').value]?.all;
+    $('calibration').hidden = !calibration || !keep;
+    if (calibration && keep) {
+      const overlap = data.calibration_overlap_cases;
+      const minimum = cutoff.target_below_minimum ? ' · Target below the attainable calibration keep rate' : '';
+      $('calibration').textContent = `Target ${calibration.target_keep_percent}% keep · Calibration ${keepLabel(cutoff)} · Evaluation ${keepLabel(keep)}${minimum}${overlap ? ` · ${overlap} evaluation cases also used for calibration` : ''}`;
+    }
     options($('group'), groups.filter(group => phase()[group]), group => labels[group]);
     similarityChart($('chart'), phase(), $('metric').value);
     renderPairs();
@@ -202,8 +224,6 @@ export function setupLayerStudy(showView) {
 
   function renderDataset() {
     const data = current();
-    const {model, synthetic, lambda} = data.metadata;
-    $('source').textContent = `${synthetic ? 'Synthetic · ' : ''}${model} · ${data.pairs_completed}/${data.pairs_requested} cases · λ = ${lambda} · full scores on a dense trajectory`;
     $('content').hidden = false;
     $('index-note').hidden = !data.metadata.max_indices;
     $('row-note').hidden = !data.metadata.row_key_replay;

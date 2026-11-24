@@ -21,6 +21,16 @@ modality pair, and masked positions are labeled in the matrix. The bundled demo 
 token scores. For recorded data, use **Load experiment** to select both the JSON summary and
 its matching `.scores.bin` file. Files can also be selected separately, in either order.
 
+In an expanded tile, open **Running max by key region** and pick a query token.
+The graph follows the shared running max and the reset running max through the
+original key tiles. The table shows the max before and through the selected tile
+and the full visible max of each contiguous text or visual run. Separate text runs
+get separate maxima, including when a physical tile crosses a boundary.
+
+For an export collected with `--vv-prefix-attention`, the tile map includes
+newly visible V→V tiles above the diagonal. The lambda slider applies the standard
+skip rule to every visible tile. Load the score companion to inspect future visual keys.
+
 Open **JL ablation** to see the synthetic dimension sweep or use **Load experiment**
 to open a report collected with `attention_study.py --jl-sweep`. The phase selector
 updates the skip-rate chart and the four modality gap distributions. The dimension
@@ -45,6 +55,8 @@ selector also offers index match rates and replay errors by modality.
 For adjacent-layer per-row key reuse, select **Per-row key match** or **Row-key replay**.
 Choose a query position in the tile timeline to see its actual and inherited key positions
 in each layer.
+Calibrated reports show the saved threshold, target keep rate, and achieved rates
+for the selected phase, tile group, and case.
 See the [cross-layer run guide](../code/README.md#cross-layer-tile-decisions).
 
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.

@@ -7,6 +7,9 @@ import math
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from tile_calibration import (IDENTITY_FIELDS, add_threshold_arguments, calibrate, case_id,
+                              case_keep_counts, selected_calibration, summarize_counts, write_json)
+
 SCHEMA = "blasst-tile-layer-study-v1"
 OUTCOMES = ("keep_keep", "keep_skip", "skip_keep", "skip_skip")
 INDEX_MATCHES = ("same_query", "same_tile_pair", "same_running_pair", "same_all_indices")
@@ -161,10 +164,12 @@ def _axis_kind(start, stop, spans):
 
 
 def recorded_case(data, index, score_file=None):
-    """Import an existing dense Attention Lab export with a standard causal mask."""
+    """Import a dense Attention Lab export with causal or pure V→V bidirectional tiles."""
+    mask_policy = data["metadata"].get("attention_mask_policy", "causal")
     if (data.get("schema") != "blasst-attention-v1"
-            or data["metadata"]["recorded_trajectory"] != "dense"):
-        raise ValueError("Expected a dense blasst-attention-v1 export with per-tile margins")
+            or data["metadata"]["recorded_trajectory"] != "dense"
+            or mask_policy not in ("causal", "vv_prefix")):
+        raise ValueError("Expected a dense blasst-attention-v1 export with a supported mask")
     spans = data["visual_spans"]
     tiles = defaultdict(dict)
     indices = defaultdict(dict) if score_file else None
@@ -173,17 +178,20 @@ def recorded_case(data, index, score_file=None):
         chunks = {}
         for tile in view["tiles"]:
             q, k, rows, cols = (tile[field] for field in ("q", "k", "rows", "cols"))
-            # A causal tile can contain masked lanes even when it has a decision.
-            q_kind = _axis_kind(max(q, k), q + rows, spans)
-            k_kind = _axis_kind(k, min(k + cols, q + rows), spans)
-            group = "mixed" if "mixed" in (q_kind, k_kind) else f"{q_kind}->{k_kind}"
+            if mask_policy == "vv_prefix" and tile["q_visual"] == tile["k_visual"] == 1:
+                group = "V->V"
+            else:
+                # Causal tiles can have masked lanes even when they have a decision.
+                q_kind = _axis_kind(max(q, k), q + rows, spans)
+                k_kind = _axis_kind(k, min(k + cols, q + rows), spans)
+                group = "mixed" if "mixed" in (q_kind, k_kind) else f"{q_kind}->{k_kind}"
             key = (view["phase"], view["step"], view["head"], q, k, rows, cols, group)
             if view["layer"] in tiles[key]:
                 raise ValueError(f"Duplicate tile measurement for {key} at layer {view['layer']}")
             tiles[key][view["layer"]] = tile["margin"]
             if score_file:
                 if q not in chunks:
-                    width = min(view["key_length"], q + rows)
+                    width = view.get("score_widths", {}).get(str(q), min(view["key_length"], q + rows))
                     block = read_score_chunk(score_file, view["score_chunks"][str(q)], rows, width)
                     chunk = (view["phase"], view["step"], view["head"], q)
                     chunks[q] = tracker.capture(chunk, view["layer"], block, data["metadata"]["tile_size"])
@@ -202,11 +210,12 @@ def read_score_chunk(file, offset, rows, width):
     return torch.frombuffer(raw, dtype=torch.float32).reshape(1, rows, width)
 
 
-def layer_pairs(case, cutoff):
+def layer_pairs(case, cutoffs):
     """Compare the same tile, head and decode step at every observed layer pair."""
     by_phase = defaultdict(lambda: defaultdict(lambda: defaultdict(Counter)))
     layers = case["layers"]
     for phase, _step, _head, _q, _k, _rows, _cols, group, margins, *snapshots in case["tiles"]:
+        cutoff = cutoffs[phase]
         winners = snapshots[0] if snapshots else [None] * len(layers)
         decisions = [(layer, value, int(value < cutoff), witness)
                      for layer, value, witness in zip(layers, margins, winners, strict=True) if value is not None]
@@ -281,21 +290,46 @@ def _reliability(values, track_indices):
 
 
 class LayerReport:
-    def __init__(self, model, synthetic, lam, tile_size, *, track_indices=False):
+    def __init__(self, model, synthetic, lam, tile_size, *, track_indices=False,
+                 row_key_replay=True, calibration=None, mask_policy="causal"):
         if not 0 < lam <= 1:
             raise ValueError("Layer study lambda must be in (0, 1]")
         self.metadata = dict(model=model, synthetic=synthetic, tile_size=tile_size,
                              cutoff=math.log(lam), recorded_trajectory="dense", **{"lambda": lam})
+        if mask_policy != "causal":
+            self.metadata["attention_mask_policy"] = mask_policy
+        if calibration:
+            identity = {field: self.metadata[field] for field in IDENTITY_FIELDS}
+            if identity != calibration["metadata"]:
+                raise ValueError("Calibration config and evaluation must match model and tile size")
+            self.metadata["calibration"] = calibration
+            del self.metadata["lambda"], self.metadata["cutoff"]
         if track_indices:
             self.metadata["max_indices"] = ["query", "tile_key", "running_key", "tile_score",
-                                            "running_score", "first_layer_replayed_margin",
-                                            "row_key_offsets_hex", "previous_layer_row_replay"]
-            self.metadata["row_key_replay"] = True
+                                            "running_score", "first_layer_replayed_margin"]
+            if row_key_replay:
+                self.metadata["max_indices"].extend(("row_key_offsets_hex", "previous_layer_row_replay"))
+                self.metadata["row_key_replay"] = True
         self.totals = defaultdict(lambda: defaultdict(lambda: defaultdict(Counter)))
+        self.keep_counts = defaultdict(lambda: defaultdict(Counter))
         self.cases = []
 
     def add(self, case):
-        for phase, groups in layer_pairs(case, self.metadata["cutoff"]).items():
+        calibration = self.metadata.get("calibration")
+        phases = {tile[0] for tile in case["tiles"]}
+        if calibration:
+            if missing := phases - calibration["thresholds"].keys():
+                raise ValueError(f"Calibration config has no threshold for {', '.join(sorted(missing))}")
+            cutoffs = {phase: calibration["thresholds"][phase]["cutoff"] for phase in phases}
+            keep_counts = case_keep_counts(case, cutoffs)
+            for phase, groups in keep_counts.items():
+                for group, counts in groups.items():
+                    self.keep_counts[phase][group].update(counts)
+            case = dict(case, keep_rates=summarize_counts(keep_counts),
+                        used_for_calibration=case_id(case) in calibration["calibration_case_ids"])
+        else:
+            cutoffs = dict.fromkeys(phases, self.metadata["cutoff"])
+        for phase, groups in layer_pairs(case, cutoffs).items():
             for group, pairs in groups.items():
                 for pair, counts in pairs.items():
                     self.totals[phase][group][pair].update(counts)
@@ -319,24 +353,55 @@ class LayerReport:
                 }
         payload = dict(schema=SCHEMA, metadata=self.metadata, pairs_requested=pairs_requested,
                        pairs_completed=len(self.cases), phases=phases, cases=self.cases)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        pending = output.with_suffix(output.suffix + ".tmp")
-        pending.write_text(json.dumps(payload, separators=(",", ":"), allow_nan=False) + "\n")
-        pending.replace(output)
+        if self.keep_counts:
+            payload["keep_rates"] = summarize_counts(self.keep_counts)
+            payload["calibration_overlap_cases"] = sum(case["used_for_calibration"] for case in self.cases)
+        write_json(output, payload)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("inputs", nargs="+", type=Path, help="dense Attention Lab JSON exports")
-    parser.add_argument("--study-lambda", type=float, default=0.1)
+    parser.add_argument("inputs", nargs="+", type=Path, help="dense Attention Lab or cross-layer JSON exports")
+    add_threshold_arguments(parser)
+    parser.add_argument("--calibrate", action="store_true", help="save thresholds for 20, 50 and 80 percent keep")
+    parser.add_argument("--calibration-scope", choices=("phase", "global"), default="phase")
+    parser.add_argument("--sample-index", type=int, default=0, help="first case in a saved cross-layer report")
+    parser.add_argument("--sample-count", type=int, help="number of cases from a saved cross-layer report")
     parser.add_argument("--study-max-indices", action="store_true",
                         help="read matching .scores.bin files to reconstruct max indices")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    calibration = selected_calibration(args, parser)
+    if args.calibrate and (calibration or args.study_lambda is not None or args.study_max_indices):
+        parser.error("--calibrate fits thresholds from saved margins; omit threshold and score flags")
+    lam = args.study_lambda if args.study_lambda is not None else 0.1
     report = None
     for index, path in enumerate(args.inputs):
         data = json.loads(path.read_text())
         metadata = data["metadata"]
+        if data.get("schema") == SCHEMA:
+            if len(args.inputs) != 1 or args.study_max_indices:
+                parser.error("provide one cross-layer report; its optional indices are already saved")
+            end = len(data["cases"]) if args.sample_count is None else args.sample_index + args.sample_count
+            if not 0 <= args.sample_index < end <= len(data["cases"]):
+                parser.error(f"requested range is outside the {len(data['cases'])} saved cases")
+            cases = data["cases"][args.sample_index:end]
+            try:
+                if args.calibrate:
+                    write_json(args.output, calibrate(metadata, cases, args.calibration_scope))
+                    print(f"Calibrated fixed thresholds on {len(cases)} cases and saved {args.output}")
+                    return
+                report = LayerReport(metadata["model"], metadata["synthetic"], lam, metadata["tile_size"],
+                                     track_indices=bool(metadata.get("max_indices")),
+                                     row_key_replay=bool(metadata.get("row_key_replay")), calibration=calibration,
+                                     mask_policy=metadata.get("attention_mask_policy", "causal"))
+                for case in cases:
+                    report.add(case)
+            except ValueError as error:
+                parser.error(str(error))
+            break
+        if args.calibrate or args.sample_index or args.sample_count is not None:
+            parser.error("--calibrate and saved case ranges require a cross-layer report")
         if args.study_max_indices:
             companion = path.with_suffix(".scores.bin")
             reference = data.get("score_file")
@@ -349,14 +414,16 @@ def main():
                 case = recorded_case(data, index, scores)
         else:
             case = recorded_case(data, index)
-        identity = (metadata["model"], metadata["synthetic"], metadata["tile_size"])
+        identity = (metadata["model"], metadata["synthetic"], metadata["tile_size"],
+                    metadata.get("attention_mask_policy", "causal"))
         if report is None:
-            report = LayerReport(identity[0], identity[1], args.study_lambda, identity[2],
-                                 track_indices=args.study_max_indices)
-        elif identity != (report.metadata["model"], report.metadata["synthetic"], report.metadata["tile_size"]):
-            parser.error(f"{path} has a different model or tile size")
+            report = LayerReport(identity[0], identity[1], lam, identity[2],
+                                 track_indices=args.study_max_indices, calibration=calibration, mask_policy=identity[3])
+        elif identity != (report.metadata["model"], report.metadata["synthetic"], report.metadata["tile_size"],
+                          report.metadata.get("attention_mask_policy", "causal")):
+            parser.error(f"{path} has a different model, tile size, or mask policy")
         report.add(case)
-    report.write(args.output, len(args.inputs))
+    report.write(args.output, len(report.cases))
     print(f"Wrote layer study for {len(report.cases)} cases to {args.output}")
 
 

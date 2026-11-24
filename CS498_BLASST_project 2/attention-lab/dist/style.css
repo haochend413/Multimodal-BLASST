@@ -72,3 +72,12 @@
 
 #layers-timeline td[data-decision="Skip"] { background: #fef0dc; color: #8b4314; }
 #layers-timeline td[data-decision="Keep"] { background: #e3f4f0; color: #08685e; }
+
+#running-max-panel { margin: 12px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; }
+#running-max-panel summary { cursor: pointer; font-weight: 650; }
+#running-max-panel .jl-controls { margin: 12px 0 0; }
+.running-max-legend { display: flex; flex-wrap: wrap; gap: 12px; }
+.running-max-legend span::before { content: ""; display: inline-block; width: 18px; margin: 0 6px 3px 0; border-top: 2px solid; }
+.running-max-legend .running-shared::before { border-color: #64748b; border-top-style: dashed; }
+.running-max-legend .running-text::before { border-color: #2459c4; }
+.running-max-legend .running-visual::before { border-color: #08776c; }

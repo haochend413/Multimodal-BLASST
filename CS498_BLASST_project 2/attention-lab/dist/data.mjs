@@ -20,10 +20,11 @@ export function validate(data) {
 export function summary(view, lambda) {
   const sums = Object.values(view.regions);
   const count = sums.reduce((a,s)=>a+s.count,0);
-  return {tiles:view.tiles.length, skipped:view.tiles.filter(t=>t.margin < Math.log(lambda)).length,
+  return {tiles:view.tiles.length, skipped:view.tiles.filter(t=>wouldSkip(t, lambda)).length,
     abs:count ? sums.reduce((a,s)=>a+s.abs_sum,0)/count : 0,
     mass:sums.reduce((a,s)=>a+s.mass,0)};
 }
+export const wouldSkip = (tile, lambda) => tile.margin < Math.log(lambda);
 
 export async function scoreFileId(file) {
   const id = await file.slice(0, 32).text();
@@ -31,17 +32,24 @@ export async function scoreFileId(file) {
   return id;
 }
 
-export async function tileScores(file, reference, view, tile) {
+export async function readScoreChunk(file, reference, view, tile) {
   const offset = view.score_chunks?.[tile.q];
-  const stride = Math.min(view.key_length, tile.q + tile.rows);
+  const stride = view.score_widths?.[tile.q] ?? Math.min(view.key_length, tile.q + tile.rows);
   const {rows, cols} = tile;
   const end = offset + rows * stride * 4;
   if (file.size !== reference.bytes || ![offset, rows, cols, stride, end].every(Number.isSafeInteger) ||
-      offset < 32 || offset % 4 || tile.k + cols > stride || end > file.size) {
+      offset < 32 || offset % 4 || tile.k + cols > stride || stride > view.key_length || end > file.size) {
     throw new Error('Token score data does not match this block.');
   }
   const bytes = new DataView(await file.slice(offset, end).arrayBuffer());
-  return Array.from({length: rows}, (_, row) =>
-    Array.from({length: cols}, (_, col) =>
-      bytes.getFloat32((row * stride + tile.k + col) * 4, true)));
+  const score = (row, key) => bytes.getFloat32((row * stride + key) * 4, true);
+  return {
+    tile: Array.from({length: rows}, (_, row) =>
+      Array.from({length: cols}, (_, col) => score(row, tile.k + col))),
+    row: row => Array.from({length: stride}, (_, key) => score(row, key)),
+  };
+}
+
+export async function tileScores(file, reference, view, tile) {
+  return (await readScoreChunk(file, reference, view, tile)).tile;
 }

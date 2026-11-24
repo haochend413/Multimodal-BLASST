@@ -73,6 +73,7 @@ STATE: Dict = {
     "phase_stats": {},
     "observer": None,         # optional synchronous callback; must not retain GPU tensors
     "qkv_hook": None,         # optional post-RoPE callback returning an output or None
+    "vv_prefix_visual": None, # opt-in prompt mask for bidirectional V→V tiles
     "decode_records": {},    # layer -> list of [B,H,1,key_tiles], one tensor per step
 }
 
@@ -239,6 +240,12 @@ def blasst_attention_forward(
     key32 = key.to(torch.float32)
     kpos = torch.arange(Skv, device=query.device)
     out = torch.empty_like(query)
+    vv_prefix = STATE["vv_prefix_visual"] if phase == "prefill" else None
+    if vv_prefix is not None:
+        if B != 1 or Sq != Skv or vv_prefix.shape != (Skv,):
+            raise ValueError("V→V prefix attention requires one unpadded, uncached prompt")
+        visual = vv_prefix.to(device=query.device, dtype=torch.bool)
+        pure_visual_tiles = F.pad(visual, (0, -Skv % TILE), value=True).reshape(-1, TILE).all(-1)
 
     stats = STATE["stats"].setdefault(layer_idx, {
         "skipped": torch.zeros(Hq, dtype=torch.long), "causal": torch.zeros(Hq, dtype=torch.long)})
@@ -253,6 +260,9 @@ def blasst_attention_forward(
         s = torch.matmul(q32, key32.transpose(-1, -2)) * scaling          # [B, H, r, Skv] fp32
         qpos = torch.arange(r0, r1, device=query.device) + offset
         allowed = kpos[None, :] <= qpos[:, None]                            # [r, Skv] causal
+        if vv_prefix is not None:
+            full_vv = pure_visual_tiles[r0 // TILE] & pure_visual_tiles
+            allowed = allowed | full_vv.repeat_interleave(TILE)[:Skv]
         s_t = score_tiles(s, allowed, mask_chunk(attention_mask, r0, r1, Sq, Skv))
         margin = tile_margins(s_t)
         skip = margin < ln_lam                                              # all rows far below running max
@@ -269,6 +279,9 @@ def blasst_attention_forward(
         if STATE["collect_stats"] or rec is not None:
             k_first = torch.arange(n_kt, device=query.device) * TILE
             causal = (k_first <= (r1 - 1 + offset))                         # [n_kt]
+            if vv_prefix is not None:
+                # The historical stats field includes the newly reachable tiles.
+                causal = causal | full_vv
             if STATE["collect_stats"]:
                 sk = (skip & causal[None, None, :]).sum(dim=(0, 2)).cpu()   # [H]
                 stats["skipped"] += sk

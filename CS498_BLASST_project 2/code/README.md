@@ -44,6 +44,35 @@ The new `attention_study.py`, `prepare_videomme_study.py`, `prepare_vqav2_study.
 and their tests are documented
 in [Attention Lab](../attention-lab/README.md).
 
+### Bidirectional masking for pure V→V tiles
+
+To test bidirectional V→V attention on one manifest case:
+
+```bash
+python attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-30.json" --sample-index 0 \
+  --layers 0,14,27 --heads 0,4 --decode-tokens 2 \
+  --vv-prefix-attention --score-data \
+  --output "$HOME/blasst-results/vqav2-vv-prefix.json"
+```
+
+In prefill, every tile with entirely visual query rows and key columns gets full
+attention scores, including above-diagonal tiles. A tile with mixed
+query rows or mixed key columns stays causal, as do T→T and cross-modal tiles.
+The physical tile grid, token positions, and joint row softmax are preserved.
+The flag applies to all language-model layers and heads. The layer and head options
+select which ones are recorded. Decode uses its usual policy with the resulting cache.
+The default run has live skipping off. Use the Attention Lab lambda slider to
+compare offline skip decisions, or add `--lambda 0.1` to apply BLASST to every
+eligible tile during generation, including pure V→V tiles.
+
+For a causal baseline, repeat the command without `--vv-prefix-attention` and use
+a different output filename. Load the JSON and score companion for each run in
+Attention Lab to compare the masks and inspect individual scores.
+For aggregate decision comparisons across a manifest, use `--vv-prefix-attention`
+with `--tile-layer-study` and the desired sample range in place of `--score-data`.
+The saved calibration config can be used to hold lambda fixed across mask policies.
+
 ### Cross-layer tile decisions
 
 Collect full-score BLASST margins across every language-model layer, using the original
@@ -108,6 +137,36 @@ statistics locally without rerunning the model:
 OMP_NUM_THREADS=1 python tile_layer_study.py ../results/vqav2-image0-question0.json \
   --study-max-indices --output /tmp/blasst-row-key-vqa-pilot.json
 ```
+
+#### Saved keep-rate calibration
+
+From a saved cross-layer report, fit the 20%, 50%, and 80% keep settings once.
+This example uses the first 10 cases for calibration and the remaining 20 for evaluation:
+
+```bash
+python tile_layer_study.py ../results/vqav2-30-row-keys.json \
+  --calibrate --sample-count 10 --output ../results/vqav2-keep-calibration.json
+
+for target in 20 50 80; do
+  python tile_layer_study.py ../results/vqav2-30-row-keys.json \
+    --sample-index 10 --sample-count 20 \
+    --calibration ../results/vqav2-keep-calibration.json --target-keep "$target" \
+    --output "/tmp/vqav2-keep-${target}-eval.json"
+done
+```
+
+Thresholds are fitted separately for prefill and decode, pooling tile margins across
+the calibration cases, layers, and heads in each phase. Use `--calibration-scope global`
+to fit one threshold per target shared by both phases. The saved config includes the
+calibration case IDs, achieved keep counts, and minimum attainable keep rate. Zero-margin
+tiles are kept even at lambda 1, so some target rates cannot be reached. Each evaluation
+reports achieved keep rates overall, by phase and tile group, and per case.
+
+Both commands above work offline with saved margins. To apply the config while collecting
+new cases, pass `--calibration /path/to/vqav2-keep-calibration.json --target-keep 50` to
+`attention_study.py --tile-layer-study` in place of `--study-lambda`. Evaluation
+cases use the saved cutoffs for every layer. Existing row-key replay records, when present,
+are rescored at those cutoffs as well. Load each evaluation JSON in **Cross-layer tiles**.
 
 ### JL precheck for BLASST
 
