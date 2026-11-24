@@ -34,6 +34,12 @@ def test_vqa_selection_and_answer_separation(tmp_path: Path) -> None:
     chosen = select_samples(questions, answers, tmp_path, images=1, questions_per_image=1,
                             seed=98, image_id=42)
     assert chosen[0]["benchmark"]["question_id"] == 420
+    question_sample = dict(images=1, questions_per_image=1, sample_questions=4, seed=98)
+    random_questions = select_samples(questions, answers, tmp_path, **question_sample)
+    assert random_questions == select_samples(questions[::-1], answers[::-1], tmp_path, **question_sample)
+    assert len({sample["benchmark"]["question_id"] for sample in random_questions}) == 4
+    with pytest.raises(ValueError, match="cannot be combined"):
+        select_samples(questions, answers, tmp_path, **question_sample, image_id=42)
     with pytest.raises(ValueError, match="not in VQA"):
         select_samples(questions, answers, tmp_path, images=1, questions_per_image=1,
                        seed=98, image_id=999)

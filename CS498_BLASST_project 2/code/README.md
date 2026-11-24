@@ -190,6 +190,37 @@ Use a fresh budget config path for this comparison. The config can then be
 reused with the same calibration settings and a fresh output path for a
 different evaluation size.
 
+#### Fixed random VQA v2 subset for prefill and decode
+
+Create the manifest once, using a data root accessible on the GPU nodes.
+`--sample-questions` samples question IDs without replacement from the full
+validation split. An image may appear with more than one question. The manifest
+records the seed and the selected IDs, and `--download` retrieves missing images.
+
+```bash
+BLASST_VQA_ROOT="$HOME/vqav2"
+BLASST_VQA_RESULTS="$HOME/blasst-results"
+BLASST_VQA_MANIFEST="$BLASST_VQA_RESULTS/vqav2-random-val-1000-seed20261124.json"
+
+python code/prepare_vqav2_study.py --data-root "$BLASST_VQA_ROOT" \
+  --sample-questions 1000 --seed 20261124 --download \
+  --output "$BLASST_VQA_MANIFEST"
+
+python code/attention_study.py --manifest "$BLASST_VQA_MANIFEST" \
+  --sample-count 1000 --decode-tokens 16 --lambda 0.1 --decode-lambda 0.1 \
+  --tv-vv-top-percent 2 --vqa-accuracy \
+  --output "$BLASST_VQA_RESULTS/vqav2-random1000-prefill-top2-tokens.json"
+
+python code/attention_study.py --manifest "$BLASST_VQA_MANIFEST" \
+  --sample-count 1000 --decode-tokens 16 --lambda 0.1 --decode-lambda 0.1 \
+  --decode-visual-links \
+  --output "$BLASST_VQA_RESULTS/vqav2-random1000-decode-links.json"
+```
+
+Both experiments compare against original BLASST on the same questions.
+The prefill command enables the token gate at 2%. The decode command enables
+live T→T-guided visual selection through the prefill links.
+
 #### Top-k gate accuracy against original BLASST
 
 ```bash

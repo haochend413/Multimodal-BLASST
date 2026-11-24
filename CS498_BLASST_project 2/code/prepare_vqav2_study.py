@@ -55,27 +55,36 @@ def _sha256(path: Path) -> str:
 
 def select_samples(questions: list[dict], annotations: list[dict], root: Path,
                    *, images: int, questions_per_image: int, seed: int,
-                   image_id: int | None = None, all_validation: bool = False) -> list[dict]:
+                   image_id: int | None = None, all_validation: bool = False,
+                   sample_questions: int | None = None) -> list[dict]:
     """Select benchmark questions deterministically, independent of source row ordering."""
-    grouped: dict[int, list[dict]] = {}
-    for question in questions:
-        grouped.setdefault(int(question["image_id"]), []).append(question)
-    candidates = sorted(grouped)
-    random.Random(seed).shuffle(candidates)
-    if image_id is not None:
-        if image_id not in grouped:
-            raise ValueError(f"Image {image_id} is not in VQA v2 validation")
-        if images != 1:
-            raise ValueError("--image-id requires --images 1")
-        candidates = [image_id]
-    if not all_validation and images > len(candidates):
-        raise ValueError(f"Requested {images} images, only {len(candidates)} available")
-    selected_questions = []
-    for selected_id in (candidates if all_validation else candidates[:images]):
-        items = sorted(grouped[selected_id], key=lambda item: int(item["question_id"]))
-        if not all_validation and len(items) < questions_per_image:
-            raise ValueError(f"Image {selected_id} has only {len(items)} questions")
-        selected_questions.extend(items if all_validation else items[:questions_per_image])
+    if sample_questions is not None:
+        if all_validation or image_id is not None or images != 1 or questions_per_image != 1:
+            raise ValueError("Question sampling cannot be combined with image selection or all-validation")
+        if not 1 <= sample_questions <= len(questions):
+            raise ValueError(f"Requested {sample_questions} questions, available range is 1–{len(questions)}")
+        ordered = sorted(questions, key=lambda question: int(question["question_id"]))
+        selected_questions = random.Random(seed).sample(ordered, sample_questions)
+    else:
+        grouped: dict[int, list[dict]] = {}
+        for question in questions:
+            grouped.setdefault(int(question["image_id"]), []).append(question)
+        candidates = sorted(grouped)
+        random.Random(seed).shuffle(candidates)
+        if image_id is not None:
+            if image_id not in grouped:
+                raise ValueError(f"Image {image_id} is not in VQA v2 validation")
+            if images != 1:
+                raise ValueError("--image-id requires --images 1")
+            candidates = [image_id]
+        if not all_validation and images > len(candidates):
+            raise ValueError(f"Requested {images} images, only {len(candidates)} available")
+        selected_questions = []
+        for selected_id in (candidates if all_validation else candidates[:images]):
+            items = sorted(grouped[selected_id], key=lambda item: int(item["question_id"]))
+            if not all_validation and len(items) < questions_per_image:
+                raise ValueError(f"Image {selected_id} has only {len(items)} questions")
+            selected_questions.extend(items if all_validation else items[:questions_per_image])
     wanted = {int(q["question_id"]) for q in selected_questions}
     answers = {int(a["question_id"]): a for a in annotations if int(a["question_id"]) in wanted}
     samples = []
@@ -111,6 +120,8 @@ def main() -> None:
     parser.add_argument("--questions-per-image", type=int, default=1)
     parser.add_argument("--image-id", type=int, help="optional exact COCO validation image ID")
     parser.add_argument("--all-validation", action="store_true", help="use every VQA v2 validation question")
+    parser.add_argument("--sample-questions", type=int,
+                        help="uniformly sample this many validation question IDs without replacement")
     parser.add_argument("--seed", type=int, default=98)
     args = parser.parse_args()
     if args.images < 1 or args.questions_per_image < 1:
@@ -123,9 +134,13 @@ def main() -> None:
         _download(ANSWERS_URL, root / "downloads" / "v2_Annotations_Val_mscoco.zip")
     questions, question_source = _load_json(root, QUESTIONS_FILE, "v2_Questions_Val_mscoco.zip")
     annotations, answer_source = _load_json(root, ANSWERS_FILE, "v2_Annotations_Val_mscoco.zip")
-    samples = select_samples(questions["questions"], annotations["annotations"], root,
-                             images=args.images, questions_per_image=args.questions_per_image,
-                             seed=args.seed, image_id=args.image_id, all_validation=args.all_validation)
+    try:
+        samples = select_samples(questions["questions"], annotations["annotations"], root,
+                                 images=args.images, questions_per_image=args.questions_per_image,
+                                 seed=args.seed, image_id=args.image_id, all_validation=args.all_validation,
+                                 sample_questions=args.sample_questions)
+    except (ValueError, KeyError) as error:
+        parser.error(str(error))
     from PIL import Image
     hashes = {}
     for sample in samples:
@@ -152,6 +167,11 @@ def main() -> None:
                "sources": {"questions_url": QUESTIONS_URL, "annotations_url": ANSWERS_URL,
                            "questions_sha256": _sha256(question_source),
                            "annotations_sha256": _sha256(answer_source)}, "samples": samples}
+    if args.sample_questions is not None:
+        payload["selection_scope"] = "seeded random validation question subset"
+        payload["selection"] = {"method": "uniform_question_sampling_without_replacement",
+                                "seed": args.seed, "population": len(questions["questions"]),
+                                "questions": len(samples)}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w") as stream:
         json.dump(payload, stream, indent=None if args.all_validation else 2, ensure_ascii=False)
