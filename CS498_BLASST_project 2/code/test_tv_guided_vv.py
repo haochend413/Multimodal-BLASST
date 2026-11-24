@@ -77,6 +77,37 @@ def test_empty_vote_and_first_key_protection():
     assert policy.start_layer(1, "cpu").bypass_keys(1) == []
 
 
+def test_top_percent_ranks_previous_votes_with_a_fixed_quota():
+    policy = TVGuidedVV(torch.tensor([False, True, True, True, True, True, True, False]),
+                        1, None, top_percent=50)
+    first = policy.start_layer(0, "cpu")
+    assert first.dropped == set()
+    first.eligible[1:7] = torch.tensor([4, 10, 4, 4, 4, 0])
+    first.kept[1:7] = torch.tensor([3, 6, 3, 4, 1, 0])
+    first.finish()
+    second = policy.start_layer(1, "cpu")
+    assert second.dropped == {2, 5, 6}
+    assert second.bypass_keys(2) == [1, 2]
+    assert second.bypass_keys(3) == []
+
+
+def test_top_percent_selected_rows_still_use_blasst(monkeypatch):
+    monkeypatch.setattr(ba, "TILE", 2)
+    monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.1))
+    monkeypatch.setitem(ba.STATE, "collect_stats", False)
+    policy = TVGuidedVV(torch.tensor([False, False, True, True]), 2, None, top_percent=100)
+    policy.start_layer(0, "cpu").finish()
+    monkeypatch.setitem(ba.STATE, "tv_guided_vv", policy)
+    observed = []
+    monkeypatch.setitem(ba.STATE, "observer", lambda skip, **_: observed.append(skip))
+    query = torch.ones(1, 1, 4, 1)
+    key = torch.tensor([10., 10., 0., 0.]).view_as(query)
+    ba.blasst_attention_forward(SimpleNamespace(layer_idx=1), query, key, query, None, scaling=1.)
+    assert observed[1][0, 0, 1].item()
+    assert policy.layers[1]["votes"][0]["decision"] == "keep"
+    assert policy.layers[1]["vv_tiles_bypassed"] == 0
+
+
 def test_counting_votes_leaves_the_baseline_unchanged(monkeypatch):
     monkeypatch.setattr(ba, "TILE", 2)
     monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.5))

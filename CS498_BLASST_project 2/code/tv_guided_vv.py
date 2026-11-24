@@ -1,6 +1,8 @@
 """Previous-layer text votes for the causal V→V query-tile policy."""
 from __future__ import annotations
 
+import math
+
 import torch
 
 
@@ -10,16 +12,21 @@ SWEEP_SCHEMA = "blasst-tv-guided-vv-v1"
 class TVGuidedVV:
     """Own the votes for one prompt so each layer reads only its predecessor."""
 
-    def __init__(self, visual, tile_size, threshold, *, replay=None):
+    def __init__(self, visual, tile_size, threshold, *, replay=None, top_percent=None):
         self.visual = visual.cpu().bool()
         self.tile_size = tile_size
         self.threshold = threshold
+        self.top_percent = top_percent
         self.replay = replay
         self.text_rows = [~tile for tile in self.visual.split(tile_size)]
         self.pure_visual = [index for index, text in enumerate(self.text_rows) if not text.any()]
         self.visual_set = set(self.pure_visual)
         self.previous = None
         self.layers = []
+
+    @property
+    def enabled(self):
+        return self.threshold is not None or self.top_percent is not None
 
     def start_layer(self, layer, device):
         if layer == 0:
@@ -57,7 +64,9 @@ class TVGuidedVV:
                 for key in self.pure_visual[end - count:end]:
                     q_len = tile_lengths[query]
                     bypassed += q_len * (q_len + 1) // 2 if query == key else q_len * tile_lengths[key]
-            layers.append(dict(layer=layer["layer"], vv_pairs_bypassed=bypassed))
+            layers.append(dict(layer=layer["layer"], vv_pairs_bypassed=bypassed,
+                               visual_query_tiles=len(layer["votes"]),
+                               visual_query_tiles_selected=sum(vote["decision"] != "skip" for vote in layer["votes"])))
 
         before = {region: count * len(layers) for region, count in causal.items()}
         after = dict(before, VV=before["VV"] - sum(layer["vv_pairs_bypassed"] for layer in layers))
@@ -81,6 +90,13 @@ class TVLayer:
             self.dropped = set(policy.replay[layer])
             if not self.dropped <= policy.visual_set or (previous is None and self.dropped):
                 raise ValueError(f"Invalid V→V gate replay for layer {layer}")
+        elif previous is not None and policy.top_percent is not None:
+            quota = math.ceil(len(policy.pure_visual) * policy.top_percent / 100)
+            ranked = sorted(previous["votes"], key=lambda vote: (
+                -(vote["kept"] / vote["eligible"]) if vote["eligible"] else math.inf,
+                vote["tile"],
+            ))
+            self.dropped = {vote["tile"] for vote in ranked[quota:]}
         elif previous is not None and policy.threshold is not None:
             self.dropped = {vote["tile"] for vote in previous["votes"]
                             if vote["eligible"] and vote["kept"] / vote["eligible"] < policy.threshold}
@@ -112,7 +128,7 @@ class TVLayer:
         votes = []
         for index in self.policy.pure_visual:
             prior = previous_votes.get(index)
-            if self.policy.threshold is None:
+            if not self.policy.enabled:
                 decision = "baseline"
             elif self.previous is None:
                 decision = "warmup"

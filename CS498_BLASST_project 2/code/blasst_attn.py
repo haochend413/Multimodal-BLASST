@@ -302,7 +302,8 @@ def blasst_attention_forward(
             tv_layer.observe_text(query_tile, row_margins, ln_lam)
             if bypass:
                 skip[..., bypass] = True
-            if (policy.threshold is not None and tv_layer.previous is not None and query_tile in policy.visual_set
+            if (policy.threshold is not None and policy.top_percent is None and tv_layer.previous is not None
+                    and query_tile in policy.visual_set
                     and query_tile not in tv_layer.dropped):
                 # An accepted visual query keeps all causally visible pure V→V tiles.
                 skip[..., [index for index in policy.pure_visual if index <= query_tile]] = False

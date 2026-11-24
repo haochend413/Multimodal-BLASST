@@ -210,6 +210,14 @@ token pairs by query and key modality, summed over layers and counted once
 across heads. The post-gate counts exclude the actual bypasses before QK and
 include pairs in mixed tiles. They precede BLASST's score-based skipping.
 
+For a percentage quota, replace `--tv-vv-threshold 0.5` with
+`--tv-vv-top-percent 50` in this audit or the matched study. Each prefill layer
+after layer 0 ranks pure visual query tiles by the previous layer's T→V keep
+fraction and selects the requested percentage, rounded up. Earlier tiles win
+ties, and tiles without eligible votes rank last. Selected rows use standard
+BLASST for their V→V tiles. The audit records the selected query-tile count
+per layer. Use new output and budget-config paths when changing gate policies.
+
 #### Full VQA v2 validation
 
 The full validation split contains 214,354 questions. The same paired comparison

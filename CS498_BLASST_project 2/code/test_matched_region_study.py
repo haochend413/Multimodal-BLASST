@@ -30,7 +30,8 @@ def test_replayed_gate_uses_recorded_query_tiles_instead_of_new_votes():
     assert layer.bypass_keys(1) == []
 
 
-def test_four_policies_preserve_case_gates_and_reuse_calibration(tmp_path):
+@pytest.mark.parametrize("top_percent", [None, 50.])
+def test_four_policies_preserve_case_gates_and_reuse_calibration(tmp_path, top_percent):
     phases = ("prefill", "decode")
     state = {"phase_stats": {phase: {"causal": 0, "skipped": 0} for phase in phases}}
     calls = []
@@ -41,7 +42,8 @@ def test_four_policies_preserve_case_gates_and_reuse_calibration(tmp_path):
     ]
 
     def collect(args, _parser, _benchmark, sample_id):
-        guided = args.tv_vv_threshold is not None
+        guided = args.tv_vv_threshold is not None or args.tv_vv_top_percent is not None
+        assert args.tv_vv_top_percent == top_percent
         reset = args.prefill_region_max or args.decode_region_max
         calls.append((sample_id, guided, reset, args.gate_replay))
         dropped = [1] if guided else []
@@ -66,7 +68,8 @@ def test_four_policies_preserve_case_gates_and_reuse_calibration(tmp_path):
 
     output = tmp_path / "report.json"
     config = tmp_path / "budget.json"
-    args = Namespace(calibration_count=1, tv_vv_threshold=.5, budget_tolerance_pp=2.,
+    args = Namespace(calibration_count=1, tv_vv_threshold=.5 if top_percent is None else None,
+                     tv_vv_top_percent=top_percent, budget_tolerance_pp=2.,
                      budget_probes=14, budget_keep_percent=50., gate_lambda=1., output=output, budget_config=config, budget_manifest_sha="fixture",
                      model="test", image_max_pixels=1280, max_tokens=8192, decode_tokens=4, sample_index=0)
     run(args, ArgumentParser(), samples, collect, lambda *_: None, state, 128)
@@ -75,6 +78,7 @@ def test_four_policies_preserve_case_gates_and_reuse_calibration(tmp_path):
     assert "baseline" not in report["variants"]
     assert len(report["variants"]) == 4
     assert budget["settings"]["requested_keep_rate"] == .5
+    assert budget["settings"].get("gate_top_percent") == top_percent
     assert budget["common_keep_targets"] == pytest.approx({"prefill": .6, "decode": .55})
     assert budget["lambdas"]["decode_region"]["prefill"] == budget["lambdas"]["qk_skip"]["prefill"]
     assert budget["lambdas"]["both_regions"]["prefill"] == budget["lambdas"]["prefill_region"]["prefill"]

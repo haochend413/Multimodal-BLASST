@@ -252,6 +252,8 @@ def main() -> None:
     tv_vv = parser.add_mutually_exclusive_group()
     tv_vv.add_argument("--tv-vv-threshold", type=float,
                        help="gate causal V→V query tiles using the preceding layer's T→V keep fraction")
+    tv_vv.add_argument("--tv-vv-top-percent", type=float, metavar="PERCENT",
+                       help="select the top percentage of visual query tiles by previous-layer T→V votes")
     tv_vv.add_argument("--tv-vv-sweep", metavar="FRACTIONS",
                        help="compare standard BLASST and comma-separated T→V relevance thresholds")
     parser.add_argument("--vqa-accuracy", action="store_true",
@@ -332,7 +334,9 @@ def main() -> None:
     tv_vv_thresholds = args.tv_vv_sweep or (
         [args.tv_vv_threshold] if args.tv_vv_threshold is not None else []
     )
-    if tv_vv_thresholds:
+    if args.tv_vv_top_percent is not None and not 0 <= args.tv_vv_top_percent <= 100:
+        parser.error("--tv-vv-top-percent must be in [0, 100]")
+    if tv_vv_thresholds or args.tv_vv_top_percent is not None:
         if any(not 0 <= threshold <= 1 for threshold in tv_vv_thresholds):
             parser.error("T→V relevance thresholds must be in [0, 1]")
         if (args.vv_prefix_attention or args.jl_dim is not None or args.jl_sweep
@@ -749,9 +753,11 @@ def _attach_study(args, recorder):
         regions = RegionMax(recorder.visual, ba.TILE)
         ba.STATE["prefill_region_max"] = regions if args.prefill_region_max else None
         ba.STATE["decode_region_max"] = regions if args.decode_region_max else None
-    if args.tv_vv_threshold is not None or args.tv_vv_sweep or args.matched_region_study or args.gate_distribution:
+    top_percent = getattr(args, "tv_vv_top_percent", None)
+    if (args.tv_vv_threshold is not None or top_percent is not None
+            or args.tv_vv_sweep or args.matched_region_study or args.gate_distribution):
         ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold,
-                                            replay=getattr(args, "gate_replay", None))
+                                            replay=getattr(args, "gate_replay", None), top_percent=top_percent)
         ba.STATE["qkv_hook"] = None
         if args.tv_vv_sweep or args.matched_region_study or args.gate_distribution:
             ba.STATE["observer"] = None
@@ -819,7 +825,7 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         torch.manual_seed(98 + args.sample_index if sweep else 98)
         length = 640
         visual = torch.zeros(length, dtype=torch.bool)
-        tv_demo = args.tv_vv_sweep or args.tv_vv_threshold is not None
+        tv_demo = args.tv_vv_sweep or args.tv_vv_threshold is not None or args.tv_vv_top_percent is not None
         if args.jl_region_audit:
             visual[15:544] = True
         elif tv_demo:
@@ -898,6 +904,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         metadata["tv_guided_vv"] = dict(threshold=policy.threshold, layers=policy.layers,
                                         pure_vv_tiles=sum(layer["pure_vv_tiles"] for layer in policy.layers),
                                         vv_tiles_bypassed=sum(layer["vv_tiles_bypassed"] for layer in policy.layers))
+        if policy.top_percent is not None:
+            metadata["tv_guided_vv"]["top_percent"] = policy.top_percent
         if args.gate_distribution:
             metadata["gate_distribution"] = policy.distribution()
         if args.tv_vv_sweep or args.matched_region_study or args.gate_distribution:

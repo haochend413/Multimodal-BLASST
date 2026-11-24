@@ -82,13 +82,16 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
     if getattr(args, "gate_distribution", False):
         return run_gate_distribution(args, parser, samples, collect, select_sample, tile_size)
     calibration, evaluation = samples[:args.calibration_count], samples[args.calibration_count:]
-    threshold = args.tv_vv_threshold if args.tv_vv_threshold is not None else .5
+    top_percent = getattr(args, "tv_vv_top_percent", None)
+    threshold = args.tv_vv_threshold if top_percent is not None or args.tv_vv_threshold is not None else .5
     settings = dict(model=args.model, manifest_sha256=args.budget_manifest_sha, tile_size=tile_size,
                     calibration_ids=[sample["id"] for sample in calibration],
                     gate_threshold=threshold, gate_lambda=args.gate_lambda,
                     requested_keep_rate=args.budget_keep_percent / 100, decode_tokens=args.decode_tokens,
                     image_max_pixels=args.image_max_pixels, max_prompt_tokens=args.max_tokens,
                     probes=args.budget_probes, tolerance_pp=args.budget_tolerance_pp)
+    if top_percent is not None:
+        settings["gate_top_percent"] = top_percent
     config_path = args.budget_config or args.output.with_suffix(".budget.json")
     if config_path.resolve() == args.output.resolve():
         raise ValueError("Use separate output and budget-config files")
@@ -149,7 +152,8 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
     report = dict(schema=SWEEP_SCHEMA, model=args.model, synthetic=False, tile_size=tile_size,
                   blasst_lambda=config["lambdas"][REFERENCE]["prefill"],
                   decode_lambda=config["lambdas"][REFERENCE]["decode"], pairs_requested=len(evaluation),
-                  answer_metric="VQA v2 consensus", variants=dict.fromkeys(POLICIES, threshold),
+                  answer_metric="VQA v2 consensus",
+                  variants=dict.fromkeys(POLICIES, threshold if top_percent is None else top_percent),
                   variant_labels=LABELS, budget_calibration=config, cases=[],
                   answer_protocol=dict(instruction=SHORT_ANSWER_INSTRUCTION, max_new_tokens=args.decode_tokens,
                                        min_new_tokens=0))
@@ -203,7 +207,8 @@ def check_gate(result, reference, expected_gate, observed_gate):
 
 
 def run_gate_distribution(args, parser, samples, collect, select_sample, tile_size):
-    threshold = args.tv_vv_threshold if args.tv_vv_threshold is not None else .5
+    top_percent = args.tv_vv_top_percent
+    threshold = args.tv_vv_threshold if top_percent is not None or args.tv_vv_threshold is not None else .5
     cases = []
     totals = {field: defaultdict(int) for field in ("prompt_tokens", "pairs_before", "pairs_after")}
     for sample in samples:
@@ -221,7 +226,7 @@ def run_gate_distribution(args, parser, samples, collect, select_sample, tile_si
             print(f"Measured V→V QK distribution on {len(cases)}/{len(samples)} questions", flush=True)
     write_json(args.output, dict(schema="blasst-gate-distribution-v1", model=args.model, tile_size=tile_size,
                                  gate_lambda=args.gate_lambda, gate_threshold=threshold,
-                                 totals=totals, cases=cases))
+                                 gate_top_percent=top_percent, totals=totals, cases=cases))
     print(f"Wrote V→V QK distribution to {args.output}", flush=True)
 
 
