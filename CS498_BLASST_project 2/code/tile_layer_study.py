@@ -168,7 +168,8 @@ def recorded_case(data, index, score_file=None):
     mask_policy = data["metadata"].get("attention_mask_policy", "causal")
     if (data.get("schema") != "blasst-attention-v1"
             or data["metadata"]["recorded_trajectory"] != "dense"
-            or mask_policy not in ("causal", "vv_prefix")):
+            or mask_policy not in ("causal", "vv_prefix")
+            or data["metadata"].get("decode_max_policy", "shared") != "shared"):
         raise ValueError("Expected a dense blasst-attention-v1 export with a supported mask")
     spans = data["visual_spans"]
     tiles = defaultdict(dict)

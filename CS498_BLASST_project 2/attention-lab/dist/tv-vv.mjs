@@ -55,7 +55,9 @@ export function setupTVVVSweep(showView) {
     const {data} = active();
     const variants = Object.keys(data.variants);
     const official = data.answer_metric === 'VQA v2 consensus';
+    const decode = data.decode_max_policies;
     $('accuracy-header').textContent = official ? 'VQA v2 accuracy' : 'Reference exact matches';
+    $('decode-header').hidden = !decode;
     $('status').textContent = `${data.synthetic ? 'Synthetic · ' : ''}${data.pairs_completed ?? data.cases.length}/${data.pairs_requested} cases · BLASST λ = ${data.blasst_lambda}`;
     $('summary').replaceChildren();
     for (const variant of variants) {
@@ -64,8 +66,12 @@ export function setupTVVVSweep(showView) {
         ` (${result.vqa_delta_pp >= 0 ? '+' : ''}${result.vqa_delta_pp.toFixed(1)} pp)`;
       const accuracy = official ? `${result.vqa_accuracy.toFixed(1)}%${delta}` :
         fraction(result.reference_exact_matches ?? 0, result.answers_scored);
-      row($('summary'), [variantLabel(variant), fraction(result.vv_tiles_bypassed, result.pure_vv_tiles),
-        accuracy, result.answers_changed]);
+      const cells = [variantLabel(variant), fraction(result.vv_tiles_bypassed, result.pure_vv_tiles)];
+      if (decode) {
+        const policy = decode[variant] === 'per_region' ? 'Per region' : 'Shared';
+        cells.push(`${policy} · ${fraction(result.decode_tiles_skipped, result.decode_tiles)}`);
+      }
+      row($('summary'), [...cells, accuracy, result.answers_changed]);
     }
     $('content').hidden = false;
     $('case-detail').hidden = !data.cases.length;

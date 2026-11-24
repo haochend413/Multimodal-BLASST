@@ -18,6 +18,8 @@ What it does (prefill, i.e. more than one query token):
 
 Decode uses 1 x 128 tiles over the cached keys, with the same skip rule.
 set_decode_threshold(enabled=False) restores the original dense decode path.
+With decode_region_max configured, each contiguous key run supplies its own
+running max for the skip test. The retained tiles share one softmax.
 
 The skip decision is "simulated": QK^T is still computed for every tile, which
 is also true of the real BLASST kernel; here the softmax/PV work is not actually
@@ -53,6 +55,8 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
+from region_max import row_tile_margins
+
 TILE = 128
 NEG_INF = float("-inf")
 
@@ -70,6 +74,7 @@ STATE: Dict = {
     "decode_enabled": True,
     "decode_lam": None,
     "decode_a": None,
+    "decode_region_max": None,  # optional prompt-local key-run layout
     "phase_stats": {},
     "observer": None,         # optional synchronous callback; must not retain GPU tensors
     "qkv_hook": None,         # optional post-RoPE callback returning an output or None
@@ -168,11 +173,6 @@ def score_tiles(scores, allowed, mask=None):
 def tile_margins(tiles):
     """Reduce each tile against its own row-wise running maximum."""
     return row_tile_margins(tiles.amax(dim=-1)).amax(dim=-2)
-
-
-def row_tile_margins(tile_max):
-    running = torch.cummax(tile_max, dim=-1).values
-    return torch.where(torch.isfinite(running), tile_max - running, NEG_INF)
 
 
 def mask_chunk(mask, start, end, query_len, key_len):
@@ -292,7 +292,8 @@ def blasst_attention_forward(
         if not bypass:
             s = torch.matmul(q32, key32.transpose(-1, -2)) * scaling      # [B, H, r, Skv] fp32
             s_t = score_tiles(s, allowed, mask)
-        margin = tile_margins(s_t)
+        decode_regions = STATE["decode_region_max"] if phase == "decode" else None
+        margin = decode_regions.margins(s_t, Skv) if decode_regions is not None else tile_margins(s_t)
         skip = margin < ln_lam                                              # all rows far below running max
         if tv_layer is not None:
             tv_layer.observe_text(query_tile, s_t, ln_lam)

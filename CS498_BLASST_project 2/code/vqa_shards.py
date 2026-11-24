@@ -10,7 +10,8 @@ from contextlib import contextmanager
 from tile_calibration import write_json
 
 CHECKPOINT_INTERVAL = 25
-CASE_FIELDS = ("answer", "vqa_score", "pure_vv_tiles", "vv_tiles_bypassed", "answer_changed")
+CASE_FIELDS = ("answer", "vqa_score", "pure_vv_tiles", "vv_tiles_bypassed", "answer_changed",
+               "decode_tiles", "decode_tiles_skipped")
 
 
 @contextmanager
@@ -35,7 +36,8 @@ def resume(report, output, samples, start):
         return
     saved = json.loads(output.read_text())
     expected = {key: value for key, value in report.items() if key != "cases"}
-    if any(saved.get(key) != value for key, value in expected.items()):
+    if (any(saved.get(key) != value for key, value in expected.items())
+            or saved.get("decode_max_policies") != report.get("decode_max_policies")):
         raise ValueError("checkpoint settings differ from this run")
     cases = saved["cases"]
     if len(cases) > len(samples) or any(
@@ -55,6 +57,9 @@ def accumulate(totals, case):
         counts["answers_scored"] += 1
         counts["pure_vv_tiles"] += result["pure_vv_tiles"]
         counts["vv_tiles_bypassed"] += result["vv_tiles_bypassed"]
+        for key in ("decode_tiles", "decode_tiles_skipped"):
+            if key in result:
+                counts[key] += result[key]
         if name != "baseline":
             counts["answers_changed"] += result["answer_changed"]
             counts["vqa_better"] += result["vqa_score"] > baseline
@@ -91,6 +96,8 @@ def merge(paths, output):
         if not shard:
             raise ValueError(f"{path} is not a VQA shard report")
         expected_config = {key: report[key] for key in config_keys}
+        if "decode_max_policies" in report:
+            expected_config["decode_max_policies"] = report["decode_max_policies"]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}
         if config is None:
             config, manifest = expected_config, expected_manifest

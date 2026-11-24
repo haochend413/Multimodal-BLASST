@@ -64,6 +64,8 @@ Choose a case, threshold, and layer to compare the preceding layer's relevance w
 current layer's votes and see which V→V query tiles bypassed QK.
 Reports collected with `--vqa-accuracy` show the VQA v2 consensus score and the
 percentage-point difference from standard BLASST.
+Combined reports collected with `--decode-region-max` also show each variant’s
+decode max policy and skipped tile count.
 
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.
 It is explicitly synthetic, not measured Qwen, Video-MME, or accuracy data.

@@ -4,12 +4,12 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from copy import deepcopy
-from typing import NamedTuple
 
 import torch
 
 import blasst_attn as ba
 from jl_gap_study import TILE_GROUPS, nested_basis
+from region_max import Span, axis_tiles, key_segments, physical_reset_margins, region_margins, row_max
 
 SCHEMA = "blasst-jl-region-audit-v1"
 METRICS = (
@@ -19,59 +19,6 @@ METRICS = (
     "full_skipped_dense_weight", "projected_skipped_dense_weight", "false_skip_dense_weight",
     "missed_skip_dense_weight",
 )
-
-
-class Span(NamedTuple):
-    start: int
-    end: int
-    region: int
-
-
-def axis_tiles(visual, size, *, packed):
-    """Start each contiguous modality run at a tile boundary, padding only its tail."""
-    end = len(visual)
-    starts = [0]
-    if packed:
-        starts.extend((visual[1:] != visual[:-1]).nonzero().flatten().add(1).tolist())
-    return [Span(start, min(start + size, hi), region)
-            for region, (lo, hi) in enumerate(zip(starts, [*starts[1:], end]))
-            for start in range(lo, hi, size)]
-
-
-def region_margins(tile_max, keys):
-    """Reset at contiguous key-run transitions; the first valid tile establishes the bar."""
-    cuts = [0, *(i for i in range(1, len(keys)) if keys[i - 1].region != keys[i].region), len(keys)]
-    return torch.cat([ba.row_tile_margins(tile_max[..., lo:hi])
-                      for lo, hi in zip(cuts, cuts[1:])], dim=-1)
-
-
-def key_segments(physical_tiles, visual):
-    """Find contiguous modality spans inside each physical key tile."""
-    runs = iter(axis_tiles(visual, len(visual), packed=True))
-    run = next(runs)
-    groups = []
-    for lo, hi, _ in physical_tiles:
-        segments = []
-        while lo < hi:
-            if lo == run.end:
-                run = next(runs)
-            end = min(hi, run.end)
-            segments.append(Span(lo, end, run.region))
-            lo = end
-        groups.append(segments)
-    return groups
-
-
-def physical_reset_margins(scores, tile_max, segments_by_tile):
-    """Reduce regional margins to one margin per row and physical tile."""
-    segments, segment_maxima, stops = [], [], [0]
-    for index, group in enumerate(segments_by_tile):
-        segments.extend(group)
-        segment_maxima.append(tile_max[..., index:index + 1] if len(group) == 1 else _row_max(scores, group))
-        stops.append(len(segments))
-    margins = region_margins(torch.cat(segment_maxima, dim=-1), segments)
-    # Every visible segment must pass the test for the physical tile to skip.
-    return torch.stack([margins[..., lo:hi].amax(-1) for lo, hi in zip(stops, stops[1:])], dim=-1)
 
 
 def _tile_geometry(scores, probabilities, q_visual, key_visual, keys):
@@ -155,7 +102,7 @@ class JLRegionStudy:
                 jl = _mask_scores(jl, allowed, mask)
                 probabilities = torch.softmax(exact, dim=-1).nan_to_num()
                 geometry = _tile_geometry(exact, probabilities, q_visual[start:end], k_visual, active_keys)
-                exact_max, jl_max = (_row_max(scores, active_keys) for scores in (exact, jl))
+                exact_max, jl_max = (row_max(scores, active_keys) for scores in (exact, jl))
                 shared_full = ba.row_tile_margins(exact_max)
                 shared_jl = ba.row_tile_margins(jl_max)
                 layout = "packed" if packed else "original"
@@ -202,10 +149,6 @@ def _mask_scores(scores, allowed, mask):
         return scores
     mask = mask[0]
     return scores.masked_fill(~mask, -torch.inf) if mask.dtype == torch.bool else scores + mask.float()
-
-
-def _row_max(scores, keys):
-    return torch.stack([scores[..., lo:hi].amax(-1) for lo, hi, _ in keys], dim=-1)
 
 
 def merge_region_audits(total, sample):
