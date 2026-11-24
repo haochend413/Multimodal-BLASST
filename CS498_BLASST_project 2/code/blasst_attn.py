@@ -81,6 +81,7 @@ STATE: Dict = {
     "qkv_hook": None,         # optional post-RoPE callback returning an output or None
     "vv_prefix_visual": None, # opt-in prompt mask for bidirectional V→V tiles
     "tv_guided_vv": None,    # prompt-local previous-layer text vote policy
+    "decode_visual_links": None,  # prompt-local prefill text-to-vision links
     "decode_records": {},    # layer -> list of [B,H,1,key_tiles], one tensor per step
 }
 
@@ -239,6 +240,23 @@ def blasst_attention_forward(
     ln_lam = min(ln_lam, 0.0)
     offset = Skv - Sq                 # queries are the LAST Sq positions of the key axis
     n_kt = math.ceil(Skv / TILE)
+    links = STATE["decode_visual_links"]
+    if links is not None:
+        if B != 1 or layer_idx < 0:
+            raise ValueError("Decode visual links require one prompt and indexed layers")
+        if phase == "decode":
+            if layer_idx not in links.layers or Skv < len(links.visual):
+                raise ValueError("Decode visual links require a prefilled, position-aligned KV cache")
+            mask = mask_chunk(attention_mask, 0, 1, Sq, Skv)
+            output, skip = links.decode(layer_idx, query, key, value, mask, scaling, ln_lam, score_tiles)
+            if STATE["collect_stats"]:
+                phase_stats = STATE["phase_stats"].setdefault("decode", {"skipped": 0, "causal": 0})
+                phase_stats["skipped"] += int(skip.sum())
+                phase_stats["causal"] += skip.numel()
+            return output.transpose(1, 2).contiguous(), None
+        if Sq != Skv or Skv != len(links.visual):
+            raise ValueError("Decode visual links require one uncached prefill")
+        links.start_layer(layer_idx, Hq, query.device)
     key32 = key.to(torch.float32)
     kpos = torch.arange(Skv, device=query.device)
     out = torch.empty_like(query)
@@ -296,6 +314,8 @@ def blasst_attention_forward(
             s_t = score_tiles(s, allowed, mask)
         row_margins = (regions.row_margins(s_t, Skv) if regions is not None
                        else row_tile_margins(s_t.amax(-1)))
+        if links is not None:
+            links.record(layer_idx, r0, s_t, ln_lam, mask)
         margin = row_margins.amax(-2)
         skip = margin < ln_lam                                              # all rows far below running max
         if tv_layer is not None:

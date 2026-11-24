@@ -7,12 +7,13 @@ import json
 from collections import defaultdict
 from contextlib import contextmanager
 
+from decode_visual_links import DECODE_LINK_COUNTS
 from tile_calibration import write_json
 
 CHECKPOINT_INTERVAL = 25
 MAX_POLICIES = ("prefill_max_policies", "decode_max_policies")
 TILE_COUNTS = ("prefill_tiles", "prefill_tiles_skipped", "decode_tiles", "decode_tiles_skipped",
-               "prefill_qk_bypassed")
+               "prefill_qk_bypassed", *DECODE_LINK_COUNTS)
 CASE_FIELDS = ("answer", "vqa_score", "pure_vv_tiles", "vv_tiles_bypassed", "answer_changed", *TILE_COUNTS)
 
 
@@ -66,9 +67,7 @@ def accumulate(totals, case, *, reference="baseline"):
         counts = totals[name]
         counts["vqa_score_sum"] += result["vqa_score"]
         counts["answers_scored"] += 1
-        counts["pure_vv_tiles"] += result["pure_vv_tiles"]
-        counts["vv_tiles_bypassed"] += result["vv_tiles_bypassed"]
-        for key in TILE_COUNTS:
+        for key in ("pure_vv_tiles", "vv_tiles_bypassed", *TILE_COUNTS):
             if key in result:
                 counts[key] += result[key]
         if name != reference:
@@ -107,7 +106,7 @@ def merge(paths, output):
         if not shard:
             raise ValueError(f"{path} is not a VQA shard report")
         expected_config = {key: report[key] for key in config_keys}
-        for key in (*MAX_POLICIES, "variant_labels"):
+        for key in (*MAX_POLICIES, "variant_labels", "decode_visual_link_study"):
             if key in report:
                 expected_config[key] = report[key]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}

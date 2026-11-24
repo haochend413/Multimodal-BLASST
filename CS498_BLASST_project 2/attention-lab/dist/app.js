@@ -5,7 +5,7 @@ import {isJLSweep, setupJLStudy} from './jl.mjs?v=region-audit';
 import {isRegionAudit, setupRegionAudit} from './region.mjs?v=region-reset';
 import {isLayerStudy, setupLayerStudy} from './layers.mjs?v=vv-prefix-skips';
 import {runningMaxTrace, drawRunningMax} from './running-max.mjs';
-import {isTVVVSweep, setupTVVVSweep} from './tv-vv.mjs?v=post-qk-budget';
+import {isTVVVSweep, setupTVVVSweep} from './tv-vv.mjs?v=decode-links';
 const $ = id => document.getElementById(id);
 const workspaces = {tiles:'tile-workspace', jl:'jl-workspace', region:'region-workspace', layers:'layers-workspace', 'tv-vv':'tv-vv-workspace'};
 function showView(view) {

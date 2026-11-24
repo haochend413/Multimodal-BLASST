@@ -207,6 +207,31 @@ maxima. The top-k gate ranks live T→V votes from the previous layer using the
 prefill `--lambda`. The separate `--gate-lambda` applies to the pass that
 records the gate in a matched study or gate distribution audit.
 
+#### Decode with prefill text-to-vision links
+
+```bash
+python code/attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-1000.json" \
+  --sample-index 20 --sample-count 100 --decode-tokens 16 \
+  --lambda 0.1 --decode-lambda 0.1 --decode-visual-links \
+  --output "$HOME/blasst-results/vqav2-100-decode-links.json"
+```
+
+The paired run compares official VQA v2 accuracy against original BLASST at
+the same thresholds. The experimental variant stores boolean prefill links per
+layer, head, text-token position, and visual tile. At decode, BLASST first
+filters text keys using a text-only running max. Kept prompt text keys select
+the union of their recorded visual tiles for QK computation. Generated text
+keys participate in text-only BLASST. Each head without usable prefill history
+falls back to ordinary BLASST for its visual keys. Retained text and vision
+scores share one softmax.
+
+The report includes visual QK tiles and keys bypassed and the number of
+layer/head/decode-step observations that used fallback. Compare
+`decode_link_fallback_heads` with `decode_head_steps`. Counts measure QK work
+avoided by the reference implementation. Load the report in Attention Lab
+under **T→V-guided V→V** to compare accuracy and bypass counts.
+
 #### Measure the token and attention mix after the V→V gate
 
 Run one prefill per question with the same gate settings and sample range as the

@@ -56,6 +56,8 @@ export function setupTVVVSweep(showView) {
     const {data} = active();
     const variants = Object.keys(data.variants);
     const official = data.answer_metric === 'VQA v2 consensus';
+    const decodeLinks = data.decode_visual_link_study;
+    $('bypass-header').textContent = decodeLinks ? 'Decode visual QK tiles bypassed' : 'Pure V→V QK tiles bypassed';
     const budgets = data.budget_calibration;
     $('budget-note').hidden = !budgets;
     const keepTargets = budgets?.common_keep_targets;
@@ -91,7 +93,10 @@ export function setupTVVVSweep(showView) {
         ` (${difference >= 0 ? '+' : ''}${difference.toFixed(1)} pp)`;
       const accuracy = official ? `${result.vqa_accuracy.toFixed(1)}%${delta}` :
         fraction(result.reference_exact_matches ?? 0, result.answers_scored);
-      const cells = [variantLabel(variant), fraction(result.vv_tiles_bypassed, result.pure_vv_tiles)];
+      const bypassed = decodeLinks
+        ? fraction(result.decode_visual_tiles_bypassed, result.decode_visual_tiles)
+        : fraction(result.vv_tiles_bypassed, result.pure_vv_tiles);
+      const cells = [variantLabel(variant), bypassed];
       for (const phase of maxPhases) {
         const policy = data[`${phase}_max_policies`][variant] === 'per_region' ? 'Per region' : 'Shared';
         const lam = budgets ? ` · λ ${Number(budgets.lambdas[variant][phase].toPrecision(4))}` : '';
