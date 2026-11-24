@@ -27,7 +27,8 @@ export function setupTVVVSweep(showView) {
     if (!layer) return;
     const source = layer.vote_layer == null ? '' : ` · votes from layer ${layer.vote_layer}`;
     $('coverage').textContent = `V→V QK tiles bypassed in layer ${layer.layer} · ${fraction(layer.vv_tiles_bypassed, layer.pure_vv_tiles)}${source}`;
-    $('answer').textContent = run.answer ? `Generated answer · ${run.answer}` : '';
+    const score = run.vqa_score == null ? '' : ` · VQA score ${run.vqa_score.toFixed(1)}%`;
+    $('answer').textContent = run.answer == null ? '' : `Generated answer · ${run.answer || '(empty)'}${score}`;
     for (const vote of layer.votes) {
       const decision = vote.mask_fallback ? 'Mask fallback' : vote.protected_first_key
         ? 'Keep first key' : {skip:'Bypass', keep:'Keep', warmup:'Warm-up', baseline:'Baseline'}[vote.decision];
@@ -47,12 +48,18 @@ export function setupTVVVSweep(showView) {
   function drawReport() {
     const {data} = active();
     const variants = Object.keys(data.variants);
+    const official = data.answer_metric === 'VQA v2 consensus';
+    $('accuracy-header').textContent = official ? 'VQA v2 accuracy' : 'Reference exact matches';
     $('status').textContent = `${data.synthetic ? 'Synthetic · ' : ''}${data.cases.length}/${data.pairs_requested} cases · BLASST λ = ${data.blasst_lambda}`;
     $('summary').replaceChildren();
     for (const variant of variants) {
       const result = data.summary[variant];
+      const delta = result.vqa_delta_pp == null ? '' :
+        ` (${result.vqa_delta_pp >= 0 ? '+' : ''}${result.vqa_delta_pp.toFixed(1)} pp)`;
+      const accuracy = official ? `${result.vqa_accuracy.toFixed(1)}%${delta}` :
+        fraction(result.reference_exact_matches ?? 0, result.answers_scored);
       row($('summary'), [variantLabel(variant), fraction(result.vv_tiles_bypassed, result.pure_vv_tiles),
-        fraction(result.reference_exact_matches ?? 0, result.answers_scored), result.answers_changed]);
+        accuracy, result.answers_changed]);
     }
     $('content').hidden = false;
     options('case', data.cases.map((_, index) => index), index => data.cases[index].sample_id ?? `Case ${index + 1}`);

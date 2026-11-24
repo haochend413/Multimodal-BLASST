@@ -62,6 +62,8 @@ See the [cross-layer run guide](../code/README.md#cross-layer-tile-decisions).
 Load an `attention_study.py --tv-vv-sweep` report into **T→V-guided V→V**.
 Choose a case, threshold, and layer to compare the preceding layer's relevance with the
 current layer's votes and see which V→V query tiles bypassed QK.
+Reports collected with `--vqa-accuracy` show the VQA v2 consensus score and the
+percentage-point difference from standard BLASST.
 
 The bundled demonstration uses seeded random Q/K tensors and a planted attention sink.
 It is explicitly synthetic, not measured Qwen, Video-MME, or accuracy data.

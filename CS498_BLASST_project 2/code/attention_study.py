@@ -21,6 +21,7 @@ from jl_region_study import JLRegionStudy, merge_region_audits
 from tile_layer_study import LayerReport, TileLayerRecorder
 from tile_calibration import add_threshold_arguments, selected_calibration, write_json
 from tv_guided_vv import SWEEP_SCHEMA as TV_VV_SCHEMA, TVGuidedVV
+from vqav2_accuracy import SHORT_ANSWER_INSTRUCTION, score_answer, validate_cases
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -246,6 +247,8 @@ def main() -> None:
                        help="gate causal V→V query tiles using the preceding layer's T→V keep fraction")
     tv_vv.add_argument("--tv-vv-sweep", metavar="FRACTIONS",
                        help="compare standard BLASST and comma-separated T→V relevance thresholds")
+    parser.add_argument("--vqa-accuracy", action="store_true",
+                        help="use short-answer generation and the official VQA score in a VQA v2 sweep")
     parser.add_argument("--jl-dim", type=int, help="audit a JL precheck at this sketch dimension")
     parser.add_argument("--jl-sweep", metavar="DIMS",
                         help="comma-separated JL widths for a paired skip-rate and gap histogram study")
@@ -276,6 +279,8 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int, default=1,
                         help="number of consecutive manifest pairs for a projected-only audit")
     args = parser.parse_args()
+    if args.vqa_accuracy and not (args.tv_vv_sweep is not None and args.manifest):
+        parser.error("--vqa-accuracy requires --tv-vv-sweep and a VQA v2 manifest")
     if args.tv_vv_sweep is not None:
         try:
             args.tv_vv_sweep = sorted({float(value) for value in args.tv_vv_sweep.split(",")})
@@ -358,6 +363,11 @@ def main() -> None:
         if not 0 <= args.sample_index < end <= len(samples):
             parser.error(f"requested sample range is outside the {len(samples)} manifest pairs")
         samples = samples[args.sample_index:end]
+        if args.vqa_accuracy:
+            try:
+                validate_cases(samples)
+            except ValueError as error:
+                parser.error(str(error))
         sample = samples[0]
         if args.sample_count == 1 and not paired_audit:
             _select_sample(args, parser, sample)
@@ -456,32 +466,54 @@ def _collect_tv_vv_sweep(args, parser, samples):
                   blasst_lambda=args.lam, decode_lambda=args.decode_lambda, pairs_requested=len(samples),
                   answer_metric="normalized full-response exact match to any supplied reference",
                   variants=dict(variants), cases=[])
+    if args.vqa_accuracy:
+        report["answer_metric"] = "VQA v2 consensus"
+        report["answer_protocol"] = dict(instruction=SHORT_ANSWER_INSTRUCTION,
+                                         max_new_tokens=args.decode_tokens, min_new_tokens=0)
     totals = {name: defaultdict(int) for name, _ in variants}
     for index, sample in enumerate(samples, start=args.sample_index):
         benchmark, sample_id = (sample["benchmark"], sample["id"]) if sample else ({}, str(index))
         case = dict(sample_index=index, sample_id=sample_id, results={})
         references = benchmark.get("reference_answers") or [benchmark.get("ground_truth", "")]
         answers = {normalized for answer in references if (normalized := _normalized_answer(answer))}
+        if args.vqa_accuracy:
+            case.update(question_id=benchmark["question_id"], question=benchmark["question_text"],
+                        reference_answers=references)
         for name, threshold in variants:
             # An ungated vote trace provides the baseline's causal V→V denominator.
             run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold))
             if sample:
                 _select_sample(run, parser, sample)
+            if args.vqa_accuracy:
+                run.question = f"{benchmark['question_text']}\n{SHORT_ANSWER_INSTRUCTION}"
             metadata = collect(run, parser, benchmark, sample_id)
             trace = metadata["tv_guided_vv"]
             answer = metadata.get("answer")
             normalized = _normalized_answer(answer) if answer is not None else None
-            match = normalized in answers if answers and normalized is not None else None
-            result = dict(answer=answer, reference_exact_match=match, **trace)
+            result = dict(answer=answer, **trace)
+            if args.vqa_accuracy:
+                score = score_answer(answer, references)
+                result["vqa_score"] = score
+                totals[name]["vqa_score_sum"] += score
+                totals[name]["answers_scored"] += 1
+                totals[name]["vqa_accuracy"] = totals[name]["vqa_score_sum"] / totals[name]["answers_scored"]
+            else:
+                match = normalized in answers if answers and normalized is not None else None
+                result["reference_exact_match"] = match
+                if match is not None:
+                    totals[name]["answers_scored"] += 1
+                    totals[name]["reference_exact_matches"] += match
             if name != "baseline" and answer is not None:
-                base_answer = case["results"]["baseline"]["answer"]
-                result["answer_changed"] = normalized != _normalized_answer(base_answer)
+                base = case["results"]["baseline"]
+                result["answer_changed"] = normalized != _normalized_answer(base["answer"])
+                if args.vqa_accuracy:
+                    delta = result["vqa_score"] - base["vqa_score"]
+                    totals[name]["vqa_better"] += delta > 0
+                    totals[name]["vqa_worse"] += delta < 0
+                    totals[name]["vqa_delta_pp"] = totals[name]["vqa_accuracy"] - totals["baseline"]["vqa_accuracy"]
             case["results"][name] = result
             totals[name]["pure_vv_tiles"] += trace["pure_vv_tiles"]
             totals[name]["vv_tiles_bypassed"] += trace["vv_tiles_bypassed"]
-            if match is not None:
-                totals[name]["answers_scored"] += 1
-                totals[name]["reference_exact_matches"] += match
             if "answer_changed" in result:
                 totals[name]["answers_changed"] += result["answer_changed"]
         report["cases"].append(case)
@@ -489,6 +521,13 @@ def _collect_tv_vv_sweep(args, parser, samples):
         write_json(args.output, report)
         print(f"Compared T→V-guided V→V for {len(report['cases'])}/{len(samples)} cases", flush=True)
     print(f"Wrote paired T→V-guided V→V report to {args.output}")
+    if args.vqa_accuracy:
+        for name, _ in variants:
+            predictions = [{"question_id": case["question_id"], "answer": case["results"][name]["answer"]}
+                           for case in report["cases"]]
+            write_json(args.output.with_name(f"{args.output.stem}-{name}-predictions.json"), predictions)
+            score = totals[name]["vqa_accuracy"]
+            print(f"{name}: VQA v2 accuracy {score:.2f}% on {totals[name]['answers_scored']} questions")
 
 
 def _collect_layer_study(args, parser, samples, calibration):
@@ -726,8 +765,12 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         ba.STATE["observer"] = None if args.jl_live else recorder.observe
         jl_study = _attach_study(args, recorder)
         with torch.inference_mode():
-            generated = model.generate(**inputs, max_new_tokens=args.decode_tokens + 1,
-                                       min_new_tokens=args.decode_tokens + 1, do_sample=False)
+            if args.vqa_accuracy:
+                generated = model.generate(**inputs, max_new_tokens=args.decode_tokens,
+                                           min_new_tokens=0, do_sample=False)
+            else:
+                generated = model.generate(**inputs, max_new_tokens=args.decode_tokens + 1,
+                                           min_new_tokens=args.decode_tokens + 1, do_sample=False)
         metadata = {"model": args.model, "synthetic": False, "prompt_tokens": length,
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}

@@ -105,6 +105,24 @@ the available references, and the report also counts changes relative to the bas
 These are tile workload counts in the PyTorch reference. For a single-run tile and
 score export, use `--tv-vv-threshold 0.5 --score-data` in place of the sweep flag.
 
+For a paired VQA v2 accuracy comparison, run the baseline and one selected threshold
+on the same validation questions:
+
+```bash
+python attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-30.json" --sample-count 30 \
+  --lambda 0.1 --decode-tokens 16 --tv-vv-sweep 0.5 --vqa-accuracy \
+  --output "$HOME/blasst-results/vqav2-tv-guided-vv-accuracy.json"
+```
+
+Both policies receive the original VQA question followed by “Answer with a single word
+or short phrase.” Greedy generation stops at EOS or the token cap. The official
+[VQA evaluator](https://visualqa.org/evaluation.html) scores the decoded answer
+against the ten references in the manifest. The JSON includes per-question scores,
+aggregate accuracy, and the paired change from standard BLASST. Each policy also
+writes a sibling `*-predictions.json` in the official question-ID/answer format.
+The score covers the selected validation subset.
+
 ### Bidirectional masking for pure V→V tiles
 
 To test bidirectional V→V attention on one manifest case:
