@@ -27,8 +27,17 @@ def claim(output):
 
 def partition(total, count, index):
     if not 1 <= count <= total or not 0 <= index < count:
-        raise ValueError("shard count must fit the manifest and shard index must be in [0, count)")
+        raise ValueError("shard count must fit the selected cases and shard index must be in [0, count)")
     return total * index // count, total * (index + 1) // count
+
+
+def shard_bounds(shard):
+    start = shard.get("selection_start", 0)
+    total = shard.get("selection_count", shard["manifest_questions"])
+    if not 0 <= start < start + total <= shard["manifest_questions"]:
+        raise ValueError("requested sample range is outside the manifest")
+    lo, hi = partition(total, shard["count"], shard["index"])
+    return start + lo, start + hi
 
 
 def resume(report, output, samples, start):
@@ -99,13 +108,16 @@ def merge(paths, output):
         if "decode_max_policies" in report:
             expected_config["decode_max_policies"] = report["decode_max_policies"]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}
+        for key in ("selection_start", "selection_count"):
+            if key in shard:
+                expected_manifest[key] = shard[key]
         if config is None:
             config, manifest = expected_config, expected_manifest
         elif config != expected_config or manifest != expected_manifest:
             raise ValueError(f"{path} uses different run or manifest settings")
         if shard["index"] in seen_shards:
             raise ValueError(f"duplicate shard index {shard['index']}")
-        start, stop = partition(shard["manifest_questions"], shard["count"], shard["index"])
+        start, stop = shard_bounds(shard)
         cases = report["cases"]
         if (len(cases) != stop - start or report["pairs_requested"] != stop - start
                 or any(case["sample_index"] != index for index, case in enumerate(cases, start=start))):
@@ -122,7 +134,7 @@ def merge(paths, output):
     missing = set(range(manifest["count"])) - seen_shards
     if missing:
         raise ValueError(f"{len(missing)} missing shards; first missing shard is {min(missing)}")
-    total = manifest["manifest_questions"]
+    total = manifest.get("selection_count", manifest["manifest_questions"])
     merged = dict(config, pairs_requested=total, pairs_completed=len(question_ids), cases=[],
                   summary=summarize(totals), vqa_merged=manifest)
     for pairs in predictions.values():

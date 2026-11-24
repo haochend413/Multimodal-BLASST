@@ -125,16 +125,16 @@ The score covers the selected validation subset.
 
 #### Combine prefill votes with per-region decode maxima
 
-From `CS498_BLASST_project 2`, reuse the 1,000-question manifest and give the
-combined run a new output path:
+From `CS498_BLASST_project 2`, choose how many questions to run from the existing
+1,000-question manifest and give the combined run a new output path:
 
 ```bash
 python code/attention_study.py \
   --manifest "$HOME/blasst-results/vqav2-1000.json" \
-  --vqa-shards 1 --vqa-shard-index 0 \
+  --sample-count 100 --vqa-shards 1 --vqa-shard-index 0 \
   --lambda 0.1 --decode-tokens 16 \
   --tv-vv-sweep 0.5 --vqa-accuracy --decode-region-max \
-  --output "$HOME/blasst-results/vqav2-1000-tv-vv-region-decode-accuracy.json"
+  --output "$HOME/blasst-results/vqav2-100-tv-vv-region-decode-accuracy.json"
 ```
 
 The sweep uses shared maxima for regular BLASST and combines previous-layer
@@ -143,7 +143,10 @@ contiguous text or visual key run has a separate running max. Mixed physical
 tiles skip only when all visible segments pass their run's cutoff. Kept keys
 share one softmax. The report compares VQA accuracy, V→V QK tiles bypassed
 during prefill, and decode tile skips. The previous prefill-only run on the same
-questions gives the comparison for adding region-local decode.
+questions gives the comparison for adding region-local decode. Select the same
+range in each report. `--sample-index` sets the starting offset, and `--sample-count`
+is applied before splitting the range into shards. Omit both flags to shard the
+entire manifest. Use a different output path for a different sample range.
 
 #### Full VQA v2 validation
 

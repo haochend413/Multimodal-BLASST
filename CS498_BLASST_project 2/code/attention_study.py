@@ -283,9 +283,12 @@ def main() -> None:
     parser.add_argument("--demo", action="store_true", help="synthetic CPU Q/K; no model downloads")
     parser.add_argument("--manifest", type=Path, help="Video-MME or VQA v2 benchmark manifest")
     parser.add_argument("--sample-index", type=int, default=0)
-    parser.add_argument("--sample-count", type=int, default=1,
-                        help="number of consecutive manifest pairs for a projected-only audit")
+    parser.add_argument("--sample-count", type=int,
+                        help="number of manifest cases to test, before splitting into shards")
     args = parser.parse_args()
+    requested_sample_count = args.sample_count
+    if args.sample_count is None:
+        args.sample_count = 1
     if args.decode_region_max and (args.jl_dim is not None or args.jl_sweep or args.jl_region_audit
                                    or args.tile_layer_study or args.score_distributions):
         parser.error("--decode-region-max changes live decode; the other audits use their own running max")
@@ -293,9 +296,8 @@ def main() -> None:
         parser.error("--vqa-accuracy requires --tv-vv-sweep and a VQA v2 manifest")
     args.vqa_shard = None
     if args.vqa_shards is not None or args.vqa_shard_index is not None:
-        if (not args.vqa_accuracy or args.vqa_shards is None or args.vqa_shard_index is None
-                or args.sample_index != 0 or args.sample_count != 1):
-            parser.error("use both VQA shard flags with --vqa-accuracy in place of sample range flags")
+        if not args.vqa_accuracy or args.vqa_shards is None or args.vqa_shard_index is None:
+            parser.error("use both VQA shard flags with --vqa-accuracy")
     if args.tv_vv_sweep is not None:
         try:
             args.tv_vv_sweep = sorted({float(value) for value in args.tv_vv_sweep.split(",")})
@@ -376,12 +378,15 @@ def main() -> None:
             parser.error("unsupported benchmark manifest schema")
         samples = manifest["samples"]
         if args.vqa_shards is not None:
-            try:
-                start, stop = vqa_shards.partition(len(samples), args.vqa_shards, args.vqa_shard_index)
-            except ValueError as error:
-                parser.error(str(error))
             args.vqa_shard = dict(index=args.vqa_shard_index, count=args.vqa_shards, manifest_questions=len(samples),
                                   manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest())
+            selected = len(samples) - args.sample_index if requested_sample_count is None else requested_sample_count
+            if args.sample_index or selected != len(samples):
+                args.vqa_shard.update(selection_start=args.sample_index, selection_count=selected)
+            try:
+                start, stop = vqa_shards.shard_bounds(args.vqa_shard)
+            except ValueError as error:
+                parser.error(str(error))
             args.sample_index, args.sample_count = start, stop - start
         del manifest_bytes, manifest
         end = args.sample_index + args.sample_count
