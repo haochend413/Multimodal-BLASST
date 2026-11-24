@@ -54,6 +54,12 @@ def test_previous_text_votes_bypass_and_reactivate_visual_queries(monkeypatch):
     assert snapshots[1, 2][..., 2:4].isneginf().all()
     assert snapshots[1, 2][..., :2].isfinite().all()
     assert snapshots[1, 6][..., 2:6].isfinite().all()
+    distribution = policy.distribution()
+    assert distribution["prompt_runs"] == [
+        {"modality": "T", "tokens": 1}, {"modality": "V", "tokens": 6}, {"modality": "T", "tokens": 1}
+    ]
+    assert distribution["pairs_before"] == {"TT": 9, "TV": 18, "VT": 18, "VV": 63}
+    assert distribution["pairs_after"] == {"TT": 9, "TV": 18, "VT": 18, "VV": 53}
 
 
 def test_empty_vote_and_first_key_protection():

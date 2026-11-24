@@ -28,6 +28,41 @@ class TVGuidedVV:
         previous = self.previous if self.previous and self.previous["layer"] == layer - 1 else None
         return TVLayer(self, layer, device, previous)
 
+    def distribution(self):
+        """Count causal token pairs with and without the recorded QK bypass."""
+        runs = []
+        tokens = {"T": 0, "V": 0}
+        causal = dict.fromkeys(("TT", "TV", "VT", "VV"), 0)
+        for is_visual in self.visual.tolist():
+            kind = "V" if is_visual else "T"
+            if not runs or runs[-1]["modality"] != kind:
+                runs.append(dict(modality=kind, tokens=0))
+            runs[-1]["tokens"] += 1
+            tokens[kind] += 1
+            for key, count in tokens.items():
+                causal[kind + key] += count
+
+        tile_lengths = [len(tile) for tile in self.text_rows]
+        pure_rank = {tile: rank for rank, tile in enumerate(self.pure_visual)}
+        layers = []
+        for layer in self.layers:
+            bypassed = 0
+            for vote in layer["votes"]:
+                count = vote["vv_tiles_bypassed"]
+                if not count:
+                    continue
+                query = vote["tile"]
+                end = pure_rank[query] + 1
+                # The gate drops a suffix of the eligible pure-V key tiles.
+                for key in self.pure_visual[end - count:end]:
+                    q_len = tile_lengths[query]
+                    bypassed += q_len * (q_len + 1) // 2 if query == key else q_len * tile_lengths[key]
+            layers.append(dict(layer=layer["layer"], vv_pairs_bypassed=bypassed))
+
+        before = {region: count * len(layers) for region, count in causal.items()}
+        after = dict(before, VV=before["VV"] - sum(layer["vv_pairs_bypassed"] for layer in layers))
+        return dict(prompt_runs=runs, prompt_tokens=tokens, pairs_before=before, pairs_after=after, layers=layers)
+
 
 class TVLayer:
     def __init__(self, policy, layer, device, previous):

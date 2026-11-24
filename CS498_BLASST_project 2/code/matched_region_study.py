@@ -29,7 +29,10 @@ LABELS = {
 
 
 def validate_args(args, parser):
-    if not args.manifest or args.demo or args.calibration_count < 1 or args.decode_tokens < 2:
+    if args.gate_distribution and (args.matched_region_study or args.budget_config is not None):
+        parser.error("Use --gate-distribution separately from matched-study calibration")
+    if not args.manifest or args.demo or (not args.gate_distribution and
+                                        (args.calibration_count < 1 or args.decode_tokens < 2)):
         parser.error("The matched study needs a VQA manifest, calibration cases and at least two generated tokens")
     if (args.tv_vv_sweep or args.vqa_shards is not None or args.vqa_shard_index is not None
             or args.lam or args.decode_lambda is not None or args.prefill_region_max or args.decode_region_max
@@ -76,6 +79,8 @@ def gate_from(trace):
 
 
 def run(args, parser, samples, collect, select_sample, state, tile_size):
+    if getattr(args, "gate_distribution", False):
+        return run_gate_distribution(args, parser, samples, collect, select_sample, tile_size)
     calibration, evaluation = samples[:args.calibration_count], samples[args.calibration_count:]
     threshold = args.tv_vv_threshold if args.tv_vv_threshold is not None else .5
     settings = dict(model=args.model, manifest_sha256=args.budget_manifest_sha, tile_size=tile_size,
@@ -195,6 +200,29 @@ def check_gate(result, reference, expected_gate, observed_gate):
     keys = ("pure_vv_tiles", "vv_tiles_bypassed", "prefill_qk_bypassed")
     if observed_gate != expected_gate or any(result[key] != reference[key] for key in keys):
         raise ValueError("The replayed V→V QK gate differs from the recorded gate")
+
+
+def run_gate_distribution(args, parser, samples, collect, select_sample, tile_size):
+    threshold = args.tv_vv_threshold if args.tv_vv_threshold is not None else .5
+    cases = []
+    totals = {field: defaultdict(int) for field in ("prompt_tokens", "pairs_before", "pairs_after")}
+    for sample in samples:
+        options = argparse.Namespace(**dict(vars(args), lam=args.gate_lambda, decode_lambda=0.,
+                                            tv_vv_threshold=threshold, decode_tokens=1))
+        select_sample(options, parser, sample)
+        benchmark = sample["benchmark"]
+        options.question = f"{benchmark['question_text']}\n{SHORT_ANSWER_INSTRUCTION}"
+        result = collect(options, parser, benchmark, sample["id"])["gate_distribution"]
+        cases.append(dict(sample_id=sample["id"], question_id=benchmark["question_id"], **result))
+        for field, counts in totals.items():
+            for key, count in result[field].items():
+                counts[key] += count
+        if len(cases) % vqa_shards.CHECKPOINT_INTERVAL == 0 or len(cases) == len(samples):
+            print(f"Measured V→V QK distribution on {len(cases)}/{len(samples)} questions", flush=True)
+    write_json(args.output, dict(schema="blasst-gate-distribution-v1", model=args.model, tile_size=tile_size,
+                                 gate_lambda=args.gate_lambda, gate_threshold=threshold,
+                                 totals=totals, cases=cases))
+    print(f"Wrote V→V QK distribution to {args.output}", flush=True)
 
 
 def calibrate(probe, reference, settings):

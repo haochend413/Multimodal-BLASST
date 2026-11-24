@@ -190,6 +190,26 @@ Use a fresh budget config path for this comparison. The config can then be
 reused with the same calibration settings and a fresh output path for a
 different evaluation size.
 
+#### Measure the token and attention mix after the V→V gate
+
+Run one prefill per question with the same gate settings and sample range as the
+matched study. For the 100 held-out questions following the 20 calibration questions:
+
+```bash
+python code/attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-1000.json" \
+  --gate-distribution --sample-index 20 --sample-count 100 \
+  --tv-vv-threshold 0.5 --gate-lambda 1 \
+  --output "$HOME/blasst-results/vqav2-100-gate-distribution.json"
+jq '.totals, .cases[0].prompt_runs' "$HOME/blasst-results/vqav2-100-gate-distribution.json"
+```
+
+`prompt_runs` gives the ordered text and visual token lengths for each prompt.
+The gate preserves those lengths. `pairs_before` and `pairs_after` count causal
+token pairs by query and key modality, summed over layers and counted once
+across heads. The post-gate counts exclude the actual bypasses before QK and
+include pairs in mixed tiles. They precede BLASST's score-based skipping.
+
 #### Full VQA v2 validation
 
 The full validation split contains 214,354 questions. The same paired comparison

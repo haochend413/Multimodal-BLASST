@@ -268,6 +268,8 @@ def main() -> None:
                         help="requested post-QK tile keep percentage in each phase")
     parser.add_argument("--gate-lambda", type=float, default=1.,
                         help="prefill lambda used to record the fixed gate for the matched study")
+    parser.add_argument("--gate-distribution", action="store_true",
+                        help="run only the fixed prefill gate and count tokens and causal pairs by modality")
     parser.add_argument("--vqa-shards", type=int, help="split the whole VQA manifest into this many shards")
     parser.add_argument("--vqa-shard-index", type=int, help="zero-based index of this restartable shard")
     parser.add_argument("--jl-dim", type=int, help="audit a JL precheck at this sketch dimension")
@@ -300,7 +302,7 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int,
                         help="number of manifest cases to test, before splitting into shards")
     args = parser.parse_args()
-    if args.matched_region_study:
+    if args.matched_region_study or args.gate_distribution:
         from matched_region_study import validate_args
 
         validate_args(args, parser)
@@ -315,7 +317,8 @@ def main() -> None:
         or args.tile_layer_study or args.score_distributions
     ):
         parser.error("The live region-max switches cannot be used with audits that compute their own running max")
-    if args.vqa_accuracy and not (args.manifest and (args.tv_vv_sweep is not None or args.matched_region_study)):
+    if args.vqa_accuracy and not (args.manifest and (args.tv_vv_sweep is not None
+                                                    or args.matched_region_study or args.gate_distribution)):
         parser.error("--vqa-accuracy requires a VQA v2 manifest and a paired study")
     args.vqa_shard = None
     if args.vqa_shards is not None or args.vqa_shard_index is not None:
@@ -335,7 +338,7 @@ def main() -> None:
         if (args.vv_prefix_attention or args.jl_dim is not None or args.jl_sweep
                 or args.tile_layer_study or args.score_distributions):
             parser.error("T→V-guided V→V compares live causal BLASST masks; omit separate mask audits")
-        if not args.matched_region_study and not 0 < args.lam <= 1:
+        if not (args.matched_region_study or args.gate_distribution) and not 0 < args.lam <= 1:
             parser.error("set the BLASST vote threshold with --lambda in (0, 1]")
     if args.tv_vv_sweep and (args.score_data or args.raw_dir):
         parser.error("--tv-vv-sweep collects a paired answer and tile-count report")
@@ -381,7 +384,7 @@ def main() -> None:
             parser.error("--jl-region-audit uses a dense trajectory and its own report; set --jl-lambda")
     paired_audit = (
         args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions
-        or args.tv_vv_sweep or args.matched_region_study
+        or args.tv_vv_sweep or args.matched_region_study or args.gate_distribution
     )
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
@@ -462,7 +465,7 @@ def main() -> None:
                 parser.error(f"Missing input media: {media_path}")
         if not torch.cuda.is_available():
             parser.error("Real model collection requires CUDA; use --demo for CPU verification")
-    if args.matched_region_study:
+    if args.matched_region_study or args.gate_distribution:
         from matched_region_study import run
 
         try:
@@ -746,11 +749,11 @@ def _attach_study(args, recorder):
         regions = RegionMax(recorder.visual, ba.TILE)
         ba.STATE["prefill_region_max"] = regions if args.prefill_region_max else None
         ba.STATE["decode_region_max"] = regions if args.decode_region_max else None
-    if args.tv_vv_threshold is not None or args.tv_vv_sweep or args.matched_region_study:
+    if args.tv_vv_threshold is not None or args.tv_vv_sweep or args.matched_region_study or args.gate_distribution:
         ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold,
                                             replay=getattr(args, "gate_replay", None))
         ba.STATE["qkv_hook"] = None
-        if args.tv_vv_sweep or args.matched_region_study:
+        if args.tv_vv_sweep or args.matched_region_study or args.gate_distribution:
             ba.STATE["observer"] = None
         return None
     if args.score_distributions:
@@ -895,7 +898,9 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         metadata["tv_guided_vv"] = dict(threshold=policy.threshold, layers=policy.layers,
                                         pure_vv_tiles=sum(layer["pure_vv_tiles"] for layer in policy.layers),
                                         vv_tiles_bypassed=sum(layer["vv_tiles_bypassed"] for layer in policy.layers))
-        if args.tv_vv_sweep or args.matched_region_study:
+        if args.gate_distribution:
+            metadata["gate_distribution"] = policy.distribution()
+        if args.tv_vv_sweep or args.matched_region_study or args.gate_distribution:
             return metadata
     if args.vv_prefix_attention:
         metadata["attention_mask_policy"] = "vv_prefix"
