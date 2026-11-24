@@ -1,0 +1,1399 @@
+Changelog
+=========
+
+0.50.0 (2027-01-xx)
+^^^^^^^^^^^^^^^^^^^
+
+**New Features**
+
+*Quantization - ONNX*
+
+- The Windows ONNX LLM quantization example supports text calibration for hybrid decoder inputs, including embedding-only exports and linear-attention states, and keeps small constants inline when exporting external weights. Install the example requirements with Transformers ``>=5.5,<5.19`` (previously ``<5.0.0``).
+- Add opt-in ``awqlite_reuse_activations`` (default: False) to share calibration activations across adjacent weights with the same input in per-node ONNX AWQ Lite/Full. For stochastic graphs, enabling reuse shares captured samples across those weights.
+
+*Quantization - Algorithms*
+
+- ``max``, ``imatrix`` and ``local_hessian`` calibration of ``iq1_s``, ``iq1_m``, ``iq2_xxs``, ``iq2_xs`` and ``iq2_s`` now derive each block's super-block scale from the weights and match each block's output energy (``local_hessian`` under each block's Hessian), in place of fixed per-format scale anchors, which lowered KL divergence in all our tests (by up to half at IQ1) and matches or beats llama.cpp's own imatrix quantizer in most of them. ``gptq`` derives the scale too and gives each output row a gain of one under its Hessian: KL fell on dense MLPs (by up to 40% at IQ1) and ranged from 19% lower to 3% higher on routed MoE experts alone.
+- Add ``context_quant_level`` to KL-divergence AutoQuantize (``method={"method": "kl_div", "context_quant_level": "lowest"}``, or ``method_options: {context_quant_level: lowest}`` in a recipe): each candidate is scored with every other searched layer at its lowest-bit format (an int picks the format by its 0-based index from the lowest), so low-bit budgets go to the layers whose error compounds most once the whole model is quantized. ``"lowest"`` is a good default; a context nearer the target budget measured the same in our tests.
+- GPTQ calibration is 25-35% faster in our MoE-expert and dense-MLP tests, with the GGML IQ formats and with NVFP4 under ``fused: true``. Results change only at round-off.
+- GPTQ now defaults to ``fused=True``, running the fused Triton update for static NVFP4 weights on SM89+ (4/6 scaling and other formats keep the unfused loop). Set ``fused: false`` to restore the previous behavior.
+
+*Quantization - QAT / QAD*
+
+*Quantization - Export & Deployment*
+
+- ``examples/hf_ptq/convert_ggml_to_int8.py`` now also converts GGML exports that hold other formats (FP8, NVFP4, KV cache quantization): their GGML layers become ModelOpt ``INT8_PB_WO`` layers beside the rest of the export, which vLLM newer than 0.34.0 serves. Exports with only GGML layers still become compressed-tensors, and fused MoE experts now convert in both.
+
+*Quantization - Recipes*
+
+- Add a sub-4-bit AutoQuantize recipe for Qwen3.6-35B-A3B at 2.75 bits, which searches the routed experts over GGML IQ2 formats with GPTQ and imatrix, weight-only NVFP4 and FP8, and BF16. Select it under ``models/Qwen/Qwen3.6-35B-A3B/auto_quantize/``.
+- The streaming Kimi-K3 converter (``examples/kimi/kimi_k3/quantize_to_nvfp4.py``) now resolves each module's format from the recipe's ``quant_cfg`` and rejects layouts it cannot write. Add the checkpoint-mirror recipe for ``nvidia/Kimi-K3.1-Pro-NVFP4`` under ``models/moonshotai/Kimi-K3.1-Pro/ptq/``.
+
+*Speculative Decoding*
+
+*Megatron Framework (M-LM / M-Bridge)*
+
+*Misc*
+
+- Move agent skills to the repository-root ``skills/`` directory, with symlinks for agent discovery.
+- Prefix agent skill names with ``modelopt-``; existing names remain available as forwarding stubs.
+
+**Backward Breaking Changes**
+
+**Deprecations**
+
+**Bug Fixes**
+
+*Quantization*
+
+- ``capture_quantized_weight_export_state`` now works on FSDP2-sharded (DTensor) weights; it raised on them, and could pick another weight's quantizer when local shards were empty.
+- NVFP4 weight export (Hugging Face checkpoints without TensorRT-LLM, and ONNX) now normalizes weights by the correctly rounded reciprocal of the block scale, as the Triton NVFP4 fake quant does, so a weight on an exact E2M1 rounding boundary no longer packs to a neighboring FP4 value; the Triton fake quant and FP8 scale sweep can also change at such boundaries. Re-export affected NVFP4 checkpoints.
+- Unified HF export now writes model-hub tensor names for models with 3-D weights that do not stack experts. GGML exports of MoE models whose conversion mapping fuses experts, and models with a short convolution such as GLM-5.3-Flash, fell back to transformers' in-memory names, which vLLM cannot load. Re-export affected checkpoints.
+
+*ONNX*
+
+- Fix ONNX AutoCast retaining one full-graph activation dump per calibration sample during inference: samples are now folded into the running per-tensor statistics as they arrive, so this retention no longer scales with the number of samples in ``calibration_data``. Loading the input data itself (a JSON input list, or a single NPZ holding multiple samples) still materializes every sample's inputs.
+- ONNX AutoCast now keeps the variance of decomposed RMSNorm and unfused LayerNorm in FP32 for both FP16 and BF16 conversion, so FP16 models converted without calibration data no longer give wrong outputs on execution providers such as TensorRT-RTX. Reconvert affected models.
+- Fix ``--dq_only`` ONNX export producing a model that ONNX Runtime cannot load when the weights are quantized to an unsigned type. Such exports now load and match the source model.
+
+*Speculative Decoding*
+
+*Megatron Framework (M-LM / M-Bridge)*
+
+- Preserve model-specific hybrid stacks when selecting MoE expert layouts in Megatron-Bridge, and reject grouped GEMM when a custom factory returns sequential experts. Custom built stack ``ModuleSpec`` values are now rejected; assign a named factory function instead.
+
+*Misc*
+
+0.49.0 (2026-12-xx)
+^^^^^^^^^^^^^^^^^^^
+
+**New Features**
+
+*Quantization - ONNX*
+
+- ONNX AutoTune can now upload its remote safety engine to a chosen path with ``autotune_remote_model_path`` / ``--autotune_remote_model_path`` (``--remote_model_path`` in the AutoTune CLI); its unique temporary filename remains the default.
+- On Linux x86-64, the ONNX extra now selects ONNX Runtime 1.30.x and CUDA 13 packages by default. GPU calibration requires a compatible CUDA 13 runtime and driver; other platforms retain their existing dependency selections.
+- ONNX AutoCast can now calibrate node by node with ``--calibrate_per_node`` or
+  ``calibrate_per_node=True``, reducing peak memory at the cost of longer calibration time.
+
+*Quantization - Algorithms*
+
+- Add ``use_weight_scale=False`` to ``awq_lite`` and ``awq_full`` calibration for activation-only AWQ scale search. Existing weight-and-activation scaling remains the default.
+- Support text-only Qwen conditional-generation checkpoints in the experimental FSDP2 weight
+  AutoQuantize path and preserve their linear-attention fusion groups during mixed-format export.
+- Add experimental data-parallel/FSDP2 KV-cache AutoQuantize, including composed weight-then-KV searches in ``examples/hf_ptq`` with synchronized calibration, scoring, selection, and resumable per-rank checkpoints. FSDP2 recipe scoring uses a global sample budget and defaults to a calibration batch size of 1 per rank.
+- Add imatrix calibration (``algorithm: {method: imatrix}``) for the GGML formats with a weighted search: each weight is encoded once, its search weighted by the square root of its inputs' per-column ``E[x^2]`` (llama.cpp's imatrix statistic), and HF fused-MoE experts get one statistic per expert. A weight that already holds final codes is left alone, so ``[{method: gptq}, {method: imatrix}]`` runs GPTQ where it applies and imatrix on the rest; the built-in IQ1 and IQ2 recipes now do this, and new ``iq1_s_experts_only`` and ``iq1_m_experts_only`` recipes apply imatrix to the routed MoE experts alone.
+- AutoQuantize now accepts GPTQ and imatrix candidates for the GGML formats (e.g. IQ2 with ``[{method: gptq}, {method: imatrix}]``), calibrating and scoring each from the original weights and keeping the selected candidates' codes in the returned model. A search with such candidates that fails before calibrating any of them leaves the model unconverted, so it can be retried on the same model.
+- ``local_hessian`` now calibrates the GGML IQ formats, which it previously left unchanged: like imatrix it encodes each weight once and pins the codes, but picks each group's local scale by the layer-output error under its inputs' 256-column Hessian, damped by the new ``perc_damp`` (default 0.3). Use ``{method: local_hessian}`` in place of ``{method: imatrix}``, alone or after GPTQ, as the new ``iq2_xxs_experts_only``, ``iq2_xs_experts_only`` and ``iq2_s_experts_only`` recipes do; it helps most at IQ2_XXS and IQ2_XS.
+- Add ``local_hessian_scales`` to the GPTQ config. GGML IQ formats then pick each block's local scales by the error GPTQ pays for that block once the later columns compensate, rather than by the squared error; on the IQ2_XXS models we tested it matched or beat both GPTQ and imatrix.
+- Add ``format_shard=(index, count)`` to ``mtq.auto_quantize`` to calibrate and score the searched formats in parallel processes, and ``mtq.merge_auto_quantize_checkpoints`` to combine the shard checkpoints into one that solves (and re-solves for other budgets) exactly like the unsharded search. Gradient and KL-divergence methods only.
+- Add ``auto_quantize.finalize_algorithm`` to AutoQuantize recipes: ``examples/hf_ptq/hf_ptq.py`` saves the search's scores and stops, and rerunning the same command quantizes the source weights with the selected per-layer formats and a layerwise algorithm such as sequential GPTQ. ``hf_ptq.py`` also takes ``--auto_quantize_format_shard`` / ``--auto_quantize_merge_shards`` to score the formats in parallel processes and merge their checkpoints, and ``mtq.get_auto_quantize_config`` takes the calibration ``algorithm`` of the returned config.
+- GPTQ now also quantizes HuggingFace fused MoE experts, each with its own Hessian from the tokens routed to it; they were previously skipped. The built-in IQ1 and IQ2 recipes therefore run GPTQ on the experts too, and large MoEs need layerwise calibration to hold one layer's expert Hessians at a time.
+- GPTQ no longer runs a max-calibration forward when no activation quantizer needs one, and ``hf_ptq.py`` now sizes the default layerwise calibration batch to what one decoder layer's forward fits in GPU memory, up to 32,768 tokens (64 samples at ``--calib_seq 512``), instead of 1. Layerwise GPTQ on HF fused-MoE models runs over 10x faster; pass ``--batch_size 1`` for the old batching.
+- Add ``hessian_input_dtype`` to the GPTQ and ``local_hessian`` algorithm configs. ``bfloat16`` accumulates the float32 Hessian with a tensor-core GEMM on bfloat16 activations, several times faster and without a float32 copy of each batch; the default ``float32`` keeps the existing float32 GEMM.
+- GPTQ and imatrix calibration of ``iq1_s``, ``iq1_m``, ``iq2_xxs``, ``iq2_xs`` and ``iq2_s`` now keep each weight's chosen super-block scales and search importance, and leave the weight unrounded instead of overwriting it with its decoding. QAD from such a checkpoint starts from the calibrated codes and trains codes under those fixed scales.
+- ``hf_ptq.py`` calibrates Qwen3.8 (``qwen4_exp``) without running its QSA indexer's per-query Python loop when every visible key fits the indexer's token budget, with bit-identical results. On Qwen3.8-Flash-Next this saves about two hours of layerwise calibration.
+
+*Quantization - QAT / QAD*
+
+- Add an experimental NeMo AutoModel NVFP4 expert adapter example with fixed published scales, FSDP2 training support, and expert-weight export. It supports the bias-free SwiGLU torch expert loop with expert parallel size 1.
+- Add a fake-quantized weight cache for QAT and QAD. Enroll the model with ``mtq.utils.enable_weight_cache(model)`` and wrap the forward and backward passes of each optimizer step in ``mtq.utils.weight_cache_scope(model)``: each weight is then fake-quantized once per step instead of once per micro-batch and activation recomputation, at the cost of one extra copy of each cached weight. It needs a straight-through weight gradient (``pass_through_bwd=True``, the default).
+- Speed up NVFP4 QAT and QAD of Hugging Face fused MoE experts: all experts of a projection are now fake-quantized in one kernel launch instead of one per expert, about 2x faster per MoE layer on Qwen3-30B-A3B with FSDP2.
+- Speed up Hugging Face QAT and QAD with ``QATTrainer``, ``QADTrainer`` or ``--manual_gc``: the ``gc.collect()`` run before each training step now skips the model and optimizer state, saving about 1 s per step (30%) on Qwen3-30B-A3B.
+
+*Quantization - Export & Deployment*
+
+- The functional quantized-weight export API now exports the KV cache: ``capture_kv_cache_export_state`` returns an attention module's ``k_scale`` / ``v_scale``, and ``build_hf_quantization_config`` takes the KV-cache formats from ``get_kv_cache_export_spec``.
+- The functional quantized-weight export API now packs weight-only MXFP4 (``W4A16_MXFP4``) weights, e.g. MXFP4 QAT of GPT-OSS experts, and rejects layers with rotated weight or input quantizers or custom quantization backends, which a packed weight cannot reproduce.
+- ``--use_fsdp2`` PTQ in ``examples/hf_ptq`` now supports vision-language models, not only Qwen3.5, calibrated on text or, with ``--calib_with_images``, on image-text samples; the vision tower is quantized only if the recipe enables it. A model whose forward requires images needs ``--calib_with_images``, and encoder-decoder models and Nemotron Nano VL are not supported yet.
+- Add ``examples/hf_ptq/convert_ggml_to_int8.py`` to expand a checkpoint exported with a GGML recipe (IQ formats, ``q8_0``) into an INT8 weight-only compressed-tensors checkpoint. Stock vLLM serves it with its integer kernels at about half the BF16 weight memory, reproducing the GGML weights up to rounding their scales to the model dtype.
+- Add an opt-in no-gather HuggingFace export for FSDP2-sharded models: with ``MODELOPT_FSDP2_EXPORT=nogather``, ``export_hf_checkpoint`` moves each tensor once, to the one rank that writes it, instead of all-gathering each FSDP2 unit on every rank as the default export does. Fused MoE experts stay sharded, each rank writing its own, and a conversion mapping that splits or merges tensors, which the default export refuses, is reversed as a single-process export reverses it.
+- Add expert-parallel PTQ for HuggingFace MoE models to ``examples/hf_ptq/hf_ptq.py``: under ``torchrun``, each rank holds only its share of the routed experts, tokens reach them by all-to-all, and every rank calibrates on its own slice of the data. ``MODELOPT_EP_DEGREE`` and ``MODELOPT_FSDP_SIZE`` override the automatic choice of expert-parallel degree and of FSDP2-sharding the dense layers, and the quantized checkpoint is written by every rank in parallel without gathering the model.
+
+*Quantization - Recipes*
+
+- Add a checkpoint-specific NVIDIA Nemotron 3.5 Super VL AutoQuantize recipe with a 4.9-effective-bit NVFP4-MSE/FP8/BF16 search and fixed NVFP4 MTP experts. Select it under ``models/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16/auto_quantize/``.
+
+*Speculative Decoding*
+
+- Add a model-agnostic native MTP training API with adapter registration, LK loss by default, optional hidden-state mixing, and standard Hugging Face weight saves. Model-specific adapters and command-line recipes are not yet included.
+- Add reusable masked LK-lambda and soft-target cross-entropy losses, and configurable offline feature mappings for custom speculative training modules.
+- Add uniform-layer hidden-state mixing for Hugging Face and Megatron EAGLE training. Enable it with ``eagle_mix_hidden_states=True`` and ``eagle_mix_hidden_states_mode="uniform_layer_sample"``; the default ``sparse_replace`` mode preserves the existing mixing behavior.
+- Streaming datasets accept JSON-encoded conversation and tool fields and preserve per-row chat-template arguments.
+- Add the **external draft** speculative-decoding mode: train a pretrained standalone draft model against a cached base model, instead of grafting a draft head onto the target. Select it with ``mtsp.convert(draft, [("external", cfg)])`` or the ``speculative_external`` recipe; the draft keeps its own embeddings and lm_head and exports as an ordinary HF checkpoint.
+- Add support for the `SPEED-Bench v1.1 <https://huggingface.co/datasets/nvidia/SPEED-Bench>`_ dataset.
+- With ``training.dataloader_num_workers`` > 0, ``examples/speculative_decoding/main.py`` now yields each training batch as soon as a worker finishes it, so one slow sample, such as a slow hidden-state fetch in streaming training, no longer stalls every DDP rank. Sample order within the prefetch window is then no longer deterministic; set ``training.dataloader_in_order=true`` to restore it (context-parallel and ``full_determinism`` runs always keep it).
+- The ``general/speculative_decoding/dflash2`` recipe now enables ``dflash_use_torch_compile`` and ``dflash_use_flex_attention``, and turns ``tf32`` off, which compilation needs on PyTorch 2.9 and 2.10. To train eagerly as before, start the run with ``dflash.dflash_use_torch_compile=false dflash.dflash_use_flex_attention=false``; a run resumed from a checkpoint keeps the checkpoint's DFlash settings.
+
+*Megatron Framework (M-LM / M-Bridge)*
+
+- Add ``--output_qdq_weight`` to Megatron-Bridge PTQ to save decoded floating-point weights with ModelOpt state for QAD; GGML IQ super-block scales remain fixed during training. Custom PTQ pipelines can call ``mtq.initialize_qdq_weights(model)``.
+- Add ``--trainable_params`` (alias ``--trainable_parameter_patterns``) to ``examples/megatron_bridge/distill.py`` to train selected student weights, including full-rank routed-expert QAD. Reuse the selection on native resume.
+- Add ``--sft_in_batch_packing``, ``--moe_aux_loss_coeff`` and ``--dsa_kernel_backend`` to ``examples/megatron_bridge/distill.py`` (``--dsa_kernel_backend`` also to ``quantize.py``): pack ``--sft_hf_dataset`` conversations per micro-batch instead of padding each to ``--seq_length``, override the MoE load-balancing loss weight (e.g. 0 for padded SFT data), and select fused DeepSeek sparse-attention kernels for long sequences.
+- Add opt-in revision-pinned chat-blend preparation with indexed programming-question recovery, complete-record deduplication, question-isolated validation, and source shortfall/provenance reports.
+- Add ``--fake_quant_weight_cache`` to ``examples/megatron_bridge/distill.py`` to fake-quantize each student weight once per QAD step instead of once per micro-batch and activation recomputation. It costs an extra BF16 copy of the student's quantized weights per GPU.
+- Add ``skip_frozen_mtp`` to the Megatron ``DistillationConfig`` (``--skip_frozen_mtp`` in ``examples/megatron_bridge/distill.py``): training forwards skip the frozen MTP head of the student and the teacher, while evaluation still runs it and its weights are saved and exported unchanged. It supports GPTModel-based models such as Qwen3.5 / Qwen3.6 without pipeline parallelism.
+- Add ``--document_boundaries`` to ``examples/megatron_bridge/distill.py`` to attend within each document of a pre-tokenized window, and ``tokenizer`` / ``max_length`` / ``pack_max_tokens`` to ``chat_jsonl`` blends to drop conversations with nothing to train and pair the rest for ``--sft_in_batch_packing``. Packed distillation of Gated DeltaNet models needs ``flash-linear-attention`` >= 0.5.2 (earlier versions compute it wrongly), which ``nemo:26.10`` ships.
+- Add ``--num_layers_in_first_pipeline_stage``, ``--num_layers_in_last_pipeline_stage`` and ``--recompute_num_layers_per_stage`` to ``examples/megatron_bridge/distill.py`` to balance pipeline-parallel distillation: give the last stage, which also runs the output layers and KD loss, fewer layers, and recompute fewer layers on later stages.
+- Add ``--vllm_fakequant_export`` to ``examples/megatron_bridge/export_quantized_megatron_to_hf.py`` to evaluate PTQ / QAD checkpoints in vLLM for formats it has no kernels for (e.g. NVFP4 on Hopper, GGML IQ): it folds the weight quantizers into BF16 weights and saves through Megatron-Bridge at any TP / EP / PP, LLMs and VLMs, with the activation and KV-cache quantizers in sidecars that ``examples/vllm_serve/vllm_serve_fakequant.py`` loads automatically. Also allow ``--ep_size`` > 1 for checkpoints built with ``--no_moe_grouped_gemm``.
+- GGML GPTQ checkpoints from ``examples/megatron_bridge`` keep their calibrated codes when the Megatron checkpoint is reloaded for QAD or export, and layerwise calibration now runs on Megatron vision-language models.
+- The Megatron unified HF export (``export_mcore_gpt_to_hf``) now copies the source checkpoint's non-model files (tokenizer, processor, remote code, chat templates, ...) into the export unchanged, from local disk only. The ``examples/megatron_bridge`` scripts make a Hugging Face Hub model local first with ``modelopt.torch.export.ensure_local_checkpoint``.
+- Add an end-to-end W4A4 NVFP4 PTQ and QAD tutorial for NVIDIA Nemotron 3.5 Super VL, covering chat-data blend preparation, assistant-only distillation, Hugging Face export and vLLM serving. See `examples/megatron_bridge/tutorials/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/megatron_bridge/tutorials/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16/>`_ for details.
+- Add GLM-5.3-Flash (``glm5_next``) support to ``examples/megatron_bridge`` PTQ and unified HF export with the ``models/zai-org/GLM-5.3-Flash-BF16/ptq/nvfp4_experts_dense_mlp-kv_fp8_cast`` recipe, matching ``nvidia/GLM-5.3-Flash-NVFP4``, and two GGML IQ2_S recipes for its routed experts: ``models/zai-org/GLM-5.3-Flash-BF16/ptq/iq2_s_experts-q8_0_shared_dense-gptq`` and, with weight-only NVFP4 on the experts' down projections, ``iq2_s_experts-nvfp4_down-q8_0_shared_dense-gptq``. Requires a Megatron-Bridge newer than the ``nemo:26.10`` container; see ``examples/megatron_bridge/README.md``.
+
+*Sparsity*
+
+- ``mts.sparsify`` now also applies sparse attention: pass a sparse attention config such as ``mts.SKIP_SOFTMAX_CALIB`` in place of the mode, or combine it with weight sparsity in one call, e.g. ``mts.sparsify(model, [("sparsegpt", {}), ("sparse_attention", mts.SKIP_SOFTMAX_DEFAULT)], forward_loop=forward_loop)``. ``mts.export`` now also handles models with sparse attention, which it keeps.
+
+*Misc*
+
+- ModelOpt MCP can track launcher jobs in MLflow and archive terminal status and task logs.
+- Launcher pipelines can prepare declared assets through an optional provider before submission, mount resolved inputs read-only, and record their versions in experiment metadata.
+- The ``evaluation`` agent skill can stop looping ("doom loop") reasoning early: ask it to avoid doom loops and it adds vLLM's ``repetition_detection`` request field (vLLM 0.17.0 or later) to every task, ending a request once its output repeats. Use the same setting for baseline and candidate runs.
+- ``modelopt.torch.utils.plugins.model_load_utils.load_pretrained`` now loads a model distributed under ``torchrun``, with an MoE's routed experts sharded across the ranks, FSDP2-sharded or whole on every rank, by the plan ``resolve_distribution_plan`` decides or one passed as its new ``distribution`` argument.
+
+**Backward Breaking Changes**
+
+- Offline speculative-training ``.pt`` files now use ``training.data_seed`` (falling back to ``training.seed``) to shuffle before applying ``data.sample_size``, and model initialization now follows ``training.seed``. Runs resumed from earlier versions may see a different sample order or selected subset.
+- ``QDQAutotunerBase.export_onnx(output_path=...)`` now returns ``None`` instead of serialized bytes. Omit ``output_path`` to keep the bytes-returning behavior, which remains subject to protobuf size limits.
+- ``examples/hf_ptq/hf_ptq.py`` launched by ``torchrun`` on more than one rank without ``--use_fsdp2`` now runs one distributed job instead of one independent run per process: an MoE that can shard its experts runs expert-parallel, any other model is replicated with each rank calibrating its own share of the data, and only rank 0 exports a replicated model. Such a launch refuses ``--low_memory_mode``, ``--use_seq_device_map``, ``--offload_folder``, AutoQuantize recipes and, under expert parallelism, ``--vllm_fakequant_export`` and ``--experts_implementation``, and any multi-rank launch now refuses layerwise-export recipes, the TensorRT-LLM checkpoint export and a ``--device`` other than ``cuda``: launch without ``torchrun`` for them.
+- ``examples/hf_ptq/hf_ptq.py --use_fsdp2`` on more than one GPU now refuses calibration that keeps its statistics on each rank, which calibrated the ranks' shards of a weight differently: AWQ-Lite, AWQ-Full, SVDQuant, local Hessian and imatrix, also as an AutoQuantize candidate (run them without ``--use_fsdp2``). It also raises when a calibration batch runs out of GPU memory, instead of retrying it in smaller pieces: set ``--batch_size`` to one that fits.
+- ``export_mcore_gpt_to_hf`` given a Hugging Face Hub model ID no longer writes the tokenizer, processor, generation config or remote-code files. Pass a local directory instead, e.g. from ``modelopt.torch.export.ensure_local_checkpoint``.
+- Drop support for Python 3.10, which has reached end-of-life. ModelOpt now requires Python 3.11 or later.
+- Bump minimum required PyTorch version to 2.10.
+- Bump minimum required ``diffusers`` version to 0.37, ``peft`` to 0.18.1, ``accelerate`` to 1.6 and ``nltk`` to 3.9 for the ``[hf]`` extra.
+- Drop support for Transformer Engine 1.x. Quantizing Transformer Engine modules now requires Transformer Engine 2.0 or later.
+- ``load_pretrained`` called in a process group of several ranks now decides how to distribute the model instead of loading it whole on every rank: it shards a supported MoE's routed experts across the ranks and FSDP2-shards a model too big for one GPU, and a sharded load refuses what it cannot honor, such as placement arguments, a ``dtype``, a quantized checkpoint or a call inside ``init_quantized_weights``. To keep loading the model whole on every rank, set ``MODELOPT_EP_DEGREE=1`` and ``MODELOPT_FSDP_SIZE=1``, or pass ``distribution=DistributionPlan(<ranks>, dense="replicate")``; the guide "Loading Hugging Face models across ranks" has the details.
+- ``load_pretrained`` loading a model whole on several ranks now places it on each rank's own GPU unless ``device_map`` is passed.
+- ``load_pretrained`` now records how it distributed the model on the model it returns, even in a single process, so ``fsdp2_wrap`` refuses that model; to shard a model yourself, wrap one loaded with ``from_pretrained``.
+- Diffusion HF exports now omit attention quantizer buffers by default, except for FLUX.1, which retains enabled Q/K/V ``_amax`` keys for runtime compatibility; other consumers of those keys can opt in with ``export_attention_quantizers=True`` (CLI: ``--extra-param export_attention_quantizers=true``). Disabled attention quantizers remain excluded, and diffusion components, including LTX-2, no longer emit KV-cache quantization metadata.
+- ``hf_quant_config.json`` of an INT4 or W4A8 AWQ checkpoint now sets ``pre_quant_scale`` per layer, only for layers that have the tensor. A model whose fused-MoE experts have none (AWQ never applies to them) is now exported as ``MIXED_PRECISION`` with per-layer entries instead of a uniform algorithm.
+- The Windows FVD example rejects I3D checkpoints requiring unrestricted pickle loading. Custom TorchScript archives now require ``--weights-sha256`` with a trusted checksum; tensor state dictionaries continue to load directly.
+- SPEED-Bench preparation script in ``examples/specdec_bench/prepare_data.py`` now supports only the latest version (v1.1); older versions of the dataset, including v1.0, are no longer supported.
+- A ``modelopt_state`` saved by an earlier release for a Hugging Face model whose fused MoE experts are stored transposed without a quantized wrapper of their own (for example Aria's) no longer restores, since those experts are now left unquantized. The checkpoints such a state exported had wrong expert weights, so there is nothing to migrate.
+- ``mtq.quantize`` and ``mto.restore`` no longer force a Hugging Face model's fused MoE experts onto the ``eager`` backend: calibration and every later forward (QAT/QAD training, AutoQuantize scoring, fake-quant evaluation) run on the ``grouped_mm`` backend Transformers selects by default, so calibrated activation scales (some of Qwen3-30B-A3B's moved by up to about 10%), step time and memory can differ from earlier releases. Load the model with ``experts_implementation="eager"`` (``--experts_implementation eager`` in ``hf_ptq.py``) to run as earlier releases did.
+- ``mtq.calibrate`` now raises an error, naming the modules, when a Hugging Face fused-experts forward reaches neither quantizer hook (a hand-written ``bmm`` forward that transformers cannot redirect, say), instead of exporting weight-derived input scales with a warning.
+
+- Layerwise-calibration resume (``checkpoint_dir``) now loads checkpoint files with ``weights_only=True``. A checkpoint directory written by an earlier release whose layer inputs hold objects other than tensors, plain containers or Hugging Face dynamic caches can no longer be resumed; recalibrate in a fresh directory, or disable checkpointing.
+- ``export_hf_checkpoint`` now reads how a model is distributed from the plan recorded on it, and raises for an FSDP2-sharded model, or one in a multi-rank run, that carries none. ``load_pretrained`` and ``examples/hf_ptq/hf_ptq.py --use_fsdp2`` record it; for a model you distribute yourself (``fsdp2_wrap`` and ``parallel_load_and_prepare_fsdp2`` record none), or export from several ranks as a DDP script does, record one with ``modelopt.torch.utils.distributed.set_distribution_plan`` before calibrating or exporting it, e.g. ``DistributionPlan(world_size)`` when every rank holds the whole model.
+- Streaming speculative-decoding training's vLLM connector (``modelopt.torch.speculative.plugins.rdma_hidden_states_connector``) now requires vLLM 0.22 or later. It is tested with vLLM 0.29 and later.
+- The yes/no environment variables ``MODELOPT_NVFP4_TRITON_SWEEP``, ``MODELOPT_SKIP_WEIGHT_QUANT_CHECK`` and ``MODELOPT_TEGROUPED_COMPILE_WEIGHT_LOOP`` now take ``1``/``0``, ``true``/``false``, ``yes``/``no`` or ``on``/``off`` in any case and raise on any other value, which they used to ignore. ``modelopt.env`` documents every ``MODELOPT_*`` variable ModelOpt reads.
+
+**Deprecations**
+
+- ``modelopt.torch.export.import_mcore_gpt_from_hf`` is deprecated and will be removed in 0.50.0; it now emits a ``DeprecationWarning``. Load Hugging Face checkpoints into Megatron-Core with Megatron-Bridge (``AutoBridge``) instead.
+- ``modelopt.torch.export.copy_non_safetensor_files_from_ckpt`` is deprecated; use ``copy_non_model_files``.
+- ``modelopt.torch.sparsity.attention_sparsity.sparsify`` (``mtsa.sparsify``) is deprecated; use ``mts.sparsify(model, config, forward_loop=forward_loop)``.
+- PyTorch 2.10 support is deprecated and will be dropped in a future release.
+- ``dflash_architecture_config.shift_label`` is deprecated and will be removed in 0.50, since ``projector_type`` fixes the label alignment (DSpark and Domino predict the next token): remove it from DFlash-family configs. Until then a value matching ``projector_type`` is ignored with a warning and any other raises, as it never took effect; checkpoints saved with it still load.
+
+**Bug Fixes**
+
+*Quantization*
+
+- QAT and QAD of the GGML formats (IQ, ``q8_0``) now re-encode trainable weights after every optimizer step, including under optimizers that write weights through a shared buffer or ``.data`` such as Megatron's distributed optimizer. With those optimizers the GGML codes used to stay those of each job's first forward, so re-run earlier Megatron QAD of these formats.
+- Megatron-Core fake quantization of Gated DeltaNet (Qwen3.5 / Qwen3.6) with a Transformer Engine ``in_proj`` now keeps its beta / alpha gates in BF16 during evaluation, QAD, ``fold_weight`` and the vLLM fake-quant export, matching deployment. Other ``in_proj`` layers stay fully quantized and warn.
+- AWQ-Clip's per-tensor clip, which ``nvfp4_awq_clip`` uses, is now searched over every data-parallel rank's data, as its block-wise clip already was, so the replicas of a weight take the same clip (exported amax values of data-parallel runs may change) and ``nvfp4_awq_clip`` works with ``examples/hf_ptq/hf_ptq.py --use_fsdp2`` on several GPUs.
+- ``hf_quant_config.json`` now declares ``pre_quant_scale`` only for INT4 / W4A8 layers that have the tensor; loading INT4 / W4A8 fused-MoE checkpoints in TensorRT-LLM also needs a release whose MoE loader treats it as optional. AWQ, SmoothQuant and SVDQuant now warn when they skip quantized fused-MoE experts.
+- Hugging Face fused MoE experts stored transposed, ``(num_experts, in_dim, out_dim)``, without a quantized wrapper of their own (for example Aria's) are now left unquantized with a warning. They were quantized with gate and up split along the wrong axis, so their exported weights were wrong; the Hugging Face export now refuses such a model's MoE block instead.
+- Calibrating a Megatron-Core model now gives the projections vLLM and TensorRT-LLM fuse into one GEMM one per-tensor input and weight range: MLA's and DeepSeek-V4's down-projections, and HF-named ones such as Kimi K3's MLA and KDA input projections with their gates; static NVFP4 also shares one global weight range between ``q_a_proj`` and ``kv_a_proj_with_mqa`` of Hugging Face DeepSeek-style models. Re-calibrate existing checkpoints to get the shared ranges.
+- Calibrating a Megatron-Core model with pipeline parallelism no longer hangs on, or mixes ranges across stages of, its ``TELinear`` layers (e.g. MLA down-projections, DSA indexer and latent-MoE projections). They now sync ranges over their own pipeline stage's tensor-, data- and context-parallel ranks instead of all ranks.
+- Fix ONNX INT4 RTN Q/DQ exports missing blocked quantization attributes, which prevented inference with ONNX Runtime CUDA and CPU execution providers. Re-export affected models.
+- ``export_mcore_gpt_to_hf`` and ``capture_kv_cache_export_state`` now write NVFP4 KV-cache ``k_scale`` / ``v_scale`` as amax / 448, like the HF exporter and as vLLM and TensorRT-LLM expect. They wrote amax / (6 * 448), which overflows in the attention kernels. Re-export Megatron checkpoints with an NVFP4 KV cache.
+- Loading a quantized Megatron-Core checkpoint into a model whose weights are not initialized yet, as Megatron-Bridge's ``load_megatron_model`` does, no longer fails with ``detected nan values in amax``. It failed whenever that memory held NaNs, e.g. on CPU or with pipeline parallelism.
+- Preserve accumulated histogram counts when computing an entropy calibration threshold with NumPy histograms.
+- ``mtq.quantize`` and ``mtq.calibrate`` now give every module back the training mode it had. They used to leave every module in the mode of the model passed in, so a module in eval mode inside a model in training mode came back in training mode.
+- Diffusers ``export_hf_checkpoint`` now honors ``save_modelopt_state=False`` (the default) when HuggingFace checkpointing is enabled. Pass ``save_modelopt_state=True`` to retain the ModelOpt state file.
+- Layerwise-calibration resume (``checkpoint_dir``) no longer runs code from a modified checkpoint directory; an unusable file now fails with an error instead.
+- The ``nvfp4_default-kv_none-gptq`` recipe no longer writes layerwise-calibration resume checkpoints by default, which made every multi-GPU (multi-process) run of it fail. To keep resumable checkpoints in a single-process run, set ``layerwise.checkpoint_dir`` in the recipe.
+- The default PTQ recipes now leave multi-token-prediction (MTP) layers unquantized in Megatron vision-language models too (``language_model.mtp.*``), as they already did at the model root.
+- ``mtq.fold_weight`` now folds sequential weight quantizers (e.g. W4A8 INT4 + FP8 weights) into the weights; it used to leave them unfolded and enabled.
+- Fix the diffusers skip-softmax HF export to emit the schema TensorRT-LLM VisualGen loads (``threshold_scale_factor.coefficients`` and a scalar ``target_sparsity``). Re-export checkpoints that failed to load.
+- Fix PTQ of native Transformers FP8 experts to apply source weight scales during calibration and export. Re-quantize affected checkpoints from the original FP8 source.
+- Fix KV-cache quantization through ``register_attention_for_kv_quant``, the fallback for Hugging Face attention classes that do not use the attention interface, attaching the ``q``, ``k`` and ``v`` bmm quantizers to the wrong tensors for most attention layouts. Recalibrate and re-export models quantized through this fallback. Attention classes that compute their scores with ``torch.baddbmm`` (e.g. ``BloomAttention``, ``GPTNeoXJapaneseAttention``) are no longer patched, since their operands were always wired wrong (or raised ``IndexError``), and now get the existing warning to register a custom quantized attention class.
+- Fix GPTQ with ``fused: true`` failing with a CUDA illegal memory access, or a Triton pointer error, on a model that ``device_map="auto"`` spreads over several GPUs once calibration reaches a layer outside the current GPU.
+- Fix calibrating a CPU- or disk-offloaded model running out of GPU memory as it progresses: the quantizer state calibration adds to an offloaded layer now leaves the GPU with the layer's weights instead of accumulating there.
+- Fix layerwise calibration replaying the wrong cached activations, or failing with ``is in 'run' mode but has no cached inputs to replay``, after a GPU out-of-memory error. It now stops with an error asking for a smaller calibration batch size.
+- Fix ``INT8_DEFAULT_CFG``, ``FP8_DEFAULT_CFG``, ``NVFP4_DEFAULT_CFG`` and the other presets and recipes that import ``configs/ptq/units/default_disabled_quantizers`` and enable ``*input_quantizer``: since 0.44 they also quantized ``nn.LayerNorm`` inputs, which adds quantization error to the residual stream of models built on ``nn.LayerNorm`` such as BERT-style encoders. Re-quantize affected models; a recipe that wants ``nn.LayerNorm`` quantizers must enable them after importing that unit.
+- Fix an illegal memory access in static NVFP4 fake quantization for tensors with more than 2^31 elements, such as stacked MoE expert weights. The kernel is also about 14x faster.
+- Fix ``fsdp2_aware_weight_update`` masking an error raised during its unshard (e.g. a CUDA OOM) with a spurious ``UnboundLocalError``.
+- Fix the ``--use_fsdp2`` loader silently leaving weights uninitialized for checkpoints that rely on key renamings Transformers registers on the top-level model class, such as Fuyu's; re-run affected PTQ jobs. The loader now raises if any parameter gets no tensor from the checkpoint.
+- Fix ``--use_fsdp2`` PTQ exports writing a default ``generation_config.json`` instead of the checkpoint's, which dropped its ``eos_token_id`` and ``pad_token_id`` so served models could generate past the end of their answer. Re-export, or copy the source's ``generation_config.json`` into existing exports.
+- Fix the ``--use_fsdp2`` loader rounding the tensors a model lists in ``_keep_in_fp32_modules_strict`` (or ``_keep_in_fp32_modules``, for fp16) to the checkpoint dtype, instead of keeping them in fp32 as ``from_pretrained`` does; re-run affected PTQ jobs. Tensors the model creates in fp32 itself were not affected.
+- Fix QAT of Hugging Face fused MoE experts with non-reentrant activation checkpointing, as in the ``examples/llm_qat`` FSDP2 config: the experts' ``F.linear`` interception stayed installed after the recompute, and training crashed with ``aten.mm.default got mixed torch.Tensor and DTensor``.
+- Fix quantization-aware training of Diffusers models failing in the backward pass with ``NotImplementedError`` once their attention modules are quantized, with or without MHA quantization.
+- Fix weight calibration, GPTQ and weight folding of Hugging Face fused MoE experts sharded by the expert parallelism of Transformers 5.16 and later, which used another rank's expert weights on every rank but the first.
+- Fix ``export_hf_checkpoint`` of an FSDP2 model quantized with W4A8 AWQ (``W4A8_AWQ_BETA_CFG``), which failed with an ``AttributeError`` on every rank.
+- AWQ calibration (``awq_lite``, ``awq_full``) of an FSDP2 model sharded over more than one rank is now rejected with ``NotImplementedError`` by ``mtq.quantize``, ``mtq.calibrate`` and ``mtq.auto_quantize`` (before its search starts, its default formats included), and by ``examples/hf_ptq --use_fsdp2`` before loading the model: each rank would fold a different smoothing scale into its weight shard. Calibrate in a single process, or use a non-AWQ algorithm.
+- ``mtq.compress`` now rejects W4A8 weights with ``NotImplementedError``: a compressed W4A8 model could neither run nor be reloaded.
+- Fix dynamic NVFP4 fake quantization with a block size other than 16, such as the block-32 weights of ``W4A8_NVFP4_FP8_CFG`` and ``NVFP4_MLP_WEIGHT_ONLY_CFG``, using blocks of 16 on GPUs with compute capability 8.9 or newer. Regular checkpoint exports after non-layerwise ``max`` calibration are unaffected; redo QAT, QAD, GPTQ, AWQ and layerwise calibration, vLLM fake-quant exports and fake-quantized accuracy evaluation done with such configs.
+- Fake quantization of an NVFP4 affine KV cache (``nvfp4_affine``) now applies its calibrated bias; it ignored the bias and saturated the simulated KV cache. Re-quantize and re-evaluate models quantized with it.
+- Fix NVFP4 fake quantization (e.g. ``NVFP4_DEFAULT_CFG``) with Triton 3.9, as in the PyTorch 26.11 container, on GPUs with compute capability 8.9 or newer: it failed with ``NotImplementedError: Block pointers have been removed in favor of the tensor descriptor API``.
+- Fix the Hugging Face export of a quantized Wan VAE (``AutoencoderKLWan``), which declared NVFP4 or FP8 in its ``quantization_config`` but saved its ``Conv3d`` weights unquantized: NVFP4 weights are now packed with their scales, other formats raise an error, and ``examples/diffusers`` quantizes only the decoder convolutions that text-to-video calibration runs. Re-quantize affected VAEs with the updated example: a VAE restored with ``--restore-from`` from an older example checkpoint keeps its uncalibrated encoder quantizers, and exporting it now raises.
+- The Hugging Face export of a diffusers model now raises an error, instead of writing a checkpoint without ``input_scale``, when a component's static input quantizers (e.g. NVFP4 or FP8) were never calibrated, as with Wan 2.2's ``transformer_2`` calibrated with ``--n-steps 1``. Calibrate with enough denoising steps to run every quantized component and re-export.
+
+*ONNX*
+
+- Fix ONNX AutoCast inference shape mismatches caused by incorrectly shared symbolic dimensions, and preserve intermediate shapes when using standalone type inference. Reconvert affected models.
+- Fix ONNX loading and quantization graph exports failing on individual initializers larger than 2 GiB, while preserving nested scopes and sequence/optional value types.
+- Saving ONNX external weights to another directory no longer removes a same-named weight file from the working directory. Existing external weights remain intact when saving a model loaded without weight data.
+- ONNX autotuner file exports now save external weight data without serializing the full model to bytes first.
+- Fix ONNX quantization placing a per-tensor Q/DQ pair on a rank-0 (scalar) constant input, which TensorRT's ONNX parser rejects (``convertAxis`` asserts the quantization axis lies in ``[0, nbDims]`` but ``nbDims == 0``). Rank-0 constant operands are now kept unquantized in the int8, fp8, and autotune export paths; the existing single-element Mul/Div/Pad stripping stays gated under ``target_dla``.
+- Fix ONNX AutoCast crashes on systems without standalone TensorRT Python bindings.
+- Fix ONNX remote AutoQDQ safety benchmarks returning infinite latency by running the generated engine with ``trtexec_safe`` on the configured target.
+- Fix ONNX quantization with the default ``concat_elimination`` pass crashing in calibration with ``KeyError: '<tensor>_ReduceMin'`` when a ``Concat`` input is a constant, such as the class token of a ViT.
+- Fix ONNX INT4 quantization ending the Python process when the INT4 packing extension fails to build, for example without a C++ compiler. It now falls back to the Python implementation.
+- Fix the column-major ``DequantizeLinear`` surgery leaving a negative or default ``axis`` attribute unchanged while transposing the weight it refers to, which changed the model's output. Re-run the surgery on affected models.
+- Fix BF16-to-FP8 ONNX export with ``ml_dtypes`` 0.7.0 producing NaN FP8 weights for very small convolution weights.
+- Fix AutoCast turning FP64 initializers and ``Constant`` values that exceed the FP32 range into infinities. They are now clamped to the largest FP32 value and the affected tensor is named in a warning.
+- Fix AutoCast flipping the sign of an initializer value too small for the target precision; such values now keep their sign.
+
+*Speculative Decoding*
+
+- Fix gradients propagated between TTT steps being multiplied by the tensor-parallel size in Megatron EAGLE training with ``use_aux_hidden_state=False`` and ``sequence_parallel=True``. This also corrects runs with hidden-state mixing disabled; reported losses are unchanged.
+- Fix gradient accumulation averaging for Hugging Face EAGLE, Medusa and external draft training. Logged loss and gradient norms now use the corrected scale.
+- Fix EAGLE3 training to normalize raw draft hidden states independently of token embeddings, matching the exported architecture. Re-train drafts trained before this fix if acceptance rate is lower than expected.
+- Fix GPT-OSS draft training with pre-normalization teacher hidden states by enabling the target model's final normalization.
+- Fix vanilla DSpark exports to use the Qwen3 DSpark architecture, head names and configuration expected by vLLM. Re-export existing training checkpoints to use this format.
+- DSpark and Domino exports now write the ``shift_label``, ``markov_rank`` and other head fields they were trained with. Domino's HF AR validation (``pseudo_speculative_generate``) now raises instead of scoring the backbone one block position off; Domino acceptance cannot be measured until a runtime applies its correction head.
+- EAGLE training with ``eagle_decoder_type="kimik2"`` now downloads the Kimi-K2 modeling code from a pinned ``moonshotai/Kimi-K2-Thinking`` revision and verifies its SHA-256 hashes before importing it. Offline runs need that revision in the Hugging Face cache.
+- Fix streaming speculative-decoding training copying the whole training corpus into every rank and every DataLoader worker, which ran trainer nodes out of host memory on corpora of a few million samples. The corpus now stays memory-mapped.
+- Fix streaming speculative-decoding training capturing another request's hidden states when the vLLM serve ran requests concurrently, and failing on vLLM 0.29 and later. Retrain drafters trained in streaming mode against a serve that ran requests concurrently.
+- Fix DFlash-family drafters (DFlash, DFlash2, DSpark, Domino, LiLiCorr) trained from scratch with ``examples/speculative_decoding/main.py`` having their RoPE frequencies rounded to BF16, so they trained under different rotary phases than vLLM serves them with.
+- Fix DFlash2's candidate-selector loss weighing every block position equally and dividing by its own count of positions, unlike the backbone loss and the SGLang/SpecForge DFlash2 reference. Logged DFlash2 losses change.
+- Fix the Hugging Face export of a quantized Wan VAE (``AutoencoderKLWan``), which declared NVFP4 or FP8 in its ``quantization_config`` but saved its ``Conv3d`` weights unquantized: NVFP4 weights are now packed with their scales, other formats raise an error, and ``examples/diffusers`` quantizes only the decoder convolutions that text-to-video calibration runs. Re-quantize affected VAEs with the updated example: a VAE restored with ``--restore-from`` from an older example checkpoint keeps its uncalibrated encoder quantizers, and exporting it now raises.
+- The Hugging Face export of a diffusers model now raises an error, instead of writing a checkpoint without ``input_scale``, when a component's static input quantizers (e.g. NVFP4 or FP8) were never calibrated, as with Wan 2.2's ``transformer_2`` calibrated with ``--n-steps 1``. Calibrate with enough denoising steps to run every quantized component and re-export.
+- Fix ``examples/megatron_bridge/distill.py`` crashing on the first step when distilling a model that uses mRoPE (e.g. Qwen-VL, Qwen3.5) with ``--pp_size`` greater than 1.
+
+*Megatron Framework (M-LM / M-Bridge)*
+
+- Nested ``only_student_forward()`` and ``only_teacher_forward()`` contexts now preserve the enclosing execution mode, including when an inner context is disabled or raises an exception.
+- Fix Megatron Top-K/Top-P distillation gradients being multiplied by the tensor-parallel size when tensor parallelism is enabled; reported loss values are unchanged.
+- Fix Megatron Top-K/Top-P distillation running out of memory at long sequence lengths with large vocabularies: since 0.48 its full-vocabulary normalizers kept several float32 copies of the logits alive. It now adds about one copy of the logits in their own dtype, and stays accurate for logits with a large common offset.
+
+*Misc*
+
+- Fix the Puzzletron memory objective pricing the KV cache with ``hidden_size // num_attention_heads`` instead of the model's ``head_dim``, which misestimated it for models such as Mistral-Small, GPT-OSS and Gemma-3 and for every candidate with a pruned hidden size. Recompute subblock statistics produced with earlier versions.
+- The ``evaluation`` agent skill's NeMo Gym MRCR recipe no longer passes ``HF_TOKEN`` on the command line, where other users on the node could read it, and keeps its rollout script in a private temporary directory instead of a fixed ``/tmp`` path.
+- Fix ``ModuleNotFoundError: No module named 'huggingface_hub'`` when importing ``modelopt.torch`` without the optional ``hf`` extra. Install the ``hf`` extra to use Hugging Face checkpointing. Affects 0.44 through 0.48.
+- Require Pydantic 2.5.0 or newer to prevent configuration-schema errors when importing ``modelopt.torch`` with older releases.
+- Require Wonderwords 2.2.0 or newer in the ``hf`` extra to prevent RULER calibration failures during random-word generation with older releases.
+- A legacy dict-format ``quant_cfg`` now applies its ``"default"`` key before the other keys wherever it appears, as before 0.44.
+
+0.48.0 (2026-11-02)
+^^^^^^^^^^^^^^^^^^^
+
+**New Features**
+
+*Sparsity*
+
+- Add skip-softmax calibration through vLLM for FlashAttention and FlashInfer, requiring ``--validation_prompts_file`` and validating serving sparsity on calibration and held-out prompts before exporting prefill/decode fits and their validation scope as ``sparse_attention_config``. Calibration uses single-sequence, unchunked eager execution; serving preserves the calibrated 128-token KV-tile granularity and 128-row prefill Q tiles, autotunes only its execution schedule, and uses a smaller Q tile for one-token decode.
+- Sparse-only vLLM installs now reject unsupported DCP, DBO/ubatching, speculative decoding, and FULL mixed-batch CUDA graphs; calibrated decode also rejects FULL decode graphs.
+
+*Quantization*
+
+- Add metadata-only export specifications and non-mutating per-weight quantizer-state capture.
+- Add functional quantized-weight packing, topology-aligned state merge/select and transport APIs, and canonical Hugging Face quantization-config construction.
+- HF export records canonical activation schemes, group/block sizes and weight-only MXFP4 metadata; mixed-format exports retain unquantized-layer exclusions, and non-square FP8 block layouts are rejected.
+- Add Q8_0 weight-only quantization with 32-value GGML blocks, packed unified HF and Megatron export, and a built-in ``q8_0`` PTQ recipe.
+- Add Hugging Face PTQ calibration and export support for Nemotron-H MTP modules, preserving calibrated expert input scales.
+- Add the ``models/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16/ptq/nvfp4-mse`` PTQ recipe, the PTQ stage for NVIDIA Nemotron 3.5 Super VL: weight-MSE calibrated NVFP4 routed and shared MoE experts, FP8 attention projections, Mamba ``in_proj``/``out_proj`` and ``lm_head``, and an FP8 KV cache. The latent MoE, router, embeddings and the vision and audio encoders stay in BF16, and the MTP rules apply only to checkpoints that carry an MTP tail. It reproduces the released precision assignment, not the released weights: the published NVFP4 checkpoint adds quantization-aware distillation after this stage.
+- Backfill checkpoint aliases for three more published NVFP4 releases: ``moonshotai/Kimi-K2.7-Code``, ``google/gemma-4-26B-A4B-it`` and ``google/diffusiongemma-26B-A4B-it``. Each imports an existing general recipe wholesale rather than copying its body.
+- Backfill checkpoint aliases for nine more published NVFP4 releases, so each is reachable from its source model's hub path: ``zai-org/GLM-5.1`` and ``GLM-5.2``, ``MiniMaxAI/MiniMax-M2.5`` and ``MiniMax-M3``, ``deepseek-ai/DeepSeek-V3.1`` and ``DeepSeek-V3.2``, ``Qwen/Qwen3-235B-A22B-Instruct-2507`` and ``-Thinking-2507``, and ``Qwen/Qwen3.6-27B``. Each imports an existing general or architecture recipe wholesale rather than copying its body.
+- Add composed Hugging Face AutoQuantize recipes that run fixed PTQ or weight AutoQuantize before
+  a separate KV-cache AutoQuantize stage, with independent resumable checkpoints for the weight and
+  KV searches. Uniform-weight plus layer-wise mixed-KV exports are marked unsupported for deployment
+  until a runtime consumes that metadata combination.
+- Add IQ1_S and IQ2_XS weight-only quantization with GGML-compatible 256-value block encoders, built-in ``iq1_s`` / ``iq2_xs`` PTQ recipes, and unified HF and Megatron export of the packed blocks. Quantized weights must have a final dimension divisible by 256, and Megatron export requires tensor and pipeline parallel sizes of 1.
+- Add ``iq2_xxs`` weight-only quantization with a CUDA encoder and a ``general/ptq`` recipe, at 2.0625 bits per weight between ``iq1_s`` and ``iq2_xs``. The same 256-value block constraint applies.
+- Add ``iq2_s`` weight-only quantization with a CUDA encoder and a ``general/ptq`` recipe, at 2.5625 bits per weight above ``iq2_xs``. The same 256-value block constraint applies.
+- Add ``iq1_m`` weight-only quantization with a CUDA encoder and a ``general/ptq`` recipe, at 1.75 bits per weight between ``iq1_s`` and ``iq2_xxs``. The same 256-value block constraint applies.
+- GPTQ (``algorithm: {method: gptq}``) now supports the GGML formats (``iq1_s``, ``iq1_m``, ``iq2_xxs``, ``iq2_xs``, ``iq2_s``, ``q8_0``). Each GGML block is quantized as a whole and its error compensated in the later columns, and export writes exactly the codes GPTQ chose. ``block_size`` must be a multiple of the format's block size (256 for the IQ formats). The built-in ``iq1_s``, ``iq1_m``, ``iq2_xxs``, ``iq2_xs`` and ``iq2_s`` recipes now quantize only the MLP/MoE weights and calibrate them with GPTQ, so they need calibration data.
+- The ``iq1_s``, ``iq1_m``, ``iq2_xxs``, ``iq2_xs`` and ``iq2_s`` encoders accept an optional per-input-column ``importance`` that weights each value's squared error in the codebook search, as llama.cpp's imatrix does. GPTQ's new ``importance_weighted`` option passes them the square root of its Hessian diagonal, and the built-in IQ1 and IQ2 recipes enable it, so each block's search favours the columns its outputs depend on most.
+- A recipe can now **delegate its whole body to another recipe** with a top-level ``$import``; any top-level key given alongside it overrides the imported one. ``metadata.recipe_type`` became optional along with it: a recipe states its kind with a ``# modelopt-schema:`` comment, with ``metadata.recipe_type``, or by delegating to a recipe that does, and only a recipe that another file imports has to carry the schema comment. Whatever a recipe does state must be true: a schema comment and a ``recipe_type`` must agree, and so must a recipe and the recipe it delegates to. ``modelopt_recipes/models/`` uses this for checkpoint entries that a portable recipe already reproduces: the entry aliases that recipe instead of copying it.
+- Backfill the recipes behind NVIDIA's already-published checkpoints under ``modelopt_recipes/models/``, so a released checkpoint's quantization scheme is reachable from its own model-hub path rather than only from the general tier. For example, ``moonshotai/Kimi-K2.6`` (published as ``nvidia/Kimi-K2.6-NVFP4``) and ``Qwen/Qwen3.5-397B-A17B`` (published as ``nvidia/Qwen3.5-397B-A17B-NVFP4-V2``) each alias a portable recipe wholesale -- the general expert-only NVFP4 recipe and the ``qwen3_5_moe`` architecture recipe respectively -- rather than copying its body; other checkpoints follow in separate changes.
+- Add ``layerwise.export_dir``: layerwise calibration writes each decoder layer to its own quantized checkpoint shard as it finishes, so no separate ``export_hf_checkpoint()`` pass is needed and, with ``layerwise.checkpoint_dir``, an interrupted run resumes without redoing finished layers. Calibration writes the layer shards; ``finalize()`` on the exporter left on the model adds the tail shard, the index and the config artifacts, and the checkpoint does not load until it runs. ``examples/hf_ptq`` does this for you. Supports FP8 and NVFP4 on single-process models, resident or offloaded, including multimodal models and models with MTP layers; other formats and placements raise ``NotImplementedError`` before calibration starts.
+- Add support for quantizing and calibrating enabled operators outside the transformer layers, such as ``lm_head``, when using layerwise calibration.
+- Add an end-to-end BEVFormer ONNX PTQ example with temporal calibration data generation, INT8 and FP8 quantization, TensorRT engine building, and nuScenes accuracy evaluation. See `examples/onnx_ptq/bevformer/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/onnx_ptq/bevformer>`_ for details.
+- Add a reusable local-Hessian NVFP4 PTQ recipe and the quantization recipe used for ``nvidia/Qwen3.8-27B-NVFP4``.
+- Add experimental dynamic FP8 fake quantization of GatedDeltaNet chunk-boundary states and WY activations for training through the standard ``quant_cfg`` interface. The fused GDN path requires ``fla-core==0.5.1`` and chunk size 64; state emulation requires SM89 or newer.
+- Add fake quantization of the sparse-attention indexer key cache and query for DeepSeek-V4 (vLLM and Megatron-Core) and GLM-5.3-Flash (vLLM) through the new ``indexer_k_quantizer`` and ``indexer_q_quantizer``. Enable them by importing the ``configs/ptq/units/indexer_k_nvfp4`` and ``configs/ptq/units/indexer_q_nvfp4`` units (NVFP4 with the global scale fixed to 1) into a recipe.
+- Add ``indexer_scorer_kwargs_quantizer`` to pass keyword arguments, such as the numerics options of a DeepGEMM build, to the DeepGEMM indexer scorer kernel of GLM-5.3-Flash per layer in vLLM fake-quant serving; see `examples/vllm_serve/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/vllm_serve>`_.
+- Add the ``configs/ptq/units/kv_nvfp4_mla`` recipe unit for fake quantization of the MLA KV cache (DeepSeek-V3, GLM-5.3-Flash, ...) in vLLM fake-quant serving: NVFP4 for the latent and FP8 for the RoPE key. See `examples/vllm_serve/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/vllm_serve>`_ for an example recipe.
+- Add fake quantization of MoE expert-parallel communication to vLLM fake-quant serving through the new ``dispatch_quantizer`` and ``combine_quantizer`` on vLLM's routed experts, for MoE layers built on vLLM's fused-MoE layer and any all-to-all backend, and for the DeepGEMM Mega-MoE kernel of DeepSeek-V4 and Kimi-K3 (``--moe-backend deep_gemm_mega_moe``). Enable them by importing the ``configs/ptq/units/moe_dispatch_nvfp4`` and ``configs/ptq/units/moe_combine_nvfp4`` units into a recipe; see ``examples/vllm_serve/README.md``.
+- vLLM fake-quant serving now runs on pre-quantized checkpoints such as FP8 when the recipe leaves those layers unquantized (for example a KV-cache-only recipe), and on MLA models with an FP8 KV cache; both previously failed during quantization.
+- ``KV_QUANT_CFG`` presets in vLLM fake-quant serving now quantize the MLA KV cache; on vLLM 0.16 and later they silently quantized nothing for MLA models.
+- vLLM fake-quant serving of NVFP4 and cast-mode KV-cache configs no longer needs ``--enforce-eager``. ``examples/vllm_serve/vllm_serve_fakequant.py`` now sets ``VLLM_DISABLE_COMPILE_CACHE=1`` for fake-quant serves by default, because a cached torch.compile graph of the same model without the fake quant would otherwise be reused.
+- ``examples/deepseek/deepseek_v4/ptq.py`` now supports DeepSeek-V4.1-Flash, whose reference implementation uses 32x32 FP8 blocks and a tokenizer-aware ``Transformer``; this is the setup used to produce ``nvidia/DeepSeek-V4.1-Flash-NVFP4``. DeepSeek-V4-Pro checkpoints work as before.
+
+*Speculative Decoding*
+
+- Add the DFlash2 draft variant, selected with ``dflash_architecture_config.projector_type="dflash2"``: DFlash's one-pass parallel backbone plus a grouped dynamic convolution around every attention/MLP sublayer (``conv_kernel_size`` / ``conv_group_size``) and a low-rank candidate selector (``selector_rank`` / ``selector_top_k``, weighted by ``dflash_selector_loss_alpha``). Exported checkpoints declare ``DFlash2DraftModel`` and load in the SGLang/vLLM DFlash2 serving path.
+- LiLiCorr now trains offline and in streaming mode, not only online: the target logits its distractor penalty reads are reconstructed from the captured final hidden state, the same path self-logit distillation uses.
+- Add ``dflash_lilicorr_w_cal`` (default ``0.0``, off): an optional LiLiCorr proposal-calibration term, a KL divergence from the target's distribution over each slot's candidates to the reranker's candidate distribution, usable in place of the distractor penalty.
+- ``examples/speculative_decoding/distributed_generate/server_generate_vlm_sglang.py`` ``--api_mode openai`` works against any OpenAI-compatible server, including vLLM, and gains ``--media_inline`` to send media as base64 ``data:`` URIs. Without ``--media_url_base`` or ``--media_inline`` the media path is still passed through verbatim, which only servers that read their own filesystem resolve (SGLang native does; vLLM needs ``--allowed-local-media-path``); that case now warns.
+
+*Megatron Framework (M-LM / M-Bridge)*
+
+- Add chat-data distillation to ``examples/megatron_bridge/distill.py``: ``--sft --sft_hf_dataset`` takes a local chat ``.jsonl`` or a Hugging Face Hub dataset, renders each conversation with the model's chat template, and ``--sft_loss_mode`` selects which turns are trained. Requires a Megatron-Bridge with ``DirectHFSFTDatasetConfig``.
+- Add ``freeze_mtp`` to the Megatron ``DistillationConfig`` (``--freeze_mtp`` / ``--no-freeze_mtp`` in ``examples/megatron_bridge/distill.py``): ``True`` freezes the student's MTP-specific parameters and disables its MTP loss, ``False`` keeps them training. Unset, they are frozen only when ``kd_loss_alpha`` is 1.0 and the student is quantized except for its MTP head, as before.
+- Add ``output_format: chat_jsonl`` to ``prepare_megatron_data_blend``: it writes a weighted blend as ``train.jsonl`` / ``validation.jsonl`` chat data for ``distill.py --sft --sft_hf_dataset``, so the distillation loss can be restricted to assistant tokens. See the `Megatron data preparation guide <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/dataset/MEGATRON_DATA_PREP.md#chat-jsonl-blends-for-assistant-only-loss>`_.
+- Add mergeable LoRA QAD for fake-quantized dense Megatron/Transformer Engine linear layers. Enable it with ``--lora_rank`` in Megatron-Bridge PTQ, train through the normal QAD flow, and export a standalone quantized checkpoint without deployment adapters.
+- Add optional Top-P (nucleus) truncation to the Megatron top-k logits KD loss (now ``TopLogitsKLLoss``) via ``logit_kl_top_p`` and ``logit_kl_top_p_min_k`` in ``DistillationConfig``: after the global Top-K selection, only the smallest prefix whose cumulative teacher probability reaches ``top_p`` (with a floor of ``min_k`` entries) contributes to the KL, mirroring ``--logits-save-top-p`` / ``--logits-save-top-p-min-k`` in Megatron-LM's logits saver.
+- Add an end-to-end W4A4 NVFP4 PTQ and QAD tutorial for Qwen3.6-35B-A3B also covering evaluation and vLLM throughput benchmarking. See `examples/megatron_bridge/tutorials/Qwen3.6-35B-A3B/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/megatron_bridge/tutorials/Qwen3.6-35B-A3B/>`_ for details.
+- Add ``--mlflow <tracking-uri>`` to the ``examples/megatron_bridge`` scripts that write a checkpoint -- ``prune_minitron.py``, ``quantize.py``, ``distill.py``, ``export_quantized_megatron_to_hf.py`` and ``export_distilled_megatron_to_hf.py`` (MLflow's own ``MLFLOW_TRACKING_URI`` is honoured too). Each run records the invocation, its arguments as searchable params and its log -- a distillation records its training metrics instead of the rank-0 log -- and writes ``.experiment.json`` into the checkpoint it produced, so a pruning, a quantization, the distillation that refines its checkpoint and the export that deploys it can be traced to one another; uploading the checkpoints themselves stays off unless ``--mlflow_log_checkpoints`` is passed.
+- Add ``--ep_size`` to ``examples/megatron_bridge/export_quantized_megatron_to_hf.py`` so large MoE models with grouped-GEMM experts can be exported with their experts sharded across GPUs. Checkpoints built with ``--no_moe_grouped_gemm`` must still be exported at ``--ep_size 1``.
+- Add unified HF export of GLM-5 / GLM-5.2 (``glm_moe_dsa``) checkpoints quantized with ``examples/megatron_bridge``. The MTP layer, which Megatron-Bridge does not build for these models, is copied through unquantized from the source checkpoint. DSA sparse-attention models also gain FP8 KV-cache quantization on Megatron.
+
+*Misc*
+
+- Add ``--modelopt-*`` options to the ``examples/vllm_serve`` launcher for fakequant calibration and checkpoint reload. Point it at an exported fakequant model directory to reload automatically: Hugging Face exports use ``vllm_fq_modelopt_state.pth``, while Megatron-Core exports now include ``quant_recipe.yaml`` alongside ``quantizer_state.pth`` for reload.
+- Add a ``kd_loss_alpha`` option to HuggingFace ``KDTrainer`` to blend cross-entropy and knowledge distillation losses during training.
+- A tracked ``examples/hf_ptq/hf_ptq.py`` run now writes ``.experiment.json`` into ``--export_path`` and uploads the same file with the run, so a checkpoint on disk names the experiment and MLflow run id that produced it. The pointer is written only once the export completes, and an export that is not tracked removes one it would otherwise inherit from a reused ``--export_path`` or from a quantized source checkpoint.
+- ``export_hf_checkpoint`` and the vLLM fake-quant export now copy the source checkpoint's non-model files (tokenizer, processor, remote code, chat templates, ...) into the export unchanged. They read the source from local disk only: get a local copy of a Hugging Face Hub model with ``modelopt.torch.export.ensure_local_checkpoint`` and load it from there.
+
+- Add Parallel Decoding Distillation (PDD) to ``modelopt.torch.fastgen`` with Qwen-Image training, distributed-checkpoint export, and PDD-2/4/8 inference. AutoModel remains an unmodified pinned runtime dependency.
+
+**Backward Breaking Changes**
+
+- ``modelopt.torch.utils.distributed.broadcast``/``allgather`` now reject objects of unregistered custom classes. Register them with ``torch.serialization.add_safe_globals``.
+- Bump minimum transformers version to ``5.5`` instead of ``4.57``; transformers 4.x is no longer supported. Upgrade with ``pip install -U "nvidia-modelopt[hf]"``.
+- ``modelopt.torch.distill.plugins.megatron.TopKLogitsKLLoss`` (``logit_kl_topk`` in ``DistillationConfig``) is renamed to ``TopLogitsKLLoss``, keeping the old name as a deprecated alias. It now normalizes both distributions over the full vocabulary instead of re-normalizing over the Top-K entries, and always appends a "ghost" token holding the probability mass outside the Top-K to both student and teacher (matching Megatron-LM's offline cached-logits KD loss). Loss values change for existing ``logit_kl_topk`` runs.
+- ``LogitsAndIntermediatesLossBalancer`` (Megatron distillation plugin) no longer rescales the distillation loss to the magnitude of the LM loss when the LM loss is included. The total is now the fixed convex combination ``(1 - alpha) * lm_loss + alpha * kd_loss`` with ``DistillationConfig.kd_loss_alpha`` (in [0, 1]), matching Megatron-LM's offline cached-logits KD. The default ``kd_loss_alpha=1.0`` skips the LM loss, as before. ``DistillationConfig.skip_lm_loss`` and ``kd_loss_scale`` are removed and raise ``ValueError`` if passed; set ``kd_loss_alpha`` instead. In ``examples/megatron_bridge/distill.py``, ``--kd_loss_alpha`` replaces ``--no_skip_lm_loss`` and ``--kd_loss_scale``.
+- The ``examples/vllm_serve`` fakequant launcher no longer supports vLLM 0.9.0. Upgrade to a version listed as tested in the example README.
+- The Megatron-Core DeepSeek-V4 indexer (``CSAIndexer``) is now a quantization module and persists its quantizer state in the checkpoint as ``indexer._extra_state``. A DeepSeek-V4 model quantized with an earlier release resumes from its ``torch_dist`` checkpoint only with a non-strict load (``--dist-ckpt-strictness log_unexpected`` in Megatron-LM) until it is saved again.
+- ``examples/hf_ptq`` no longer detects MTP layers by name. Checkpoint weights the model has no parameter for -- an MTP head, an auxiliary tower -- are worked out once, when the model loads, and carried into the export unchanged. Load with the new ``modelopt.torch.utils.plugins.model_load_utils.load_pretrained``, as ``hf_ptq`` does, to record them then; ``export_hf_checkpoint`` works them out itself for a model loaded another way. Everything the loader *did* place goes through the normal export path. This removes ``load_mtp_weights``, ``mtp_layer_prefixes_from_checkpoint`` and their support matrix of MTP storage conventions, along with ``_add_mtp_exclusions`` and the pre-quantization ``enable: False`` entries ``hf_ptq`` appended to the recipe's ``quant_cfg``. Two consequences: MTP layers now follow the recipe like any other module instead of being force-excluded by the script -- matching ``examples/megatron_bridge``, which has no MTP-specific code at all -- and ``quantization_config.ignore`` can no longer claim a layer is unquantized that the export in fact quantized. Recipes importing ``configs/ptq/units/default_disabled_quantizers`` still disable ``mtp.*``, so their behaviour is unchanged; a recipe omitting that unit will now quantize an MTP the model actually built.
+- ``examples/hf_ptq --vllm_fakequant_export`` now raises ``NotImplementedError`` when the checkpoint holds weights the model has no parameter for and a shard actually provides them (an MTP head, an auxiliary tower). The fake-quant exporter writes only model-backed state, so it would otherwise drop those weights silently -- and a fake-quant checkpoint is evaluated, where a missing head changes the score rather than failing loudly. Use the unified HF export, which carries them through. Buffers Transformers recomputes are not weights to lose: ``*.inv_freq`` is skipped even when a shard provides it, since older Llama/Mistral-lineage conversions do list it in the index and refusing an export over it would reject checkpoints that export correctly today. The check runs immediately after the model loads, not at export time, so an incompatible run fails before calibration rather than after it.
+- The ``modelopt.onnx.quantization.ort_patching`` module has been removed with no
+  compatibility shim; update direct imports to use ``ort_session`` for model loading
+  and session setup, ``ort_calibration`` or ``ort_calibration_per_node`` for calibration,
+  ``ort_quantization`` for static Q/DQ quantization, and ``ort_patches`` for patch composition.
+- The ``modelopt.onnx.quantization.graph_utils`` module has been removed with no
+  compatibility shim; update direct imports using this migration map:
+
+  - ``modelopt.onnx.quantization.graph_indexing``: ``expand_node_names_from_patterns``,
+    ``find_mha_partitions``, ``get_fusible_backbone``,
+    ``get_tensor_consumer_node_indices``, ``get_tensor_consumer_nodes``,
+    ``get_tensor_from_name``, ``get_tensor_producer_nodes``, ``has_const_input``,
+    ``has_path_type``, ``is_const_input``, and ``match_fp8_mha_pattern``.
+  - ``modelopt.onnx.quantization.graph_selection``: ``find_nodes_from_convs_to_exclude``,
+    ``find_nodes_from_matmul_to_exclude``, ``find_nodes_from_mha_to_exclude``,
+    ``find_nodes_to_exclude``, ``get_extended_model_outputs``, ``get_input_shapes``,
+    and ``validate_op_types_spelling``.
+  - ``modelopt.onnx.quantization.graph_rewrites``: ``cast_custom_ops``,
+    ``convert_fp16_io``, ``insert_fp8_mha_casts``, ``insert_matmul_casts``,
+    ``remove_output_initializers``, and ``remove_redundant_cast_nodes``.
+  - ``modelopt.onnx.quantization.qdq_graph``: ``build_non_residual_input_map``,
+    ``classify_partially_quantized_weighted_ops``, ``classify_partition_nodes``,
+    ``filter_quantizable_kgen_heads``, ``find_conv_to_layernorm_nodes``,
+    ``get_concat_eliminated_tensors``, ``get_layer_info``,
+    ``get_layer_precision_mapping``, ``get_resize_scales``, ``print_stat``,
+    ``remove_partial_input_qdq``, ``should_quantize_to_8bit``, and
+    ``validate_8bit_layers``.
+- Layerwise calibration now uses prior-layer QDQ activations by default
+  (``layerwise.get_qdq_activations_from_prev_layer=True``). Set it to ``False`` to
+  preserve full-precision activations for subsequent layers (the default behavior for
+  max calibration without layerwise calibration).
+- ``get_te_hybrid_stack_spec`` was removed from ``modelopt.torch.nas.plugins.megatron``; it had no use outside tests. Use ``modelopt.torch.utils.plugins.megatron_layer_specs.te_hybrid_stack_spec_sequential_mlp`` for the SequentialMLP layout, or ``megatron.core.models.hybrid.hybrid_layer_specs.hybrid_stack_spec`` for grouped GEMM.
+- Unified HuggingFace export now fails with ``NotImplementedError`` when it meets an MoE block whose expert projection names it does not know, instead of assuming Mixtral's ``w1``/``w2``/``w3``. If you hit this, register a ``ModelSpec`` for the model under ``modelopt/torch/models/``. Every MoE architecture ModelOpt exported correctly before this change is registered, so no supported model regresses.
+- ``--recipe`` (and ``modelopt.recipe.load_recipe``) now resolve a recipe path **filesystem-first**: a recipe of the same relative path in the current working directory takes precedence over the shipped built-in of that name, matching how recipe ``$import`` paths already resolve. Previously the built-in won.
+
+**Deprecations**
+
+- The Diffusers ONNX export and TensorRT engine deployment workflow is deprecated and will be removed no earlier than 0.49.0, after the one-release migration period. Export unified Hugging Face checkpoints with ``--hf-ckpt-dir`` and follow the `diffusion deployment guide <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers#hf-checkpoint-deployment>`_ to select a compatible backend.
+- The ``examples/vllm_serve`` ``QUANT_CFG`` / ``KV_QUANT_CFG`` environment variables and their
+  ``--modelopt-quant-cfg`` / ``--modelopt-kv-quant-cfg`` flags will be deprecated in a future release.
+  For new runs, use a PTQ recipe via ``RECIPE_PATH`` or ``--modelopt-recipe-path``; unset the old
+  variables when switching because the launcher rejects mixing them with a recipe.
+- KV-domain searches in ``examples/hf_ptq`` now use ``--kv_auto_quantize_checkpoint``;
+  ``--auto_quantize_checkpoint`` remains a deprecated fallback for a KV-primary recipe for one
+  release.
+- Rename the architecture-specific recipe tier from ``modelopt_recipes/huggingface/`` to ``modelopt_recipes/model_type/`` to clarify that it holds recipes shared across every checkpoint of a Hugging Face ``model_type``. Saved ``--recipe huggingface/<model_type>/...`` paths still resolve via a backward-compatibility alias but now emit a ``FutureWarning``, so update them to ``model_type/<model_type>/...`` as the ``huggingface/`` prefix is deprecated.
+- The single-format quantization CLI flags are deprecated in favour of ``--recipe`` and will be removed in a future release; passing one now emits a ``FutureWarning``. ``examples/hf_ptq``: ``--qformat`` and ``--kv_cache_qformat``. ``examples/megatron_bridge/quantize.py``: ``--quant_cfg``, ``--kv_cache_quant`` and ``--weight_only``. ``examples/torch_onnx/torch_quant_to_onnx.py``: ``--qformat``. A recipe carries the quantization config, the calibration algorithm and the KV-cache setting in one file, so they cannot drift apart the way separate flags can -- and ``--recipe`` already took precedence over all six, silently on ``hf_ptq`` and with a warning on ``megatron_bridge`` -- with one gap the recipe closes rather than inherits: a weight AutoQuantize recipe that omits ``kv_cache`` still falls back to ``--kv_cache_qformat``, so set ``kv_cache`` in the recipe when migrating. Use a recipe from ``modelopt_recipes/general/ptq/``, an architecture-specific one under ``modelopt_recipes/model_type/<model_type>/``, or a checkpoint-specific one under ``modelopt_recipes/models/``. The warning fires only when a flag is passed explicitly: ``--qformat`` defaults to ``fp8`` and ``--kv_cache_qformat`` to ``fp8_cast``, so warning on the defaults would fire on every run, including runs that correctly use ``--recipe``. ``examples/speculative_decoding/scripts/quantize_drafter.py`` keeps ``--qformat`` undeprecated: it has no ``--recipe`` alternative yet.
+- The TensorRT-LLM checkpoint export format is deprecated and will be removed in 0.49.0: ``export_tensorrt_llm_checkpoint`` and ``torch_to_tensorrt_llm_checkpoint`` now emit a ``DeprecationWarning`` on use. Use ``export_hf_checkpoint``, which exports a unified Hugging Face checkpoint deployable on TensorRT-LLM, vLLM and SGLang. Its implementation moved to ``modelopt.torch.export.trtllm``, so import those two functions from there and the ``ModelConfig`` dataclasses from ``modelopt.torch.export.trtllm.model_config``; both functions remain importable from ``modelopt.torch.export`` for this release only.
+- ``modelopt.torch.export.get_model_type`` and ``modelopt.torch.export.model_utils.MODEL_NAME_TO_TYPE`` return TensorRT-LLM model names and are deprecated for removal in 0.49.0 (they now emit a ``DeprecationWarning``); use the Hugging Face model type, ``model.config.model_type``, instead. ``export_tensorrt_llm_checkpoint`` now detects ``decoder_type`` when it is omitted, and ``examples/hf_ptq`` uses Hugging Face model types throughout.
+- The ``evaluation`` agent skill no longer supports GDPVal: its task recipe, example config and Apptainer SIF helper are removed, and the shared NeMo Gym machinery it carried now lives at ``references/gym.md`` with the launcher wrapper renamed ``scripts/nel-gym.sh``. GDPVal is an AA-suite member, so an "AA" request now generates the ``aa/`` tasks only -- report per-task scores rather than an aggregate compared against a published AA Index.
+- DBRX model support is removed: ModelOpt no longer quantizes or exports DBRX (``DbrxForCausalLM``) checkpoints. Use ModelOpt 0.47 to quantize DBRX, or write your own plugin as described in the customized-model quantization guide.
+- Deprecate ``metadata.recipe_type`` in recipe YAML, for both single-file recipes and a directory recipe's ``metadata.yml``. A recipe now says what kind it is with a ``# modelopt-schema:`` comment naming its schema class, or by delegating to a recipe that does (single-file recipes only -- a directory recipe has no body to delegate through); ``recipe_type`` is still read and still honoured, so a recipe outside this repo keeps working unchanged, but new recipes should leave it out and every recipe shipped here has been converted. Where both are present they must agree, and so must a recipe and the recipe it delegates to -- a disagreement is an error rather than a silent preference.
+
+**Bug Fixes**
+
+- ``export_hf_checkpoint`` now warns when layerwise export ignores ``save_modelopt_state=True`` because saving ModelOpt state is unsupported for this path. Leave the option at its default ``False`` to avoid the warning, including when warnings are treated as errors.
+- Fix LTX-2 distillation full-mode checkpoints to use the safetensors format expected by their file extension and loaders.
+- Fix corrupted ONNX external tensor data when exporting models on Windows by upgrading ONNX. Regenerate affected models from clean weights.
+- Harden the default locations of the TensorRT deployment runtime's build artifacts and the ONNX AutoTune timing cache: they no longer sit at fixed paths under the shared system temp directory, where another local user could pre-create them to plant symlinks or swap a built engine. Both now live in a private temporary directory that is created once per process; pass ``timing_cache_path`` (runtime) or ``--timing_cache`` (AutoTune) to keep a timing cache across processes.
+- Fix ``import modelopt.torch`` failing with ``ModuleNotFoundError`` for ``requests`` or ``huggingface_hub`` when ``nvidia-modelopt`` is installed without the ``[hf]`` extra.
+- Harden the distributed object broadcast/allgather helpers and the Megatron expert-parallel export gather so a compromised peer rank can no longer execute code through a crafted pickle payload: payloads load with ``weights_only=True`` and the export gathers raw bytes instead of pickled objects.
+- Harden ``examples/vllm_serve/Dockerfile``: ``/workspace`` is no longer world-writable, so no other unprivileged user in the container can replace the CUDA extensions or the ModelOpt sources that the vLLM server loads. The directory is now owned by the ``vllm`` user; rebuild the image, and to run it as a different user point ``TORCH_EXTENSIONS_DIR`` at a directory that user can write, since ModelOpt otherwise cannot load its CUDA extensions and falls back to slower eager fake quantization.
+- Fix LSQ clamping small, representable FP8 block scales too aggressively, which could zero quantized values and suppress scale gradients.
+- Fix ONNX AutoTune benchmark initialization with TensorRT 11 while preserving strongly typed networks on TensorRT 10.
+- Keep vision-block Linears in high precision in the ``qwen3_vl`` and ``qwen3_5`` FP8 vision recipes so exported checkpoints avoid a vLLM vision-attention shape failure. The recipes still quantize primary and deepstack merger Linears; re-quantize affected checkpoints before deployment.
+- Fix ONNX preprocessing with custom TensorRT plugin libraries on TensorRT 11.
+- Fix building the custom TensorRT plugin example with TensorRT 11.
+- Fix TensorRT inference initialization on TensorRT 11 and retain shape validation for static, dynamic, and shape-tensor inputs.
+- Fix unified HF export writing a weight name the source checkpoint does not use when a model declares a backwards-compatibility *load* rename as a reversible ``WeightRenaming``. Reversing such a rule rewrote the canonical name to a legacy spelling, and a deployment runtime keyed on the canonical name then failed to load the quantized checkpoint. Each exported name is now resolved against the names the source checkpoint actually carries, for both the exported tensors and the quantization config's module references.
+- Fix exports using the built-in Transformers NemotronH implementation retaining incompatible legacy remote-code config and model mappings. Re-export affected checkpoints before deployment.
+- Fix ``examples/hf_ptq`` failing with ``KeyError: 'mlp'`` on dense Nemotron-H checkpoints (Nano-9B/12B-v2, H-8B/47B/56B) with Transformers 5.5, whose built-in ``NemotronHForCausalLM`` supports only the MoE variant. ``get_model`` now uses the checkpoint's bundled code when ``--trust_remote_code`` is set and the built-in config can't be built.
+- Fix ``export_hf_checkpoint`` dropping Diffusers pipeline settings, such as Wan 2.2 ``boundary_ratio``, from ``model_index.json`` when ``components`` is given. Re-export affected checkpoints to a new directory, since component exports do not overwrite an existing ``model_index.json``.
+- Fix INT8 real quantization (``mtq.compress``) of FP16 weights zeroing or clipping channels with a small amax: their scales underflowed in FP16. Scales of newly compressed INT8 weights are now stored in FP32.
+- Fix Hugging Face exports classifying registered Qwen VLM parameters as unplaced source weights, which overwrote quantized tensors with original weights and incorrectly excluded their modules from quantization. Re-export affected checkpoints.
+- Right-pad labeled calibration samples to avoid fully masked causal rows that can produce non-finite cuDNN attention gradients during AutoQuantize. Generation previews remove padding before decoding.
+- Fix ONNX quantization reusing existing tensor names for scale and zero-point parameters while preserving INT8 calibration-cache lookup. The boolean ``--target_dla`` / ``target_dla=True`` now preserves scalar multiplication/division operands and padding fill values as constants; use Q/DQ Translator for compatible TensorRT 10.7-and-earlier DLA deployments, or direct Q/DQ with strongly typed DLA enabled in a compatible TensorRT 11.4+ build.
+- Fix calibration silently dropping samples when an out-of-memory error forces the batch to be
+  split and a smaller working batch size is already known: the slices stopped tiling the batch,
+  so the rows between the old and the new width never reached the model and the collected
+  statistics covered fewer samples than requested. Splitting a batch that holds a ``None`` entry
+  no longer raises ``TypeError`` either, and a batch holding a value under
+  ``allowed_non_tensor_keys`` now reports that its rows cannot be split instead.
+- Fix Megatron unified HF export of MoE models with grouped-GEMM experts when only the experts are quantized (e.g. ``nvfp4_experts_only-*`` recipes): ``hf_quant_config.json`` and the ``quantization_config`` in ``config.json`` were not written, so the quantized experts were served as unquantized weights. Re-export such checkpoints.
+- Fix DFlash conversion on NoPE targets whose config leaves ``rope_theta`` unset.
+- Fix offline DFlash training failing to reconstruct the target logits when the captured hidden states are stored in a different dtype than the target's weights.
+- Fix ``hf_ptq`` overwriting a model's existing ``pad_token`` with ``eos_token`` when the model already has a valid padding token. The exported tokenizer now preserves the source model's padding configuration.
+- Fix Hugging Face exports dropping off-index safetensors such as GLM-4.7's ``mtp.safetensors``.
+- Fix Megatron-Core checkpoint saving for quantized grouped MoE experts when tensor and expert parallelism are both enabled.
+- Fix FP8 fake quantization treating a positive amax at or below 2**-24 as zero, which silently zeroed such tensors and channels and every block of a static NVFP4 weight (``NVFP4StaticQuantizer``, including LSQ) with a global amax below ~3.6e-7. Fake quantization now matches the exported checkpoint.
+- Fix ``megatron_preprocess_data`` with ``workers > 1`` segfaulting when run in a process that has already initialized CUDA or other native threads (for example in-process after GPU work): the tokenization worker pool now uses the ``forkserver`` start method instead of ``fork``.
+- Fix unified HuggingFace export of RADIO-based VLMs retaining post-conversion vision and
+  projector names instead of restoring the hub layout; deployment loaders could skip those weights.
+  Streaming, offload, FSDP2, and layerwise export now reject reverse conversions that regroup
+  tensors; use resident export for those models.
+- Fix that same reverse rename double-prefixing tensors copied from the source checkpoint rather
+  than loaded by the model, when a conversion mapping renames a module to a suffix of its original
+  name. Those tensors already carry the hub name, so C-RADIO towers exported
+  ``vision_model.radio_model.radio_model.input_conditioner.norm_mean``. Re-export affected
+  checkpoints.
+- Fix shared ONNX export metadata and Diffusers attention policy: every ``NVFP4QuantExporter`` post-process now upgrades the default-domain opset to at least 23, all FP8 custom-op exports re-run ONNX shape/type inference after setting output metadata, and quantized SDPA derives FP8 MHA enablement from the live Q/K/V quantizers instead of honoring a caller-set ``_disable_fp8_mha`` attribute.
+- Fix ONNX FP16 conversion failing to preserve public output types when type inference changes a graph output declaration before output casts are inserted.
+- Fix ``examples/hf_ptq/hf_ptq.py`` discarding a completed PTQ run (no checkpoint exported) when the optional post-quantization sanity-check ``generate()`` call raised, for example because ``device_map="auto"`` placed part of the model on CPU. That failure is now caught and only skips the sanity check; export proceeds regardless.
+- Fix ``examples/megatron_bridge/export_quantized_megatron_to_hf.py`` storing the MoE router at Megatron's ``moe_router_dtype``, which is a routing *compute* dtype, not a storage one. The router now exports at the export ``dtype`` like every other unquantized weight, matching what ``hf_ptq.py`` and the released NVFP4 checkpoints contain; pass ``moe_router_dtype`` to ``export_mcore_gpt_to_hf`` explicitly if you want the old fp32 storage.
+- Fix unified Megatron export writing a second, unreferenced copy of the vocab embedding when a model with MTP layers is exported with pipeline parallelism. The duplicate was never loaded but inflated the checkpoint by the size of the embedding (about 1 GB for Qwen3.6-35B-A3B); re-export to reclaim the space.
+- Fail fast on non-finite AutoQuantize output gradients with an actionable error before accumulating sensitivity scores, without changing attention backend settings.
+- Fix ONNX INT8 entropy calibration failing or producing invalid quantization parameters for FP16 activations.
+- Fix HuggingFace checkpoint export failing with ``activation scaling factor 0.0 not positive`` when a dynamic-block quantizer (such as an NVFP4 input quantizer) ends calibration with an amax of zero because the calibration data never activated that layer or expert. Such a quantizer now exports a positive fallback scale and warns instead of crashing, matching what static quantizers already did; if you see the warning, check whether the layer is expected to be inactive and consider a larger calibration size.
+- Fix ``--use_fsdp2`` HuggingFace checkpoint export gathering the whole model onto rank 0, which made export the dominant phase of a PTQ run and could exhaust host memory on large models. The model is now split into per-decoder-layer units dealt round-robin across ranks; each rank gathers every unit but keeps, packs, and writes only the ones it owns, so a rank buffers roughly ``model / world_size`` instead of the whole checkpoint, and rank 0 writes the combined index. Export configurations that cannot be split this way now raise instead of producing a mismatched checkpoint: FSDP2 combined with another DTensor parallelism (for example FSDP2 + tensor parallel on a 2-D mesh; HSDP is supported), models whose decoder layers cannot be discovered, a decoder layer object reused across layers, and a module that holds the decoder layers while owning parameters of its own.
+- Speed up ``mtq.quantize`` on FSDP2-sharded fused-MoE models. Promoting static-block weight quantizers gathered each expert's slice of the fused weight across ranks even though only quantizer state is read, adding a collective per expert to calibration.
+- Add FP8 and INT8 recipes that quantize timm ResNet shortcut inputs immediately before residual adds. The torch ONNX example now accepts PTQ and AutoQuantize recipes through ``--recipe`` and uses ``--qformat`` when no recipe is provided. ResNet supports only FP8 and INT8 because TensorRT has limited convolution kernel support; AutoQuantize and other quantization formats are no longer supported for ResNet.
+- Fix ``dflash_fp32_master_weights`` being inert outside HF ``Trainer`` and lossy across a resume, by moving the extra precision from the model into the optimizer. The draft now always matches the frozen base's dtype, and ``MasterWeightAdamW`` holds an fp32 master copy plus fp32 Adam moments, applies the update in fp32 and writes the result back at the parameter's dtype -- the standard mixed-precision placement. Nothing has to reconcile dtypes at forward time any more, so evaluation, ``pseudo_speculative_generate`` (which AR validation calls outside the Trainer's autocast) and a plain ``mtsp.convert()`` followed by a forward all behave the same as training; gradients stay in the base dtype, so the DDP gradient all-reduce is no longer doubled; and the exported drafter is unchanged. The training loop has to build the optimizer -- ``examples/speculative_decoding`` does -- and ``VerifyMasterWeightsCallback`` raises after the first step if it did not, rather than letting the flag be silently absent for a whole job. **``dflash_fp32_master_weights`` now defaults to ``True``**: with the draft no longer promoted, turning it on changes optimizer memory and optimizer arithmetic but nothing about the model, so every DFlash-family recipe gets it. Set it to ``False`` to reclaim the memory.
+- Fix a DDP hang in DFlash training at scale where a rank whose batch contained no valid anchor skipped the draft forward, leaving its rotary buffer list shorter than other ranks' and causing ``broadcast_buffers`` to hang. The buffer is now created during ``modify()`` before training begins.
+- Fix ``megatron_generate`` dropping the VLM vision inputs (``pixel_values`` / ``image_grid_thw`` / ``image_sizes``) after the first generated token when KV-cache decoding is off, including the automatic fallback under sequence parallelism, which made generation silently ignore the image. No other ModelOpt feature is affected.
+- Fix two issues in the vLLM offline hidden-state dump (``examples/speculative_decoding/collect_hidden_states/compute_hidden_states_vllm.py``) that only surface on large runs. **Resume:** the filter that skips conversations whose ``.pt`` already exists now runs with ``load_from_cache_file=False``. It depends on on-disk state, which is not part of the fingerprint ``datasets`` computes from the function and the dataset, so with a persistent HF cache reused across a resumed or requeued run the cached "keep everything" result from an earlier run was replayed and the dump re-generated and overwrote conversations it had already finished (observed: tens of thousands of ``.pt`` rewritten while the output count stayed flat). **Staging:** generation is now chunked (``--save-chunk-size``, default 256), so each chunk is saved and its staged hidden states freed before the next chunk is generated. Previously the whole dataset was generated before anything was saved, which kept every conversation staged in the connector's ``shared_storage_path`` (``/dev/shm``, i.e. RAM, by default) at once and exhausted it partway through large dumps. Chunking also makes the dump incrementally durable, so an interrupted run keeps its finished conversations and resumes from them. The save path now also frees each conversation's staged hidden states in a ``finally``, so a conversation skipped mid-loop (e.g. a short ``loss_mask``) can no longer leak its staging file, and conversation ids are validated as plain filenames before being used to build output paths.
+- Fix YAML config I/O decoding with the locale codepage instead of UTF-8, which made a config containing any non-ASCII byte fail to load on a machine whose locale is not UTF-8 (notably Windows, where the default is cp1252). ``modelopt/recipe/loader.py``, the two ONNX autotune state files, the two transformers config readers, the distill config and the puzzletron profile now pass ``encoding="utf-8"`` explicitly. Only the YAML config paths are covered: these are the files most likely to carry non-ASCII text in comments, model names or paths, and the only ones read inside a user's process.
+- Hybrid (e.g. Nemotron-H) checkpoints saved by the ``examples/megatron_bridge`` scripts now record their layer spec in ``run_config.yaml`` in a form that reloads, so they can be converted to HuggingFace; a checkpoint saved by an earlier release still needs its ``model.hybrid_stack_spec`` block replaced by hand.
+- Fix ONNX export of quantized models failing with ``Unsupported op_type for real weight quantization: Transpose`` when a weight reaches its consumer transposed, as in MaxViT's attention blocks. The same export now also quantizes each weight along the axis its Q/DQ pair declares, correcting silently wrong ``dq_only`` output when that axis differed from the consumer's default.
+- Fix the ``evaluation`` agent skill's LiveCodeBench recipe scoring correct solutions that use binary standard I/O (``sys.stdin.buffer`` / ``sys.stdout.buffer``) as failures: the recipe now pins a fixed LiveCodeBench judge in the NeMo-Skills container. LiveCodeBench scores change as a result, so re-run earlier baselines before comparing.
+- Fix GPTQ with Megatron data parallelism: each data-parallel replica of a module now builds its Hessian from the whole calibration set instead of only its own shard, so all replicas reach the same quantized weights.
+- Fix ``examples/llm_sparsity/weight_sparsity/finetune.py`` saving a sharded state dict under FSDP2, the default FSDP version in Transformers 5, which made ``export_hf_ckpt.py`` fail to restore it. Re-run finetuning to produce a loadable ``finetuned_modelopt_state.pth``.
+
+0.47.0 (2026-09-23)
+^^^^^^^^^^^^^^^^^^^
+
+**New Features**
+
+*Quantization*
+
+- ONNX quantization with Autotune now benchmarks placements in the requested runtime precision and retains calibrated INT8/FP8 Q/DQ only when it meets the configured TensorRT speedup threshold (1.02x by default); otherwise it saves the high-precision no-Q/DQ model.
+- Add a Muse Glimmer AutoQuantize recipe that searches language-model MLP projections, self-attention projections, and ``lm_head`` over W4A16 NVFP4 Four-Over-Six, FP8, and BF16 fallback at 5.5 effective bits while leaving the vision tower unquantized.
+- Add ``examples/alpamayo/qad.py``, which runs quantization-aware distillation on the quantized Alpamayo checkpoint produced by ``examples/alpamayo/quantize.py``. It distills the quantized VLM against the original FP16 VLM with ``QADTrainer``, supports FSDP2 for multi-GPU runs, and ``--export`` reassembles the trained VLM into a full AlpamayoR1 checkpoint that ``AlpamayoR1.from_pretrained`` can reload.
+- Add a calibration-free streaming Kimi-K3 converter and checkpoint-mirror recipe for NVFP4 routed experts with ``input_scale=1.0`` and 128x128 block-FP8 KDA/MLA attention weights. The converter operates shard-by-shard on the source checkpoint's packed MXFP4 experts instead of loading the 2.8T model through the in-memory ``hf_ptq.py`` path.
+- Add end-to-end PETRv1 and PETRv2 ONNX PTQ examples covering calibration, INT8 and FP8 VoVNet backbone quantization, TensorRT deployment, and accuracy evaluation.
+- Add opt-in FP8 Vision Encoder recipes under the ``qwen3_vl`` and ``qwen3_5`` model types. The vision-only recipe keeps the language model and KV cache in high precision; the joint recipe quantizes Vision Encoder and language-model Linears and uses FP8 KV-cache cast. Both quantize primary and deepstack merger Linears where present, while leaving patch embedding and vision-attention BMMs in high precision. Exported checkpoints require an inference runtime that supports quantized Vision Encoder Linears.
+- Add ``method="aumann_shapley"`` to ``mtq.auto_quantize`` for label-free path-integral sensitivity scoring and predicted calibration damage; pass method-specific settings such as an optional damage bound in a method dictionary.
+- Add ``mtq.temporarily_fold_weights`` for repeated frozen-weight inference and ``mtq.preserve_quantizer_attributes_context`` for restoring temporary quantizer property and type changes. Temporary folding snapshots affected fake-quant weights on a configurable device and restores them with their quantizer state; retained pre-quant scales are inactive, while shared weights, shared quantizers, and ``SequentialQuantizer`` weights are unsupported.
+- Add the ``nvfp4_act_headroom`` calibration algorithm for NVFP4 **activation** global scales. Instead of setting the global scale from the largest per-block amax seen during calibration (plain ``max``, which leaves no room above it so any larger activation saturates), it anchors the scale to a low percentile of the per-block amax distribution, leaving the rest of the FP8 block-scale range as headroom: ``amax = max(rho * anchor, upper)``, where ``anchor`` and ``upper`` are the per-block amaxes at ``anchor_percentile`` (default 1) and ``upper_percentile`` (default 99.99; set to 100 to never clip calibration data), and ``rho`` (default 16384) is the headroom factor. Applies only to NVFP4 dynamic-block input quantizers; ``SequentialQuantizer`` activation quantizers raise. Weight scales are an orthogonal axis selected by a nested ``weight_scale_algorithm`` (``max`` by default, or ``mse`` / ``local_hessian``), so one recipe can combine a weight calibration with this activation policy in a single pass. Ships ``modelopt_recipes/general/ptq/nvfp4_act_headroom-kv_fp8_cast.yaml``, which mirrors ``nvfp4_default-kv_fp8_cast`` with only the calibration algorithm swapped and exports a standard NVFP4 checkpoint.
+- Add layer-wise KV-cache AutoQuantize through ``mtq.auto_quantize`` with ``cost_model="kv_cache"``. It measures isolated full-vocabulary forward KL for caller-supplied K/V formats, solves a width-weighted additive storage-constrained recipe across eligible layers, preserves search-disabled layers in their existing format, exports the selected per-attention mapping in unified HF checkpoints, returns sensitivity metadata in the search state, and supports resumable search checkpoints. A cast-mode FP8/NVFP4 recipe at 5.4 bits/scalar is included.
+
+*Speculative Decoding*
+
+- Add **LiLiCorr** speculative-decoding training (`arXiv:2608.20530 <https://arxiv.org/abs/2608.20530>`_): a candidate-lattice reranker on top of the DFlash draft backbone, selected via ``dflash_architecture_config.projector_type=lilicorr``. Requires online training; recipe at ``modelopt_recipes/general/speculative_decoding/lilicorr.yaml``. Training and export only — serving is in the companion SGLang PR.
+- Add ``dflash_fp32_master_weights`` (default ``False``): keep the DFlash draft's parameters and Adam moments in fp32 while its matmuls run in bf16 (classic mixed precision). Requires a bf16 autocast around the forward, which HF ``Trainer`` supplies under ``TrainingArguments.bf16``. Yields 7–14% acceptance-length improvement over bf16-only training across all ``projector_type`` variants; both LiLiCorr recipes set it to ``true``. The cost is memory, plus a doubled gradient all-reduce under DDP.
+- Fix ``training.gradient_checkpointing`` to reach the DFlash draft. Previously the flag applied only to the frozen target model, saving no activations; the draft now honours it in its decoder-layer loop.
+- Add optional **grouped sublayer convolutions for LiLiCorr**, reusing DFlash2's ``DFlashGroupedConv``; enabled by ``conv_kernel_size`` and ``conv_group_size`` in ``dflash_architecture_config``. Requires the DFlash2 branch. Recipe at ``modelopt_recipes/general/speculative_decoding/lilicorr_conv.yaml``.
+
+- Add PTQ support for Step-3.7 (``stepfun-ai/Step-3.7-Flash``), whose routed experts were previously left unquantized. Quantize with the new ``model_type/step3p7/ptq/nvfp4_experts_only-kv_fp8_cast`` or ``model_type/step3p7/ptq/nvfp4_mlp_only-kv_fp8`` recipes rather than the general ones, which select experts by module names Step does not use.
+
+*Megatron Framework (M-LM / M-Bridge)*
+
+- Add ``clamp_kv_cache_scales`` to ``export_mcore_gpt_to_hf``. Set it to ``False`` when exporting a QAT Megatron-Core model to preserve its learned FP8 KV-cache scales; the default retains the existing minimum scale of 1.0.
+- Add SFT-masked data support to ``examples/megatron_bridge/distill.py``: ``--sft --sft_dataset_root <dir>`` distills on raw prompt-completion JSONL (``{"input", "output"}`` records) with the loss masked to the response tokens, using Megatron-Bridge's ``FinetuningDatasetConfig`` and the model's own HuggingFace tokenizer instead of the pretraining ``GPTDataset`` and ``NullTokenizer``.
+- Add per-expert weight quantization for Transformer Engine ``TEGroupedLinear`` (fused MoE experts): each expert now has its own ``weight_quantizer`` (a ``GroupedQuantizer`` holding one ``TensorQuantizer`` per expert) with an independent ``amax``, instead of a single shared ``amax`` across all experts. Applies to ``mtq.quantize`` calibration, HF / Megatron export, and QAD.
+- Add opt-in ``torch.compile`` execution for Transformer Engine grouped-linear per-expert weight quantizers while preserving their native checkpoint amax shapes. Set ``MODELOPT_TEGROUPED_COMPILE_WEIGHT_LOOP=1`` before quantized-module conversion; the default path remains eager.
+- Add HuggingFace unified export of quantized Qwen3-VL and Qwen3.5-VL checkpoints (PTQ or QAD) via ``examples/megatron_bridge/export_quantized_megatron_to_hf.py``, Qwen3.5-VL additionally covering GatedDeltaNet linear-attention layers and MoE shared experts. Only the language model is quantized; the vision tower is copied from the source HuggingFace checkpoint.
+- Megatron-Bridge scripts now choose the MoE expert layout automatically from the model config: the faster fused ``TEGroupedMLP`` (grouped GEMM) unless the architecture cannot export it to HuggingFace, in which case ``SequentialMLP`` keeps the checkpoint exportable and ``--no_moe_grouped_gemm`` forces it explicitly. For the affected architectures this changes MoE activation scales from one shared scale to per-expert.
+
+*Misc*
+
+- Add ``nodes_to_exclude`` regex support to the Q/DQ-aware ONNX ``convert_to_f16`` API, matching ``convert_to_mixed_precision`` node-name exclusion semantics while composing with the existing operation and tensor block lists.
+- Add ``modelopt.torch.utils.mlflow.MlflowRunLogger`` for recording a script run on an MLflow tracking server: the invocation, the ModelOpt version, the run log (captured by teeing ``stdout``/``stderr``) and any caller-supplied artifacts, with configuration as searchable params. ``mlflow`` is an optional dependency, imported only when tracking is enabled.
+- Add ``--mlflow <tracking-uri>`` to ``examples/hf_ptq/hf_ptq.py`` (MLflow's own ``MLFLOW_TRACKING_URI`` is honoured too). A tracked run records the invocation, the resolved recipe (``$import``\ s expanded), the run log and the quantization summaries, with every command-line argument as a searchable param; failed runs are recorded with their traceback. The experiment defaults to ``$USER/hf_ptq/<checkpoint basename>-<recipe name or --qformat>`` and can be overridden with ``--mlflow_experiment`` / ``--mlflow_run_name``.
+- Add ``--mlflow <tracking-uri>`` to ``examples/vllm_serve/vllm_serve_fakequant.py`` (MLflow's own ``MLFLOW_TRACKING_URI`` is honoured too), so a fake-quant serve records what it quantized and an evaluation of that endpoint can be traced back to a recipe. A tracked run uploads the launcher command, the resolved ``RECIPE_PATH`` (or the merged ``QUANT_CFG``/``KV_QUANT_CFG`` when presets are used), the worker log and the quantizer summary; the experiment defaults to ``$USER/vllm_serve_fakequant/<model basename>-<recipe name or quantization config>`` and can be overridden with ``--mlflow-experiment`` / ``--mlflow-run-name``.
+
+**Backward Breaking Changes**
+
+- Migrate the FAR3D ONNX PTQ example to the shared evaluator and ModelOpt containers and ``quantize_vovnet.py``. Only the encoder supports INT8 and FP8; decoder calibration, quantization, and related CLI flags are removed, and the decoder remains in its exported mixed FP16/FP32 precision.
+- Image-text calibration with ``--calib_with_images`` now forwards multimodal batches through the complete VLM for all VLM families, so existing non-Nemotron commands may produce different language-model activation ranges and output scales. Recipe-based VLM PTQ also targets the complete VLM: vision modules stay in high precision by default and are quantized only when a model-specific recipe enables them, so custom recipes must explicitly exclude vision modules when required.
+- Move the checkpoint-mirror recipe tier from ``huggingface/models/<org>/<checkpoint>/`` to the top-level ``models/<org>/<model_id>/``, keyed by each recipe's canonical Hugging Face Hub id — so the Step 3.5 Flash recipe moves to ``models/stepfun-ai/Step-3.5-Flash/ptq/`` and the NVIDIA Nemotron recipes gain the ``NVIDIA-`` prefix (e.g. ``models/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16/ptq/nvfp4-mse``). Update any saved ``--recipe`` paths for these checkpoint recipes accordingly; the per-``model_type`` recipes under ``huggingface/`` are unchanged.
+- Move the Mistral Medium 3.5 checkpoint-mirror recipe from ``huggingface/models/nvidia/Mistral-Medium-3.5-128B-NVFP4/ptq/nvfp4-max-calib`` to ``models/mistralai/Mistral-Medium-3.5-128B/ptq/nvfp4-max-calib``, keying it by the canonical Hugging Face base model. Update any saved ``--recipe`` paths to the new location.
+- Remove the ``--auto_quantize_bits``, ``--auto_quantize_method``, ``--auto_quantize_score_size``, ``--auto_quantize_cost_model`` and ``--auto_quantize_active_moe_expert_ratio`` flags from ``examples/hf_ptq`` (deprecated in 0.46). Use an AutoQuantize ``--recipe`` from ``modelopt_recipes/general/auto_quantize/`` instead. Those recipes now also splice in the shared base ``cost_excluded_layers`` unit, which the removed CLI applied unconditionally, so a VL model keeps its vision tower and MTP layers out of the effective-bits denominator. On a VL model this changes the per-layer cost weights, so an existing ``--auto_quantize_checkpoint`` from an earlier release is rejected with "Use a different checkpoint path"; delete or repoint it to re-run the search.
+- Remove the ``examples/llm_ptq`` symlink and the ``examples/vlm_ptq`` forwarder (both deprecated in 0.46). Use ``examples/hf_ptq``, passing ``--vlm`` for vision-language models.
+- Remove the backward-compat ``--qformat`` / ``--quant_cfg`` short names ``int8_sq``, ``int8_wo``, ``w4a8_awq``, ``nvfp4_awq``, ``nvfp4_mse``, ``nvfp4_local_hessian``, ``fp8_pb_wo`` and ``fp8_pc_pt`` (deprecated in 0.45). Use the preset basename under ``modelopt_recipes/configs/ptq/presets/model/`` instead: ``int8_smoothquant``, ``int8_weight_only``, ``w4a8_awq_beta``, ``nvfp4_awq_lite``, ``nvfp4_w4a4_weight_mse_fp8_sweep``, ``nvfp4_w4a4_weight_local_hessian``, ``fp8_2d_blockwise_weight_only`` and ``fp8_per_channel_per_token``. The ``modelopt.recipe.presets.QFORMAT_ALIASES`` table and the ``aliases`` argument of ``load_quant_cfg_choices()`` are removed along with them.
+- Remove the legacy ``layerwise`` bool form, its ``use_sequential`` alias, and the top-level ``layerwise_checkpoint_dir`` key from calibration algorithm configs (deprecated in 0.45). Use the nested form, e.g. ``layerwise: {enable: true, checkpoint_dir: /path}``. A pre-0.45 ``modelopt_state`` carrying either legacy key now fails validation on restore instead of being migrated; re-save it with a 0.45/0.46 release first.
+- Remove in-trainer quantization via ``QuantizationArguments.quant_cfg`` / ``--quant_cfg`` (deprecated in 0.45); use ``--recipe``. New recipes ``general/ptq/mxfp4_mlp_weight_only`` and ``general/ptq/nvfp4_mlp_weight_only`` replace ``MXFP4_MLP_WEIGHT_ONLY_CFG`` / ``NVFP4_MLP_WEIGHT_ONLY_CFG`` in the ``examples/gpt-oss`` QAT flow.
+- Remove the ``QuantizationArgumentsWithConfig`` alias in ``modelopt.torch.quantization.plugins.transformers_trainer`` (deprecated in 0.45). Use ``QuantizationArguments``.
+- Transformer Engine ``TEGroupedLinear`` (fused MoE experts) now uses **per-expert** weight quantization (one ``amax`` per expert) instead of a single shared ``amax``, so ModelOpt checkpoints containing quantized ``TEGroupedLinear`` modules saved before 0.47 are **not compatible** with 0.47. Re-run PTQ to regenerate compatible checkpoints.
+- ``mtq.quantize`` now raises when a config asks for weight quantization but none of its weight-quantizer patterns match the model, instead of calibrating and exporting a silently unquantized checkpoint (``"quant_algo": null``). Configs that quantize activations or the KV cache only are unaffected, as are patterns that match and are then disabled by a later entry. If this fires, use the recipe for that architecture under ``modelopt_recipes/huggingface/<model_type>/`` or fix the module patterns. Set ``MODELOPT_SKIP_WEIGHT_QUANT_CHECK=1`` to disable the check process-wide, e.g. for a pipeline-parallel rank whose local stage legitimately has none of the targeted modules.
+
+**Deprecations**
+
+- Remove ``examples/llm_eval/lm_eval_tensorrt_llm.py`` (the ``trt-llm`` model) in favor of the TensorRT-LLM backend shipped by lm-evaluation-harness itself (registered as ``trtllm``, also supports ``loglikelihood_rolling`` and pipeline parallelism); ``lm_eval`` is pinned to ``>=0.4.12,<0.5``. Replace ``python lm_eval_tensorrt_llm.py --model trt-llm --model_args tokenizer=<tok>,checkpoint_dir=<ckpt>`` with ``python lm_eval_trtllm.py --model trtllm --model_args model=<ckpt>,tokenizer=<tok>``, and set ``tensor_parallel_size`` and ``max_input_len`` explicitly — they default to 1 and 2048, and longer prompts are silently truncated. Use ``lm_eval_trtllm.py`` rather than the plain ``lm_eval`` CLI: it patches an off-by-one in the backend's ``_parse_logprobs`` that otherwise raises ``KeyError`` on every loglikelihood task. Loglikelihood tasks additionally require **TensorRT-LLM >= 1.3.0rc11**; generative tasks are unaffected. ``examples/hf_ptq/scripts/huggingface_example.sh`` gains ``--input`` (``BUILD_MAX_INPUT_LEN``, default 4096) to size the evaluation engine's context, and honours a preset ``LM_EVAL_TP`` to override the tensor-parallel size.
+- Bump minimum container requirement to ``nemo:26.08`` for the Megatron-Bridge / Megatron-LM optimization features. Megatron-LM quantization still works on ``nemo:26.06`` but will be dropped in a future release.
+
+**Bug Fixes**
+
+- Fix ONNX AutoCast failing on models with external initializers larger than 2 GiB.
+- Avoid querying CUDA/Blackwell capability when ``NVFP4QTensor.quantize`` uses its CPU path or has the optional TensorRT-LLM fast path disabled.
+- Fix NVFP4 ONNX export to quantize FP4 weights with the published FP8 block scales, matching eager ModelOpt packed weights. Block scales below ``2**-9`` are now clamped to that minimum, and non-finite or negative scales raise an error.
+- Fix FP8 ONNX export of BF16 models during real-weight compression.
+- Fix Megatron-Bridge Quantization Aware Distillation of a vision-language model silently discarding the ModelOpt state, so the distilled checkpoint restored no quantizers and exported as an unquantized model. Re-run QAD to regenerate any affected checkpoint.
+- Fix Megatron-Core HuggingFace export silently omitting fused (grouped GEMM) MoE experts for architectures without an ``experts.linear_fc1`` rule (e.g. ``Qwen3MoeForCausalLM``), which produced a valid-looking checkpoint containing no expert weights. The exporter now raises instead of writing that checkpoint; the scripts also avoid the situation by selecting ``SequentialMLP`` for those architectures.
+- Fix GatedDeltaNet (Qwen3.5) quantizer exclusions on Megatron-Core: the recipe patterns name the HuggingFace ``linear_attn`` module, so the ``conv1d`` was calibrated and the alpha / beta gate projections were exported in FP8. ``conv1d`` now has a ``self_attention`` alias in the default disabled-quantizer units, and the alpha / beta projections are exported in BF16 (they share Megatron's fused ``in_proj`` quantizer and cannot be disabled by name).
+- Fix quantizing a Megatron-Core GPT ``output_layer`` (HuggingFace ``lm_head``) failing to checkpoint: megatron-core drops ``output_layer._extra_state``, where ModelOpt keeps quantizer state, so saving raised and loading silently restored the layer unquantized. ModelOpt now retains that entry for every Megatron model, and disables the workaround once megatron-core keeps it itself.
+- Fix Megatron-Core HuggingFace export writing Qwen3.5 / Qwen3.6 MoE routed experts as one packed tensor per layer, which vLLM cannot load (``Layer ... has no parameter 'w2_weight_weight_scale_2'``). Quantized exports now write one entry per expert with ``gate_proj`` / ``up_proj`` split, matching the released NVFP4 checkpoints.
+- Megatron-Core HuggingFace export now names unquantized grouped-GEMM MoE experts in ``exclude_modules`` instead of omitting them, so a mixed-precision checkpoint tells the runtime what is not quantized. This adds one ``hf_quant_config.json`` entry per expert per layer for grouped-expert architectures such as ``NemotronHForCausalLM``; the served numerics are unchanged.
+- Remove ``--moe_calib_experts_ratio`` from ``examples/megatron_bridge/quantize.py``. It was accepted but had no effect there: the option is implemented only for HuggingFace MoE modules, so Megatron models silently ignored it. It remains available in ``examples/hf_ptq/hf_ptq.py``, where it works.
+- Fix image-text (VLM) calibration hanging on multi-GPU: the per-subset sample budget used truncating division, so the stream supplied fewer samples than requested (1023 for ``--calib_num_samples 1024`` over 3 subsets) and the strided data-parallel sharder left the trailing rank one sample short, deadlocking calibration until a 30-minute NCCL/gloo timeout. Subset budgets now sum exactly, and the sharder truncates every rank to the same count.
+- Fix Megatron-Core quantized KV-cache scales being dropped when a Qwen checkpoint is exported to HuggingFace: ``k_scale`` / ``v_scale`` were omitted and ``kv_cache_quant_algo`` left unset for every Qwen architecture, so a checkpoint calibrated with an FP8 or NVFP4 KV cache silently served an unquantized one.
+- Megatron-Core HuggingFace export now verifies its own output: if the exported checkpoint is missing tensors the source checkpoint has (an architecture whose module has no export rule), it raises instead of writing a valid-looking checkpoint. Depth-pruned models and tied embeddings are accounted for.
+- Loading a Megatron checkpoint that holds quantizer tensors but no restorable ModelOpt state now raises instead of silently loading the model unquantized.
+- Fix image-text calibration for non-Nemotron VLMs by forwarding multimodal batches through the complete VLM.
+- Update HuggingFace checkpoint export to use name-based tied-weight deduplication instead of the previous address-based approach. The address-based deduplication could incorrectly drop an untied weight that happened to share memory with a tied one, producing an incomplete checkpoint (observed as a false positive on MiniMax-M2.7).
+- Fix EAGLE-3 training with context parallelism (``--cp_size > 1`` in ``examples/speculative_decoding``), which failed to start on ``accelerate >= 1.13`` and then raised ``got mixed torch.Tensor and DTensor``.
+- Polygraphy minimum dependency upgraded to ``0.53.4`` to solve ONNX AutoCast failures when marking optional graph outputs.
+- Fix ``--kv_cache_free_gpu_memory_fraction`` having no effect on the ``lm_eval`` task of ``examples/hf_ptq/scripts/huggingface_example.sh``, where the KV cache always took TensorRT-LLM's default 90% of free GPU memory and evaluation could run out of memory. ``examples/llm_eval/lm_eval_trtllm.py`` now takes ``kv_cache_free_gpu_memory_fraction`` in ``--model_args``, defaulting to 0.8.
+- Fix ``--aux-layers eagle`` failing in the vLLM offline hidden-state dump (``examples/speculative_decoding/collect_hidden_states/compute_hidden_states_vllm.py``). ``eagle`` is the flag's default, but the dump's standalone resolver -- a copy kept so the script runs in a stock vLLM container without ModelOpt -- only handled ``dflash`` and explicit id lists, so the documented invocation aborted with ``invalid literal for int(): 'eagle'`` before any state was written. An unrecognised preset now reports which values are accepted instead of surfacing the raw ``int()`` error.
+
+0.46.0 (2026-08-18)
+^^^^^^^^^^^^^^^^^^^
+
+**New Features**
+
+*Quantization*
+
+- Add NVFP4 and FP8 PTQ recipes with projection-output quantizers for Llama-Nemotron embedding and reranking models (``modelopt_recipes/huggingface/nemotron_llama/``) and an end-to-end HF embedding/reranking quantize-to-ONNX example (``examples/torch_onnx/hf_embedding_quant_to_onnx.py``). Quantizing the projection-Linear outputs keeps TensorRT inter-layer activations in FP4, roughly halving engine activation memory versus the plain ``nvfp4`` preset. NVFP4/MXFP8 output quantizers now export through the dynamic quantize path. ``examples/torch_onnx/torch_quant_to_onnx.py`` also gains a ``--recipe`` flag to load quantization configs from YAML recipes instead of the removed ``mtq.*_CFG`` module-constant table.
+- Add an end-to-end FAR3D ONNX PTQ example with calibration data generation, INT8 and FP8 quantization, TensorRT engine building, and Argoverse 2 accuracy evaluation. See `examples/onnx_ptq/far3d/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/onnx_ptq/far3d>`_ for details.
+- Add Learned Scale Quantization (LSQ) and Dual-LSQ support for quantization-aware distillation, including learnable ``amax`` parameters, tied-scale and pre-scale options, focused NVFP4 recipes, and scale-only training.
+- Add a fused Triton fast path for the ``local_hessian`` NVFP4 weight-scale search, roughly **34x** faster than the Python reference sweep on a single 8192x4096 weight and bit-exact with it for fp32/fp16 weights. Used automatically during ``local_hessian`` calibration for both dense and fused-MoE expert weights; falls back to the reference sweep on CPU, when Triton is unavailable, or via ``MODELOPT_NVFP4_TRITON_SWEEP=0``.
+- Add NVFP4 Four-Over-Six (4/6) weight quantization (``mtq.NVFP4_FOUR_OVER_SIX_CFG``): MSE weight calibration picks, per block, between an M=6 and an M=4 dynamic range (the choice is folded into the FP8 per-block scales), with the ``four_over_six: true`` flag normalizing those scales by 256 (vs 448) for M=4 headroom. Supported via ``mtq.quantize`` and HF / Megatron export only -- **not** ``mtq.compress``, which does not preserve the per-block M=4/M=6 choice.
+- Add dLLM (tied-weight PTQ and HF-checkpoint export) support for diffusion-based encoder-decoder LLMs (e.g. DiffusionGemma) whose encoder/decoder stacks share parameters via HF ``_tied_weights_keys``. Modules sharing a source weight are deduplicated at export (~42% storage reduction on ``nvfp4_experts_only`` for tied 26B MoE checkpoints), a new ``sync_tied_input_amax`` helper max-merges per-side ``input_quantizer.amax`` across tied modules so single-backbone consumers don't clip either side, and the exported state dict is reordered so the canonical-side keys win the dedup. Ships a DiffusionGemma recipe under ``modelopt_recipes/huggingface/diffusion_gemma/ptq/``. Non-tied models see no behavioral change.
+- Add Torch-TensorRT FP8 deployment example for HuggingFace ViT (``examples/torch_trt/``): ``torch_tensorrt_ptq.py`` covers ``mtq.quantize`` → ``torch_tensorrt.compile(ir="dynamo")``, and ``torch_tensorrt_accuracy.py`` reports the compiled model's ImageNet-1k top-1/top-5 accuracy (the unquantized baseline is Torch-TensorRT-compiled too, for an apples-to-apples comparison). Ships a ViT-tuned FP8 PTQ recipe under ``modelopt_recipes/huggingface/vit/ptq/fp8.yaml`` that quantizes the encoder Linears, patch-embed ``nn.Conv2d``, ``classifier``, per-block LayerNorm inputs, and the attention Q/K/V BMMs and softmax. Verified on ``google/vit-base-patch16-224``: FP8 stays within 0.13 pp Top-1 of the FP16 baseline.
+- Add **AutoQuantize recipe** support: ``mtq.auto_quantize`` can be driven declaratively from a YAML recipe (``RecipeType.AUTO_QUANTIZE`` / ``AutoQuantizeConfig``) specifying candidate formats, the ``effective_bits`` target, cost model (incl. ``active_moe`` and ``excluded_module_name_patterns``), scoring method, and disabled layers. Adds an ``effective_bits`` cost-model override on ``QuantizeConfig`` / ``QuantizerAttributeConfig`` (block-scale-accurate NVFP4 = 4.5 via ``configs/numerics/nvfp4``). Shipped recipes live under ``modelopt_recipes/general/auto_quantize/`` and model-specific ones under ``modelopt_recipes/huggingface/<model>/auto_quantize/``.
+- Add module-specific AutoQuantize search spaces through ``mtq.auto_quantize(..., module_search_spaces=...)`` and recipe-level ``auto_quantize.module_search_spaces``. Glob-matched decision groups can override the global candidate formats and control whether BF16/no-quant is solver-selectable with ``allow_no_quant``. A recipe can instead reuse a normal PTQ ``quantize`` config as the fixed baseline and list only the genuinely searched modules; fixed and searched groups stay in one calibration, scoring, effective-bits, checkpoint, and export flow.
+- Add ``rotate.mode`` to torch quantizer configs. The default ``"rotate"`` keeps the existing rotate-before-quantize behavior; ``"rotate_back"`` enables fake-quant rotate → quantize → rotate-back for TensorQuantizer.
+- Add a ``constant_amax`` ``QuantizerAttributeConfig`` field that pins a quantizer's ``amax`` to a fixed value and skips activation calibration. Unlike ``use_constant_amax`` (which hardcodes 448.0 for KV-cache cast math and registers no buffer), ``constant_amax`` stores the constant on the ``_amax`` buffer so it is used by both the fake-quant forward and the exported scaling factor — for NVFP4 activations, ``constant_amax: 2688.0`` yields ``input_scale == 1.0``. Ships ``modelopt_recipes/general/ptq/nvfp4_experts_only_input_scale1-kv_fp8_cast.yaml``, which applies this to the MoE expert activation quantizers.
+- Add ``MaxCalibConfig.skip_forward_without_activation_calib`` (opt-in, default ``False``): max calibration skips the ``forward_loop`` when no enabled quantizer needs data-driven activation statistics — e.g. an experts-only recipe using ``constant_amax`` / ``use_constant_amax``, or dynamic / MX quantization. Weight calibration still runs on the weight tensors directly, so quantized weights are unchanged. It is opt-in because the ``forward_loop`` can carry caller-side effects (notably materializing sharded parameters under DeepSpeed ZeRO-3). Enabled by the ``nvfp4_experts_only_input_scale1-kv_fp8_cast`` recipe.
+- Add ``examples/minimax_m3/hf_ptq_mixed_mxfp8_nvfp4.py`` for streaming MiniMax-M3 export and a model-specific ``hf_ptq.py`` recipe that produces an MXFP8 language-model base with MSE-calibrated NVFP4 routed experts directly from BF16. The NVFP4 expert ``input_scale`` is fixed to 1.0.
+- Add opt-in TensorRT-RTX ABI Execution Provider support for ONNX calibration on Windows arm64. Select it with ``--calibration_eps=NvTensorRtRtx --trt_rtx_backend=abi``; the legacy backend remains the default.
+
+*Speculative Decoding*
+
+- Add the **D-PACE** loss objective for DFlash speculative-decoding training (`arXiv:2605.18810 <https://arxiv.org/abs/2605.18810>`_) and make it the default (``dflash_loss_objective: dpace``). It replaces the static exponential position decay with dynamic, confidence-derived per-position weights that adapt to whichever block positions currently limit acceptance. Smoothing is controlled by ``dflash_dpace_alpha`` (default 0.5); set ``dflash_loss_objective: decay`` to restore the previous static schedule. Training-only and detached from the gradient (no architecture or inference change).
+- Add **streaming** speculative-decoding training (EAGLE3 / DFlash): the draft trains on base-model hidden states produced on the fly by a co-located ``vllm serve`` (no disk dump), moved trainer-side over NIXL RDMA, scaling to multi-node (dedicated serve replicas + DDP trainers). New launcher examples for NVFP4 Kimi-K2.5 / K2.6 on GB200/aarch64 under ``tools/launcher/examples/moonshotai/``.
+- Add **Domino** speculative-decoding training: the parallel DFlash draft backbone plus a lightweight GRU causal correction head, selected via ``dflash_architecture_config.projector_type=domino``. Trained with a base/final dual loss whose ``dflash_lambda_base_start``/``dflash_lambda_base_decay_ratio`` curriculum decays the base-loss weight 1→0. Exports in the z-lab drafter format; recipe at ``modelopt_recipes/general/speculative_decoding/domino.yaml``. Training only — the inference path is not wired up yet.
+
+*Megatron Framework (M-LM / M-Bridge)*
+
+- Add Minitron pruning support for Megatron-Core models with the following new attention and MoE variants. For these, only ``hidden_size`` is pruned (alongside the usual ``ffn_hidden_size`` / ``num_layers`` / MoE dimensions); the variant-internal dimensions noted below are not pruned:
+
+  - **GatedDeltaNet** (linear attention) and **gated attention** (``attention_output_gate``), such as Qwen3.5 (hybrid GatedDeltaNet + gated-attention) language models, including MoE variants — attention / linear-attention heads are not pruned.
+  - **Multi-Latent Attention (MLA)**, such as DeepSeek — MLA latent ranks are not pruned.
+  - **Latent MoE**, such as Nemotron-3-Super — ``hidden_size`` pruning resizes the latent projections while the MoE latent dim itself is not pruned.
+- Optimize Minitron pruning support for MoE models using the fused **grouped GEMM** experts (``TEGroupedMLP``) in addition to the existing ``SequentialMLP`` path. ``examples/megatron_bridge/prune_minitron.py`` now uses grouped GEMM by default (pass ``--no_moe_grouped_gemm`` to fall back to ``SequentialMLP``).
+- Add Minitron pruning support for the language model part of vision-language models (e.g. Qwen3.5-VL, Gemma3-VL) via ``examples/megatron_bridge/prune_minitron.py``. The language model is pruned while the vision tower is left intact and the full VLM is saved back; ``hidden_size`` is not pruned if it is shared with the vision projector. Pruning importance is estimated from image-text calibration (the full VLM forward over vision-conditioned activations) by default, or from a text dataset for text-only ablations.
+- Add PTQ support for the language model part of vision-language models (e.g. Qwen3.5-VL, Gemma3-VL) via ``examples/megatron_bridge/quantize.py``. Only the language model is quantized (vision tower + projector left in full precision) and the full VLM is saved as a Megatron checkpoint. The calibration modality is inferred from ``--calib_dataset_name``: an image-text dataset drives the full VLM forward (vision-conditioned activations), while a text dataset runs text-only calibration of the language model. Image-text calibration shards across data-parallel ranks (context parallelism is supported only for text-only calibration). HuggingFace unified export of a quantized VLM is not yet supported.
+- Add Megatron-Bridge distillation and Quantization-Aware Distillation (QAD) support for the language model part of vision-language models (e.g. Qwen3.5-VL, Gemma3-VL) via ``examples/megatron_bridge/distill.py``.
+- Add **context-parallel (CP)** and **data-parallel (DP)** support to the shared Megatron-Core inference/calibration utilities. Under CP, ``get_megatron_calibration_forward_loop`` and ``megatron_mmlu`` partition each sequence across CP ranks (zigzag load-balanced) and MMLU gathers per-rank logits back to the full sequence for last-token scoring. Under DP, calibration shards the dataset across data-parallel ranks (amax is max-reduced across the DP group inside ``mtq``) and ``megatron_mmlu`` shards whole batches and all-reduces the per-subject counts. DP is implicit (``world_size / (tp * pp * cp)``); ``examples/megatron_bridge/quantize.py`` gains a ``--cp_size`` flag.
+- Add support for retaining all Megatron-Bridge distillation checkpoints via ``distill.py --checkpoint_keep_last -1`` and exporting all or selected iterations with ``export_distilled_megatron_to_hf.py --export_iterations``.
+- Add the ``prepare_megatron_data_blend`` utility to prepare weighted Megatron data blends from YAML configs, including optional token-budgeted subsets for distillation workflows. See the `Megatron data preparation guide <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/dataset/MEGATRON_DATA_PREP.md#prepare-token-budgeted-data-blends>`_.
+
+*Misc*
+
+- Add the ``day0-release`` agent skill, a deterministic end-to-end driver that chains the PTQ → evaluation → comparison skills with an enforced gate after each stage (validating checkpoint coverage, evaluation-run completeness, and the baseline-vs-candidate accuracy threshold) and returns a publish decision (ACCEPT / REGRESSION / ANOMALOUS / INFEASIBLE). v1 reports and stops on regression; the recipe-search loop is deferred.
+- Add support for ONNX Q/DQ node placement for DLA via the new flag ``--target_dla``.
+- (Experimental) Add pruning examples for Qwen3.5-9B and Nemotron3-Nano using the `new experimental puzzletron branch <https://github.com/NVIDIA/Model-Optimizer/blob/puzzletron_v2/examples/puzzletron/README.md#end-to-end-tested-models>`_, this branch uses `AutoModel <https://github.com/NVIDIA-NeMo/Automodel>`_ for better parallelization and efficiency.
+
+**Backward Breaking Changes**
+
+- Remove the ``examples/diffusers/eval`` image-quality evaluation example (ImageReward / CLIP-IQA / CLIP metrics) and its references in ``examples/diffusers/README.md``. The example was deprecated in 0.45 and is no longer maintained.
+- Remove the deprecated ``examples/llm_autodeploy`` example (deprecated in 0.45). Use TensorRT-LLM's `AutoDeploy <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/auto_deploy>`_ directly together with ModelOpt PTQ in ``examples/hf_ptq``.
+- Remove the deprecated ``examples/llm_qad`` Megatron-LM QAD example (deprecated in 0.45). Use the `megatron_bridge QAD example <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/megatron_bridge#quantization-aware-distillation-qad>`_ instead, which provides a simpler Python-based interface and better model coverage.
+- Dropped VILA / NVILA vision-language model support in ``examples/hf_ptq``. VILA's modeling code requires ``transformers<=4.50.0``, which conflicts with ModelOpt's minimum supported ``transformers`` version. The VILA-specific bootstrap (repo clone, ``requirements-vila.txt``) and loading paths in ``example_utils.py`` have been removed.
+- Dropped **Phi-4-multimodal** and **Phi-3-vision** PTQ support in ``examples/hf_ptq``. Phi-4-multimodal's bundled remote code needs ``transformers<4.52``, below ModelOpt's minimum of ``4.57``; Phi-3-vision, the superseded predecessor in the same family, is dropped alongside it and is likewise broken on Transformers 5.x. The support-matrix row, the ``phi4mm`` model type, the multimodal-detection heuristics that only ever matched these two, the ``Phi3Image`` / ``PhiImage`` embedding-export exclusions, and the ``modelopt_recipes/huggingface/phi4mm/`` recipes have been removed. Text-only Phi-3/Phi-4 and Phi-3.5-MoE are unaffected.
+
+**Deprecations**
+
+- ``examples/hf_ptq`` AutoQuantize is now driven by an **AutoQuantize recipe** (``--recipe``). The ``--auto_quantize_bits``, ``--auto_quantize_method``, ``--auto_quantize_score_size``, ``--auto_quantize_cost_model``, and ``--auto_quantize_active_moe_expert_ratio`` flags are **deprecated** but still work: they are converted into an ``AutoQuantizeConfig`` on the fly (emitting a ``DeprecationWarning``) and will be removed in a future release. Prefer a recipe under ``modelopt_recipes/general/auto_quantize/``. See ``examples/hf_ptq/README.md``.
+- Renamed ``examples/llm_ptq`` to ``examples/hf_ptq`` to reflect that it covers Hugging Face LLM **and** VLM PTQ. A relative symlink ``examples/llm_ptq`` to ``hf_ptq`` keeps existing paths and commands working; it will be removed in a future release. Please update references to the new ``examples/hf_ptq`` path.
+- Consolidated ``examples/vlm_ptq`` into ``examples/hf_ptq``. Vision-language model PTQ now shares the ``hf_ptq.py`` entry point and ``scripts/huggingface_example.sh``; pass ``--vlm`` to run the TensorRT-LLM multimodal quickstart smoke test. The ``examples/vlm_ptq/scripts/huggingface_example.sh`` entry point is deprecated: it now prints a warning and forwards to the ``hf_ptq`` script with ``--vlm``, and will be removed in a future release. See `examples/hf_ptq/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/hf_ptq#vlm-quantization>`__.
+- Bump minimum transformers version to ``4.57`` instead of ``4.56``. Transformers 4.x support will be dropped in a future release.
+- Bump minimum nemo container requirement to ``nemo:26.04`` (recommended ``nemo:26.06``) for Megatron-Bridge / Megatron-LM optimization features.
+- Python 3.10 support will be dropped in the next release as it is reaching EOL.
+
+**Bug Fixes**
+
+- Reject INT4 and W4A8 AWQ checkpoint export when a weight's input dimension is not divisible by the configured block size. Choose an ``awq_block_size`` that evenly divides every quantized weight's input dimension.
+- Fix NemotronH dense MLP quantization with the ``nvfp4_mlp_only`` and ``nvfp4_omlp_only`` recipe families. NemotronH registers these projections as ``mixer.up_proj`` / ``mixer.down_proj``, which the previous ``*mlp*`` selector missed, producing checkpoints with a null ``quant_algo``.
+- Fix ``ShapeInferenceError`` during ONNX INT8 + FP16 quantization (``--high_precision_dtype fp16``) of weakly-typed models (e.g. TensorFlow exports) that carry stale rank-0 ``graph.output`` shapes or ops such as ``TopK`` that ONNX's static shape inference cannot resolve. Stale output shapes are now reconciled via symbolic shape inference, and AutoCast falls back to schema-based type inference so unresolved ops no longer leave tensors untyped.
+- Fix fused MoE expert auto-detection (``register_fused_experts_on_the_fly``) skipping modules without an ``act_fn`` attribute. Modules applying a custom gated activation between the two ``F.linear`` calls (e.g. ``MiniMaxM3VLExperts``) were silently skipped, leaving routed experts unquantized and failing HF export. Enables NVFP4/FP8 quantization and export for MiniMax-M2 / MiniMax-M3.
+- Fix unified HF export emitting transformers' *in-memory* (post-``conversion_mapping``) tensor names instead of the original model-hub names, breaking the unified-checkpoint contract (observed on MiniMax-M3). A new quant-aware reverse conversion derives the rename/split rules from the model's conversion mapping and carries each weight's companion scale tensors through the renames and un-fusions, so quantized exports round-trip to the hub names. Mapping ops that cannot be reversed quant-aware yet (e.g. still-stacked fused experts) fall back to the in-memory names instead of aborting the export.
+- Fix unified HF export of already-compressed NVFP4 weights, i.e. ``mtq.compress`` and ``hf_ptq.py --low_memory_mode``, writing a ``weight_scale`` of half the required size with meaningless values (the per-block scale cannot be recomputed from packed nibbles). The export now reuses the per-block scale captured at compression time. The internal ``_scale`` / ``_double_scale`` quantizer buffers are also removed after use; they previously leaked into the checkpoint and made downstream loaders (vLLM, TensorRT-LLM PyTorch backend) fail with ``KeyError``.
+- Fix ONNX FP16/BF16 conversion (``--high_precision_dtype fp16``) producing inconsistent tensor types on models with control-flow subgraphs. Subgraph nodes now only run in low precision when all their float inputs are subgraph initializers, outer-scope captures and precision boundaries are reconciled with ``Cast`` nodes, and ``Constant`` folding refreshes ``value_info`` so strongly-typed parsers (TensorRT) no longer reject the model. Behavioral change: a weight inside a branch that also reads an outer-scope FP32 activation now stays FP32 instead of being converted.
+- Nested submodel reverse mappings are now scoped against registered model namespaces, preventing text-only mappings from capturing an already nested VLM's ``model.visual.*`` namespace or double-prefixing ``model.language_model.*`` (observed on Qwen3.5).
+- Fix vLLM 0.24+ support, where ``FusedMoE`` became a factory function and the expert weights moved onto a ``RoutedExperts`` submodule, breaking every ``QuantModuleRegistry`` lookup with ``TypeError: issubclass() arg 2 must be a class``. The plugin now registers whichever fused-MoE module class the installed release provides. The registry key moves ``vllm_FusedMoE`` to ``vllm_RoutedExperts`` and quantizer paths gain ``.routed_experts``, so an older ``modelopt_state`` does not restore onto 0.24+ as-is.
+- Fix ``examples/vllm_serve`` serving shared experts uncalibrated: their ``gate_proj``/``up_proj`` quantizer keys were not merged into ``gate_up_proj`` on reload, so they matched no module and were dropped.
+- Fix Qwen3-VL MoE PTQ failing on ``transformers>=5.12`` with ``AttributeError: 'QuantQwen3VLMoeTextExperts' object has no attribute 'hidden_size'``. transformers 5.12 moved ``Qwen3VLMoeTextExperts`` onto the standard fused-experts layout, but the legacy static wrapper shadowed on-the-fly detection. The new layout is now claimed by ``register_fused_experts_on_the_fly``; the legacy wrapper is still registered on ``transformers<5.12``, whose ``torch.bmm``-based forward the generic wrapper cannot intercept.
+- Fix ``examples/hf_ptq`` multi-node FSDP2 export (``--use_fsdp2``) failing with ``RuntimeError: Cannot set version_counter for inference tensor``. ``export_quantized`` now runs under ``torch.no_grad()`` instead of ``torch.inference_mode()``, so the gathered full params stay normal tensors.
+- Fix HF checkpoint export failing with ``AttributeError: 'list' object has no attribute 'keys'`` for models whose modeling code still declares tied weights in the ``transformers<5`` list format (common among ``trust_remote_code`` checkpoints, e.g. ``stepfun-ai/Step-3.7-Flash``). Such models load fine but died at the end of PTQ, after calibration. ModelOpt's ``save_pretrained`` patch now normalizes a list-style declaration to the equivalent dict for the duration of the save.
+- Fix unified HF export of multimodal models whose vision tower carries its own ``PrefixChange`` conversion (``LlavaForConditionalGeneration`` and ``Gemma3ForConditionalGeneration`` on ``transformers>=5.12``). The quant-aware reverse conversion ignored transformers' ``scope_prefix``, so the vision tower's prefix rule was applied to *every* key in the state dict and vLLM rejected the checkpoint with ``ValueError: There is no module or parameter named 'vision_model'``. Reverse rename rules now carry their scope and are applied only to keys under it.
+- Fix QLoRA export in ``examples/llm_qat/export.py`` failing with ``AssertionError: Model already has modelopt state!``: ``enable_huggingface_checkpointing`` already restores the quantized base model's state, so the export now restores only when the model is not already converted. Two further breakages on the same path are also fixed: ``_restore_qtensor_wrappers`` matched no modules because PEFT re-parents the quantized linear as ``<name>.base_layer``, and ``postprocess_state_dict`` silently dropped every ``base_layer.*`` key missing from a hand-maintained rename map (losing the NVFP4 ``weight_scale_2`` global scale and any linear ``bias``) — the rename is now a generic ``.base_layer.`` strip.
+- Fix ``--use_fsdp2`` PTQ (``examples/hf_ptq``) failing on models that hold a few parameters in a dtype other than the model's own, with ``AssertionError: FSDP expects uniform original parameter dtype`` on the first calibration forward. Nemotron-3-Nano is one such model: its MoE router gates are declared ``float32`` while the rest of the checkpoint is bfloat16, so each decoder layer's FSDP2 shard group mixed dtypes. ``fsdp2_wrap`` now passes those off-dtype parameters to ``fully_shard(ignored_params=...)``, leaving them replicated in their original dtype instead of casting them, and warns with their names and their share of the model.
+- Fix ``--use_fsdp2`` HF export making no progress for hours on large MoE checkpoints. ``create_fsdp_param_mapping`` resolved each ``FSDPParam``'s module by scanning every ``model.named_parameters()``, and export calls it once per quantized module, so the cost was quadratic in (parameters x modules): harmless for dense models, intractable for a MoE with many experts. Exporting Nemotron-3-Nano-30B-A3B (6,243 parameter tensors, 6,004 quantized modules) spent an estimated 1.9 hours there with every GPU idle. The parameter index is now built once per mapping instead of once per ``FSDPParam`` (1151 ms -> 5.1 ms per call), preserving the previous ``named_parameters()``-order resolution for tied weights.
+
+0.45.0 (2026-07-06)
+^^^^^^^^^^^^^^^^^^^
+
+**New Features**
+
+*Quantization*
+
+- Add NVFP4 W4A16 weight-only quantization (``w4a16_nvfp4``): FP4 weights with group_size=16, BF16 activations, no calibration forward pass required. Use ``mtq.W4A16_NVFP4_CFG`` or ``--qformat w4a16_nvfp4`` in ``hf_ptq.py``. vLLM deployment support is in progress.
+- Add ``--cast_mxfp4_to_nvfp4`` flag to ``examples/llm_ptq/hf_ptq.py`` for closed-form, bit-exact MXFP4 → NVFP4 weight conversion. Supports the GPT-OSS family (``openai/gpt-oss-20b``, ``openai/gpt-oss-120b``). See `examples/llm_ptq/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq#mxfp4--nvfp4-cast-for-gpt-oss>`__ for usage.
+- Add ``--cast_mxfp4_to_nvfp4`` flag to ``examples/deepseek/deepseek_v4/quantize_to_nvfp4.py`` for closed-form, bit-exact MXFP4 → NVFP4 conversion of DeepSeek V4 routed-expert weights (mirrors the GPT-OSS cast; w1/w3 share one per-tensor ``scale_2`` for the fused GEMM1). Activation ``input_scale`` still comes from ``--amax_path`` calibration.
+- DeepSeek PTQ (``examples/deepseek/ptq.py``) now defaults to native top-k calibration with post-hoc per-layer peer-max sync of expert ``input_quantizer.amax``; the all-experts path is preserved behind ``--calib_all_experts``.
+- Add active-MoE cost accounting for ``mtq.auto_quantize`` effective-bits search. Set ``constraints={"effective_bits": ..., "cost_model": "active_moe", "cost": {"active_moe_expert_ratio": ...}}`` to weight routed MoE expert costs by active experts per token while keeping shared experts fully counted. The ``hf_ptq.py`` AutoQuant path exposes this via ``--auto_quantize_cost_model active_moe`` and ``--auto_quantize_active_moe_expert_ratio``.
+- Add quantized ``nn.Embedding`` support. ``nn.Embedding`` is now registered in ``QuantModuleRegistry`` and exposes ``weight_quantizer`` (embedding table), ``output_quantizer`` (lookup activations), and a permanently disabled ``input_quantizer`` placeholder — embedding inputs are integer indices and cannot be fake-quantized, so direct ``enable*()`` calls raise. ``export_hf_checkpoint`` packs quantized embedding weights alongside Linear layers. Embedding quantizers are opt-in (``parent_class: nn.Embedding`` disabled by default).
+- Add composable ``$import`` system for recipe YAML configs, enabling reusable config snippets referenced via ``{$import: name}`` markers. All built-in PTQ recipes converted to use imports with shared snippets under ``modelopt_recipes/configs/`` (numeric formats, quant_cfg building blocks, presets). See :ref:`composable-imports`.
+- The PTQ example scripts ``examples/llm_ptq/hf_ptq.py``, ``examples/llm_ptq/multinode_ptq.py`` and ``examples/megatron_bridge/quantize.py`` now derive their ``--qformat`` / ``--kv_cache_qformat`` (``--quant_cfg`` / ``--kv_cache_quant`` for Megatron-Bridge) CLI vocabularies by discovering the YAML presets under ``modelopt_recipes/configs/ptq/presets/{model,kv}/`` rather than carrying hardcoded ``QUANT_CFG_CHOICES`` / ``KV_QUANT_CFG_CHOICES`` tables. The discovery helper, alias table and ready-built ``QUANT_CFG_CHOICES`` / ``KV_QUANT_CFG_CHOICES`` mappings now live in ``modelopt.recipe.presets`` and are shared by all three scripts. Presets are loaded eagerly into a plain dict at import. Adding a new preset YAML makes it available on the CLI of all three with no script change — note this means each script now accepts every preset under those directories, not just a previously curated subset. All previously-supported short names (``int8_sq``, ``nvfp4_awq``, ``fp8_pb_wo``, ``nvfp4_mse``, ``w4a8_awq``, ``nvfp4_local_hessian``, ``fp8_pc_pt``, ``int8_wo``) keep working via a small deprecation alias table; new formats should be exposed as preset YAMLs (or, longer term, as full ``--recipe`` recipes).
+- Add ``configs/ptq/presets/kv/fp8_cast.yaml`` and ``configs/ptq/presets/kv/nvfp4_cast.yaml``, promoting ``fp8_cast`` / ``nvfp4_cast`` to first-class KV presets composed from the existing ``kv_fp8_cast`` / ``kv_nvfp4_cast`` unit fragments. The previous runtime ``use_constant_amax`` post-edit in ``hf_ptq.py`` is removed; ``use_constant_amax: true`` now lives in the YAML and is therefore authoritative. **Custom (out-of-tree) recipes that target a cast KV format must set ``use_constant_amax: true`` themselves on the ``[kv]_bmm_quantizer`` config** — in-tree recipes already do via the ``kv_*_cast`` units.
+- Add FP8 KV-cache cast variants for the partial-NVFP4 and weight-only general PTQ recipes: ``general/ptq/nvfp4_mlp_only-kv_fp8_cast``, ``general/ptq/nvfp4_experts_only-kv_fp8_cast``, ``general/ptq/nvfp4_omlp_only-kv_fp8_cast``, and ``general/ptq/nvfp4_weight_only-kv_fp8_cast``. These compose the same model-quant configs as their ``-kv_fp8`` siblings with the ``kv_fp8_cast`` unit (constant-amax FP8 KV cache, no KV calibration forward pass).
+- Add Nemotron-3-Super-120B-A12B PTQ recipes ``modelopt_recipes/huggingface/models/nvidia/Nemotron-3-Super-120B-A12B-BF16/ptq/nvfp4-mse.yaml`` (MSE-mixed) and ``nvfp4-max-calib.yaml`` (max-calib mixed): NVFP4 W4A4 routed experts + FP8 per-tensor shared experts / Mamba in/out_proj + FP8 KV cache.
+- Group layerwise calibration options under a nested ``LayerwiseConfig`` and add two knobs: ``get_qdq_activations_from_prev_layer`` (correct GPTQ-Hessian vs max-calib activation semantics — defaults to True for GPTQ, False for max/mse/local_hessian) and ``save_every`` (gate per-window ``next_inputs.pt`` activation-cache writes). Legacy bool ``layerwise`` and flat ``layerwise_checkpoint_dir`` keys still work; the bool form emits a ``DeprecationWarning``.
+- Add two layerwise-calibration memory optimizations: ``calib_mutates_weights`` (set False for amax-only algorithms — max/mse/local_hessian — to skip the per-layer weight checkpoint blob and in-memory writeback, persisting only quantizer state), and meta-device skip-layer placeholders (already-calibrated layers emit zero-filled ``meta`` tensors instead of real-device buffers, eliminating their activation memory — models with real-device inter-layer ops on the hidden state are unsupported).
+- Add ``examples/alpamayo`` showing FP8, NVFP4, and AutoQuantize (mixed-precision) quantization of the Alpamayo (formerly Alpamayo-R1) ~10B vision-language-action model, with a joint VLM + diffusion calibration loop and both fake-quant and ``--real-quant`` packed-checkpoint export. See `examples/alpamayo/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/alpamayo>`_ for details.
+- Refactor ``llm_qat`` example with unified YAML-based configuration and flexible dataset blending.
+  ``ModelOptArgParser`` adds ``--config`` YAML support with CLI overrides and auto-generates ``ARGUMENTS.md`` from dataclass definitions.
+  Dataset blending (``configs/dataset/blend.yaml``) supports HuggingFace datasets, local JSON/JSONL/Parquet files, and weighted multi-source blends.
+  The legacy FSDP1 accelerate config is removed; ``llm_qat`` now documents FSDP2, DeepSpeed, and DDP backends.
+
+*Megatron Framework (M-LM / M-Bridge)*
+
+- Add quantization examples for the Megatron-Bridge framework (``examples/megatron_bridge/``): post-training quantization (`quantize.py <https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/megatron_bridge/quantize.py>`_ calibrates an HF model via ``--quant_cfg`` alias / full config name or a ``--recipe`` YAML, with optional KV-cache quant, weight-only, compression, and MoE expert-ratio calibration, and saves a Megatron checkpoint with tensor / pipeline / expert parallelism), export to a deployable HuggingFace (unified) checkpoint for TensorRT-LLM / vLLM / SGLang (`export_quantized_megatron_to_hf.py <https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/megatron_bridge/export_quantized_megatron_to_hf.py>`_), and Quantization Aware Distillation (extend existing `distill.py <https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/megatron_bridge/distill.py>`_). See `examples/megatron_bridge/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/megatron_bridge>`_ for details.
+- Add Megatron Core export/import mapping for Qwen3-VL (``Qwen3VLForConditionalGeneration``) vision-language models. The mapping handles the ``model.language_model.`` weight prefix used by Qwen3-VL.
+- Add shared Megatron-Core calibration forward loop: ``modelopt.torch.utils.plugins.megatron_calibration.get_megatron_calibration_forward_loop`` produces the ``forward_loop`` callable expected by ``mtq.quantize`` / ``mtp.prune``. Replaces the bespoke calibration loops in Megatron-LM and Megatron-Bridge for quantization and pruning with a single canonical implementation.
+- Support Megatron-Core checkpoint restore and export for MSE ``NVFP4StaticQuantizer``.
+- Add mixed-precision FP8 + NVFP4 export for Megatron-Core: per-layer ``quant_algo`` recorded under ``quantized_layers`` in ``hf_quant_config.json``, PP-aware ``kv_cache_dtype`` gather, fused-QKV exclude split into per-HF-name ``q/k/v_proj`` entries.
+- Add AutoQuant and GPTQ support for Megatron-Core models, including MCore-specific AutoQuant hooks and decoder-layer discovery for GPTQ layerwise calibration.
+- Add support for ``active_params`` (for MoE models) and ``memory_mb`` constraints in Minitron pruning on top of existing ``params`` constraint. You can also provide multiple constraints. See `examples/pruning/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning>`_ for more details. The underlying utility functions ``mcore_param_count``, ``mcore_memory_footprint_mb``, and ``print_mcore_model_stats`` in ``modelopt.torch.nas.plugins.megatron_model_stats`` are also available for standalone use to compute parameter counts and memory footprints (weights + KV-cache + Mamba state) for any Megatron-Core model.
+- Add Minitron pruning support for Megatron-Bridge Gemma3 models.
+- Add end-to-end optimization tutorial for Minitron pruning + two-phase distillation (80B @ 8K + 20B @ 32K long-context = 100B tokens) + FP8 PTQ + vLLM deployment for Nemotron-3-Nano-30B-A3B-BF16 (MoE + Mamba-Transformer hybrid) → Pruned 22B/A3.0B active params, along with data blend preparation steps (with tool-calling data) and detailed pruning / data-blend / long-context ablations. See `examples/megatron_bridge/tutorials/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/megatron_bridge/tutorials/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/>`_ for details.
+
+*Datasets & Calibration*
+
+- Add ``DATASET_COMBOS`` to ``modelopt.torch.utils.dataset_utils`` — single ``--dataset`` tokens that fan out to multiple registered datasets; per-entry ``num_samples`` is split evenly across the members. Initial combos: ``cnn_nemotron_v2_mix`` (``cnn_dailymail`` + ``nemotron-post-training-dataset-v2``, used by ``hf_ptq.py`` when no ``--dataset`` is provided) and ``nemotron-post-training-v3`` (the seven ``nvidia/Nemotron-*`` SFT datasets added in #1498, mirroring the `nemotron-post-training-v3 collection <https://huggingface.co/collections/nvidia/nemotron-post-training-v3>`_). Combo names are listed by ``get_supported_datasets()`` and surfaced in ``--dataset`` help. ``get_dataset_dataloader`` rejects inputs that mix a combo with one of its member datasets (e.g. ``cnn_dailymail,cnn_nemotron_v2_mix``) to avoid double-sampling, and ``get_dataset_samples`` rejects combo names so callers route through the dataloader. ``hf_ptq.py`` default ``--calib_size`` is bumped from ``512`` to ``1024`` so the total calibration sample count under the new default combo matches the previous two-dataset fallback.
+- The ``nemotron-sft-agentic-v2`` registered dataset (added in #1498) now uses only the ``search`` split. The previously configured ``interactive_agent`` and ``tool_calling`` splits contain content-level defects (heterogeneous schema and a malformed JSON row, respectively) that cause pyarrow's streaming JSON reader to fail deterministically.
+- Add ``pack=True`` mode to ``get_dataset_dataloader`` (Megatron-LM pretraining-style global-stream document packing): all raw samples concatenated EOS-separated into one token stream, sliced into uniform ``max_sample_length`` rows. Used by the shared megatron calibration loop.
+
+*Misc*
+
+- Add offline DFlash speculative decoding training. Train the draft module from pre-computed base-model hidden states dumped by ``examples/speculative_decoding/collect_hidden_states/compute_hidden_states_hf.py``; base-model transformer layers are deleted after conversion to save memory. Controlled by the auto-derived ``dflash_offline`` flag on ``DFlashConfig`` (derived from ``data_args.offline_data_path``). The dump scripts now share ``collect_hidden_states/common.py`` for aux-layer selection (``--aux-layers eagle|dflash|<list>``) and optional assistant-token ``loss_mask`` for answer-only-loss training.
+- Add ``mtsa.config.SKIP_SOFTMAX_TRITON_CALIB`` for skip-softmax attention-sparsity calibration through the fused Triton ``attention_calibrate`` kernel (HF ``modelopt_triton`` backend), measuring multi-threshold tile-skip statistics the way the Triton inference kernel actually skips tiles for both prefill and decode. Exposed as ``--sparse_attn_cfg skip_softmax_triton_calib`` in ``examples/llm_sparsity/attention_sparsity/hf_sa.py`` (with a new ``--calib_data_dir`` flag for RULER calibration data).
+- Add DMD2 distillation for few-step diffusion models in ``examples/diffusers/fastgen/``: distill Qwen-Image into a 4/8-step student via Distribution Matching Distillation. See `examples/diffusers/fastgen/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers/fastgen>`_ for details.
+- Make ``.agents/skills/`` the canonical location for agent skills; agent-specific directories (``.claude/skills/``, etc.) are now relative symlinks into ``.agents/``, so one skill suite serves multiple coding agents (Claude Code, Codex). See ``.agents/README.md``.
+- Extend Claude Code agent skills for PTQ, deployment, evaluation, monitoring, and baseline-vs-quantized result comparison. Adds evaluation task references for additional benchmarks, stronger PTQ checkpoint validation gates, and session-scoped workspace/job tracking.
+- Add SLURM Quality of Service (QoS) support to the ModelOpt launcher. Users can set QoS via ``slurm_config.qos`` or ``SLURM_QOS`` and the value is forwarded to ``nemo_run.SlurmExecutor``.
+
+**Backward Breaking Changes**
+
+- ``KDTrainer`` / ``QADTrainer`` evaluation now reports KD as the primary
+  ``eval_loss`` and CE as ``eval_ce_loss``; the previous secondary
+  ``eval_kd_loss`` metric is removed.
+- Reorganize custom CUDA / Triton kernels under ``modelopt.torch.kernels`` into ``common/attention``, ``quantization/{conv,gemm}``, and ``sparsity/attention``. High-level APIs (``mtq.quantize``, ``mtsa.sparsify``, etc.) are unchanged, but **any code importing directly from the kernel subpackages must be updated**: there is no backwards-compatibility shim; the old import paths will raise ``ImportError`` / ``ModuleNotFoundError``. Migration table:
+
+  - ``from modelopt.torch.kernels import IS_AVAILABLE, attention, attention_calibrate, register_triton_attention`` → ``from modelopt.torch.kernels.common.attention import ...``
+  - ``from modelopt.torch.kernels.triton_fa import ...`` → ``from modelopt.torch.kernels.common.attention.triton_fa import ...``
+  - ``from modelopt.torch.kernels.hf_triton_attention import ...`` → ``from modelopt.torch.kernels.common.attention.hf_triton_attention import ...``
+  - ``from modelopt.torch.quantization.triton import ...`` → ``from modelopt.torch.kernels.quantization.gemm import ...``
+  - ``from modelopt.torch.quantization.src.conv.implicit_gemm_cuda import ...`` → ``from modelopt.torch.kernels.quantization.conv.implicit_gemm_cuda import ...``
+  - ``from modelopt.torch.sparsity.attention_sparsity.kernels import ...`` → ``from modelopt.torch.kernels.sparsity.attention import ...``
+
+- Deprecated GradNAS pruning algorithm as it is not actively maintained and supports very limited and old models. It is recommended to use Minitron or Puzzletron pruning for LLM models. Also deprecates related ``examples/chained_optimizations`` directory.
+- Model-specific PTQ ``quant_cfg`` adjustments previously hardcoded in ``examples/llm_ptq/`` (``build_quant_cfg`` / ``mono_quantize``) for gemma, mpt, phi4mm, and Nemotron VL are now opt-in **model-specific recipes** under ``modelopt_recipes/huggingface/<model_type>/ptq/``. Any adjustment specific to a model type or instance must live in that model's recipe; the bare ``--qformat`` path produces only the generic numerics. Pass ``--recipe huggingface/<model_type>/ptq/<recipe>`` to apply the model's recipe. Covers gemma/mpt ``w4a8_awq`` (``awq_lite`` ``alpha_step=1``), gemma ``int8_sq`` (SmoothQuant ``alpha=0.5``), phi4mm speech/audio/image/vision exclusions, and Nemotron VL vision-branch exclusions. All shipped recipes also enable FP8 KV-cache cast. MTP dynamic layer exclusion and ``is_nemotron_vl`` detection remain in Python.
+- The Step3.5-Flash recipe moved from ``modelopt_recipes/models/Step3.5-Flash/nvfp4-mlp-only.yaml`` (0.44) to ``modelopt_recipes/huggingface/step3p5/Step3.5-Flash/ptq/nvfp4-mlp-only.yaml`` to match the ``huggingface/<model_type>/ptq/`` layout convention. Update ``--recipe`` paths accordingly.
+
+**Deprecations**
+
+- Deprecate the public ``QuantizationArgumentsWithConfig`` name in ``modelopt.torch.quantization.plugins.transformers_trainer``; it now aliases ``QuantizationArguments`` and will be removed in a future release.
+- Deprecate ``examples/llm_autodeploy``. The AutoQuant + TensorRT-LLM AutoDeploy
+  workflow it demonstrates will be removed in a future release; use TensorRT-LLM's
+  `AutoDeploy <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/auto_deploy>`_
+  directly together with ModelOpt PTQ in ``examples/llm_ptq``.
+- Deprecate the ``examples/llm_qad`` Megatron-LM QAD example. Use the `megatron_bridge QAD example <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/megatron_bridge#quantization-aware-distillation-qad>`_ instead, which provides a simpler Python-based interface and better model coverage.
+
+**Bug Fixes**
+
+- Support non-gated fused MoE experts in unified HuggingFace export. Nemotron-H MoE models (transformers 5.x ``NemotronHExperts``) store experts as fused 3-D ``up_proj`` / ``down_proj`` parameters with no ``gate_up_proj``; the fused-experts detection previously keyed on ``gate_up_proj``, so these were never wrapped as ``_QuantFusedExperts`` and export raised ``NotImplementedError: MoE model with experts type 'NemotronHExperts' is not supported``. The fused-experts path now also recognizes the non-gated layout (new ``_QuantNonGatedFusedExperts``) and exports a single ``up_proj`` per expert; the gated path is unchanged.
+- Always list unquantized MoE routers/gates in the exported ``exclude_modules``. ``get_quant_config`` only recorded modules that carry a quantizer, but on ``transformers>=5.0`` MoE routers are no longer ``nn.Linear`` (e.g. ``TopKRouter``) and never receive one, so the BF16 router weight was written to the checkpoint yet omitted from ``exclude_modules``. vLLM / SGLang then treated it as quantized and failed to load (e.g. Qwen3-30B-A3B NVFP4: ``AssertionError: Tried to load weights of size [128, 2048] to a parameter of size [128, 1024]``). Routers are now detected structurally (an MoE block with an ``experts`` container plus a weight-bearing ``gate`` / ``router`` / ``shared_expert_gate`` submodule) and recorded as unquantized regardless of quantizer attachment.
+- In Megatron-Core only do EP amax sync for routed expert weights if ``sync_expert_weight_amax=True``. Previously EP amax sync would sync routed expert weights across EP ranks even when ``sync_expert_weight_amax`` was False.
+- Fix Megatron-Core HF importer to load fused ``TELayerNormColumnParallelLinear.layer_norm_weight`` from HF for GPT-family models (Qwen3 etc.) under ``--export-default-te-spec``. Importer now prefers per-context keys ``fused_input_layernorm`` / ``fused_pre_mlp_layernorm`` (fallback ``fused_norm`` for Nemotron-H backward compatibility); ``mcore_qwen.py`` provides the new rules. Without this fix, post-prune MMLU sat at chance.
+- Fix ONNX AutoCast ``keep_io_types=True`` sanity-check failure (``Unexpected type in I/O tensor ...``) when a network input/output is an empty tensor (a dimension of size 0). Such tensors were "fake-cast" (retyped in place) to the low precision type; because the value-info map aliases the ``graph.input``/``graph.output`` ``ValueInfoProto``, this silently changed the model's I/O type. AutoCast now inserts a real ``Cast`` for protected I/O tensors instead.
+- Fix INT8 entropy calibration of fp16 ONNX models raising ``ValueError: Too many bins for data range`` on numpy >= 2.0. ``_collect_value`` in ``modelopt.onnx.quantization.ort_patching`` now casts the histogram range endpoints to Python float so bin edges are computed in float64, instead of inheriting the fp16 dtype of an activation tensor with a small range (which collapsed the 128-bin linspace under NEP-50 promotion).
+- Fix the GPT-OSS MXFP4 → NVFP4 PTQ path in ``examples/llm_ptq/hf_ptq.py`` (used with ``--cast_mxfp4_to_nvfp4``). ``get_model`` now loads native MXFP4 checkpoints (``openai/gpt-oss-*``) dequantized to BF16 ``GptOssExperts`` via ``Mxfp4Config(dequantize=True)`` on a sequential device map. This fixes a CUDA illegal-memory access during the multi-GPU dequant load and the ``NotImplementedError`` for experts type ``Mxfp4GptOssExperts`` during unified HF export (the packed-kernel experts wrapper, used when the optional ``kernels`` package is installed, is unsupported by export); ``kernels`` is no longer required. The ``--cast_mxfp4_to_nvfp4`` step now also resolves a HF Hub ID ``--pyt_ckpt_path`` to its local snapshot directory instead of failing with ``FileNotFoundError``.
+- Fix ``_QuantGptOssExperts`` / ``_QuantLlama4TextExperts`` static-block NVFP4 weight calibration raising ``ValueError: Input shape has changed`` during the calibration forward. These experts quantize their weights transposed (``_transposed_quantize``); ``iter_weights_for_calibration`` now yields the same transposed view so weight-only calibration and the forward agree on the block-quant shape (and the export ``_amax`` orientation).
+- Fix unified HF checkpoint export for Llama4 MoE models. The uncalibrated-experts input-quantizer ``amax`` fallback in ``_export_transformers_checkpoint`` special-cased only ``QuantGptOssExperts``; ``QuantLlama4TextExperts`` uses the same fused ``gate_up_proj`` / ``down_proj`` layout and is now handled by the same branch, fixing the export failure.
+- Fix ``NotImplementedError: "max_all_cuda" not implemented for 'Float8_e4m3fn'`` during quantization calibration of models with natively FP8 (``float8_e4m3fn`` / ``float8_e5m2``) weights, such as DeepSeek-V3. FP8 dtypes implement no reduction (``max``/``amax``), ``abs``, or elementwise ``maximum`` kernels, so ``reduce_amax`` now upcasts FP8 inputs to the default float dtype before reducing; the upcast is lossless and only affects the FP8 path.
+
+0.44.0 (2026-05-13)
+^^^^^^^^^^^^^^^^^^^
+
+**New Features**
+
+- Add model-agnostic `Liger kernel <https://github.com/linkedin/Liger-Kernel>`_ fused loss support in ``ModelOptHFTrainer`` for any HuggingFace causal LM, with distributed param gathering for FSDP2, DeepSpeed ZeRO-3, and DDP. Extends HuggingFace's built-in Liger integration which is limited to `a fixed set of model architectures <https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/transformers/monkey_patch.py>`_, FSDP only, and CrossEntropy loss. ModelOpt additionally supports Liger fused KD loss (JSD) for knowledge distillation.
+- Add ``ModelOptTrainerArguments`` to ``ModelOptHFTrainer`` with ``--trainable_params``, ``--frozen_params``, ``--lr_config``, and ``--manual_gc`` flags. Add per-parameter learning rate support via YAML config. Saved checkpoints preserve the model's original dtype in ``config.json``.
+- Simplify ``KDTrainer`` for HuggingFace knowledge distillation: remove ``mtd.convert()`` class-swap in favor of explicit teacher forwarding with logit-level distillation support.
+- Support full Transformer Engine spec for Minitron pruning (``mcore_minitron``). Now we no longer need to use custom ModelOpt spec. Note that this does not affect the usage of the pruning workflow but makes pruning slightly faster and may result in slightly different pruned model because of different kernel and numerics.
+- Add end-to-end tutorial for Minitron pruning + distillation + quantization + evaluation + vLLM deployment for Nemotron-Nano-9B-v2 → Pruned 7B along with data blend preparation steps (and ablation study). See `examples/pruning/minitron/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning/minitron/>`_ for details.
+- Add Puzzletron - a new algorithm for heterogeneous pruning of LLM and VLM models. See `examples/puzzletron/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/puzzletron>`_ for more details.
+- Added iterator interface using CalibrationDataReader in ONNX quantization workflow.
+- Add N:M sparse softmax support to the Triton flash attention kernel (``modelopt.torch.kernels.common.attention.triton_fa``). See `examples/llm_sparsity/attention_sparsity/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_sparsity/attention_sparsity>`_ for usage.
+- Add skip-softmax skipping to the Triton flash attention kernel for both language models and video diffusion models (``modelopt.torch.kernels.common.attention.triton_fa``). See `examples/llm_sparsity/attention_sparsity/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_sparsity/attention_sparsity>`_ and `examples/diffusers/sparsity/ <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers/sparsity>`_ for usage.
+- Add Video Sparse Attention (VSA) method for video diffusion models (``modelopt.torch.sparsity.attention_sparsity``). VSA uses 3D block tiling with a two-branch architecture for attention speedup.
+- Enable PTQ workflow for the Step3.5-Flash MoE model with NVFP4 W4A4 + FP8 KV cache quantization. See `modelopt_recipes/models/Step3.5-Flash/nvfp4-mlp-only.yaml <https://github.com/NVIDIA/Model-Optimizer/blob/main/modelopt_recipes/models/Step3.5-Flash/nvfp4-mlp-only.yaml>`_ for more details.
+- Add support for vLLM fakequant reload using ModelOpt state for HF models. See `examples/vllm_serve/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/vllm_serve#load-qatptq-model-and-serve-in-vllm-wip>`_ for more details.
+- [Early Testing] Add Claude Code PTQ skill (``.claude/skills/ptq/``) for agent-assisted post-training quantization. The skill guides the agent through environment detection, model support checking, format selection, and execution via the launcher or manual SLURM/Docker/bare GPU paths. Includes handling for unlisted models with custom module patching. This feature is in early testing — use with caution.
+- [Early Testing] Polish Claude Code evaluation skill (``.claude/skills/evaluation/``) for agent-assisted LLM accuracy benchmarking via NeMo Evaluator Launcher. Adds two companion skills vendored verbatim from `NVIDIA-NeMo/Evaluator <https://github.com/NVIDIA-NeMo/Evaluator>`_: ``launching-evals`` (run/check/debug/analyze NEL evaluations) and ``accessing-mlflow`` (query MLflow runs, compare metrics, fetch artifacts). Re-sync at a pinned upstream SHA via ``.claude/scripts/sync-upstream-skills.sh``. Also adds a shared ``skills/common/credentials.md`` covering HF / NGC / Docker token setup referenced by multiple skills. This feature is in early testing — use with caution.
+- Add performant layerwise calibration for large models that don't fit on GPU (e.g. DeepSeek-R1, Kimi-K2). See `modelopt_recipes/general/ptq/nvfp4_experts_only-kv_fp8_layerwise.yaml <https://github.com/NVIDIA/Model-Optimizer/blob/main/modelopt_recipes/general/ptq/nvfp4_experts_only-kv_fp8_layerwise.yaml>`_ for usage. Layerwise calibration also supports PTQ with intermediate progress saving — useful when long PTQ runs get hit with Slurm timeouts. See `modelopt_recipes/general/ptq/nvfp4_default-kv_none-gptq.yaml <https://github.com/NVIDIA/Model-Optimizer/blob/main/modelopt_recipes/general/ptq/nvfp4_default-kv_none-gptq.yaml>`_ for usage.
+- Add implicit GEMM CUDA kernel for Conv3D with fused NVFP4 fake quantization (``modelopt.torch.quantization.src.conv``). When NVFP4 quantization is applied to an ``nn.Conv3d`` layer via ModelOpt PTQ, the implicit GEMM path is used automatically instead of cuDNN. Uses BF16 WMMA tensor cores (SM80+) with FP32 accumulation and in-kernel FP4 (E2M1) activation quantization. Grouped convolution (``groups > 1``) falls back to the default cuDNN path. Inference only — training mode falls back to cuDNN with a warning.
+- Add FP8 MHA quantization support for vision transformers. Adds an attention-aware ONNX post-processing pass (scale Mul / K-transpose move before Q, Q→DQ insertion on softmax output) in :class:`FP8QuantExporter <modelopt.onnx.export.fp8_exporter.FP8QuantExporter>`, per-instance nested-attention-wrapper skipping in the HF plugin, and ``nn.LayerNorm`` registration in ``QuantModuleRegistry`` so BMM input quantizers and LayerNorm output quantizers defined in FP8_DEFAULT_CFG are honored end-to-end. See `examples/torch_onnx/torch_quant_to_onnx.py <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/torch_onnx/torch_quant_to_onnx.py>`_ for the general timm-model quantize→ONNX workflow.
+
+**Backward Breaking Changes**
+
+- The ``quant_cfg`` field in quantization configs is now an **ordered list** of ``QuantizerCfgEntry`` dicts instead of a flat dictionary. Each entry specifies a ``quantizer_name`` wildcard, an optional ``parent_class`` filter, a ``cfg`` dict of quantizer attributes, and/or an ``enable`` flag. Entries are applied in list order with later entries overriding earlier ones. The old dict-based format is still accepted and automatically converted via ``normalize_quant_cfg_list()``, but now emits a ``DeprecationWarning``; new code should use the list format. All built-in configs (e.g. ``FP8_DEFAULT_CFG``, ``INT4_AWQ_CFG``, ``NVFP4_DEFAULT_CFG``), examples, and YAML recipes have been updated. See the :ref:`quant-cfg` documentation for the new format reference and migration guide.
+- Deprecated Mllama (Llama 3.2 Vision) support in the ``llm_ptq`` and ``vlm_ptq`` examples. The ``model_type == "mllama"`` branches and ``MllamaImageProcessor`` usage have been removed from ``hf_ptq.py`` and ``example_utils.py``. For image-text calibration of VLMs, use ``--calib_with_images`` with a supported VLM (see Nemotron VL section in ``examples/llm_ptq/README.md``).
+
+**Bug Fixes**
+
+- Fix Megatron utility functions for generation (with pipeline parallelism) and ~10x speedup in MMLU score evaluation (by batching prefill passes).
+- Fix Minitron pruning (``mcore_minitron``) for MoE models. Importance estimation hooks were incorrectly registered for MoE modules and NAS step was hanging before this.
+- Fix TRT support for remote autotuning in ONNX Autotune from 10.16+ to 10.15+ and fix TRT versioning check to the ``trtexec`` version instead of the TRT Python API when using ``trtexec`` backend.
+- Exclude MatMul/Gemm nodes with K or N < 16 from ONNX INT8 and FP8 quantization. Such small-dimension GEMMs cannot efficiently use INT8/FP8 Tensor Cores and the added Q/DQ layers cause perf regressions in TensorRT. Honors Gemm ``transB`` when deriving K.
+- Fix ``nvfp4_awq`` export ``AssertionError: Modules have different quantization formats`` for MoE models (e.g. Qwen3-30B-A3B) when some experts are not exercised by the calibration data. ``awq_lite`` now applies a neutral all-ones ``pre_quant_scale`` to any expert that ends up disabled (no cache-pass tokens, NaN scales, or no search-pass tokens) so its format remains ``nvfp4_awq``, consistent with the rest of the MoE block. A warning is emitted whenever this fallback fires.
+
+**Misc**
+
+- [Security] Changed the default of ``weights_only`` to ``True`` in ``torch.load`` for secure checkpoint loading. If you need to load a checkpoint that requires unpickling arbitrary objects, first register the class in ``torch.serialization.add_safe_globals([cls])`` before loading. Added :meth:`safe_save <modelopt.torch.utils.serialization.safe_save>` and :meth:`safe_load <modelopt.torch.utils.serialization.safe_load>` API to save and load checkpoints securely.
+- Bump minimum required PyTorch version to 2.8.
+- [Experimental] Add support for transformers>=5.0, including generic PTQ and unified HF checkpoint export for fused MoE expert modules (Mixtral, Qwen2-MoE, Qwen3-MoE, Qwen3.5-MoE, DeepSeek-V3, Jamba, OLMoE, etc.).
+- Improve ``megatron_preprocess_data``: add ``--reasoning_content`` support for Nemotron v3 datasets, eliminate intermediate JSONL for HuggingFace datasets, return output file prefixes from the Python API, add gzip input support (``.jsonl.gz``), add ``--strip_newlines`` flag for plain-text pretraining data, add ``--hf_streaming`` for very large datasets (only consumed rows downloaded), and auto-shuffle when ``--hf_max_samples_per_split`` is set to avoid biased sampling.
+- Add installation support for Python 3.14. Only basic unit tests are verified for now. Production usage still defaults to Python 3.12. Python 3.10 support will be dropped in the next release.
+
+0.43.0 (2026-04-16)
+^^^^^^^^^^^^^^^^^^^
+
+**Bug Fixes**
+
+- ONNX Runtime dependency upgraded to 1.24 to solve missing graph outputs when using the TensorRT Execution Provider.
+
+**Backward Breaking Changes**
+
+- Default ``--kv_cache_qformat`` in ``hf_ptq.py`` changed from ``fp8`` to ``fp8_cast``. Existing scripts that rely on the default will now skip KV cache calibration and use a constant amax instead. To restore the previous calibrated behavior, explicitly pass ``--kv_cache_qformat fp8``.
+- Removed KV cache scale clamping (``clamp_(min=1.0)``) in the HF checkpoint export path. Calibrated KV cache scales below 1.0 are now exported as-is. If you observe accuracy degradation with calibrated KV cache (``--kv_cache_qformat fp8`` or ``nvfp4``), consider using the casting methods (``fp8_cast`` or ``nvfp4_cast``) instead.
+
+**New Features**
+
+- Add ``fp8_cast`` and ``nvfp4_cast`` modes for ``--kv_cache_qformat`` in ``hf_ptq.py``. These use a constant amax (FP8 E4M3 max, 448.0) without data-driven calibration, since the downstream engine uses FP8 attention math for both FP8 and NVFP4 quantization. A new ``use_constant_amax`` field in :class:`QuantizerAttributeConfig <modelopt.torch.quantization.config.QuantizerAttributeConfig>` controls this behavior.
+- User does not need to manually register MOE modules to cover experts calibration coverage in PTQ workflow.
+- ``hf_ptq.py`` now saves the quantization summary and moe expert token count table to the export directory.
+- Add ``--moe_calib_experts_ratio`` flag in ``hf_ptq.py`` to specify the ratio of experts to calibrate during forward pass to improve expert coverage during calibration. Default to None (not enabled).
+- Add sparse attention optimization for transformer models (``modelopt.torch.sparsity.attention_sparsity``). This reduces computational cost by skipping attention computation. Supports calibration for threshold selection on HuggingFace models. See `examples/llm_sparsity/attention_sparsity/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_sparsity/attention_sparsity>`_ for usage.
+- Add support for rotating the input before quantization for RHT.
+- Add support for advanced weight scale search for NVFP4 quantization and its export path.
+- Enable PTQ workflow for Qwen3.5 MoE models.
+- Enable PTQ workflow for the Kimi-K2.5 model.
+- Add ``nvfp4_omlp_only`` quantization format for NVFP4 quantization. This is similar to ``nvfp4_mlp_only`` but also quantizes the output projection layer in attention.
+- Add ``nvfp4_experts_only`` quantization config that targets only MoE routed expert layers (excluding shared) with NVFP4 quantization.
+- ``pass_through_bwd`` in the quantization config is now default to True. Please set it to False if you want to use STE with zeroed outlier gradients for potentially better QAT accuracy.
+- Add :meth:`compute_quantization_mse <modelopt.torch.quantization.model_quant.compute_quantization_mse>` API to measure per-quantizer mean-squared quantization error, with flexible wildcard and callable filtering.
+- **Autotune**: New tool for automated Q/DQ (Quantize/Dequantize) placement optimization for ONNX models. Uses TensorRT latency measurements to choose insertion schemes that minimize inference time. Discovers regions automatically, groups them by structural pattern, and tests multiple Q/DQ schemes per pattern. Supports INT8 and FP8 quantization, pattern cache for warm-start on similar models, checkpoint/resume, and importing patterns from an existing QDQ baseline. CLI: ``python -m modelopt.onnx.quantization.autotune``. See the Autotune guide in the documentation.
+- Add ``get_auto_quantize_config`` API to extract a flat quantization config from ``auto_quantize`` search results, enabling re-quantization at different effective bit targets without re-running calibration.
+- Improve ``auto_quantize`` checkpoint/resume: calibration state is now saved and restored across runs, avoiding redundant calibration when resuming a search.
+- Add support for Nemotron-3 (NemotronHForCausalLM) model quantization and support for NemotronH MoE expert support in ``auto_quantize`` grouping and scoring rules.
+- Add support for block-granular RHT for non-power-of-2 dimensions.
+- Replace modelopt FP8 QDQ nodes with native ONNX QDQ nodes.
+
+**Deprecations**
+
+- Removed MT-Bench (FastChat) support from ``examples/llm_eval``. The ``run_fastchat.sh`` and ``gen_model_answer.py`` scripts have been deleted, and the ``mtbench`` task has been removed from the ``llm_ptq`` example scripts.
+- Remove deprecated NeMo-2.0 Framework references.
+
+**Misc**
+
+- Migrated project metadata from ``setup.py`` to a fully declarative ``pyproject.toml``.
+- Enable experimental Python 3.13 wheel support and unit tests in CI/CD.
+
+0.42.0 (2026-03-09)
+^^^^^^^^^^^^^^^^^^^
+
+**Bug Fixes**
+
+- Fix calibration data generation with multiple samples in the ONNX workflow.
+
+**New Features**
+
+- Add standalone type inference option (``--use_standalone_type_inference``) in ONNX AutoCast as an alternative to ONNX's ``infer_shapes``. This experimental feature performs type-only inference without shape inference, useful as a workaround when shape inference fails or to avoid unnecessary shape inference overhead.
+- Add support for Kimi K2 Thinking model quantization from the original int4 checkpoint.
+- Add support for ``params`` constraint based automatic neural architecture search in Minitron pruning (``mcore_minitron``) as an alternative to manual pruning (using ``export_config``). See `examples/pruning/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning>`_ for more details on its usage.
+- New example for Minitron pruning with Megatron-Bridge framework along with advanced pruning usage with new ``params`` constraint based pruning. Also add example for distillation with Megatron-Bridge framework. Check `examples/megatron_bridge/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/megatron_bridge>`_ for example scripts.
+- Add support for calibration data with multiple samples in ``npz`` format in the ONNX Autocast workflow.
+- Add ``--opset`` option to ONNX quantization CLI to specify the target opset version for the quantized model.
+- Add support for context parallelism in Eagle speculative decoding for huggingface and megatron core models.
+- Add unified Hugging Face export support for diffusers pipelines/components.
+- Add LTX-2 and Wan2.2 (T2V) support in the diffusers quantization workflow.
+- Add PTQ support for GLM-4.7, including loading MTP layer weights from a separate ``mtp.safetensors`` file and export as-is.
+- Add support for image-text data calibration in PTQ for Nemotron VL models.
+- Add support for advanced weight scale search for NVFP4 quantization and its export path.
+- Add PTQ support for Nemotron Parse.
+- Add distillation support for LTX-2. See `examples/diffusers/distillation/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers/distillation>`_ for more details.
+
+0.41.0 (2026-01-20)
+^^^^^^^^^^^^^^^^^^^
+
+**Bug Fixes**
+
+- Fix Megatron KV Cache quantization checkpoint restore for QAT/QAD (device placement, amax sync across DP/TP, flash_decode compatibility).
+
+**New Features**
+
+- Add support for Transformer Engine quantization for Megatron Core models.
+- Add support for Qwen3-Next model quantization.
+- Add support for dynamically linked TensorRT plugins in the ONNX quantization workflow.
+- Add support for KV Cache Quantization for vLLM FakeQuant PTQ script. See `examples/vllm_serve/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/vllm_serve#Calibrate-and-serve-fake-quant-model-in-vLLM>`__ for more details.
+- Add support for subgraphs in ONNX autocast.
+- Add support for parallel draft heads in Eagle speculative decoding.
+- Add support to enable custom emulated quantization backend. See :meth:`register_quant_backend <modelopt.torch.quantization.nn.modules.tensor_quantizer.register_quant_backend>`` for more details. See an example in ``tests/unit/torch/quantization/test_custom_backend.py``.
+- Add ``examples/llm_qad`` for QAD training with Megatron-LM.
+
+**Deprecations**
+
+- Deprecate ``num_query_groups`` parameter in Minitron pruning (``mcore_minitron``). You can use ModelOpt 0.40.0 or earlier instead if you need to prune it.
+
+**Backward Breaking Changes**
+
+- Remove ``torchprofile`` as a default dependency from ModelOpt as its used only for flops-based FastNAS pruning (computer vision models). It can be installed separately if needed.
+
+**Windows Support**
+
+- Fix ONNX 1.19 compatibility issues with CuPy during ONNX INT4 AWQ quantization. ONNX 1.19 uses ml_dtypes.int4 instead of numpy.int8 which caused CuPy failures.
+- Add support for ONNX Mixed Precision Weight-only quantization using INT4 and INT8 precisions. Refer quantization `example for GenAI LLMs <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows/onnx_ptq/genai_llm>`_.
+- Add support for some diffusion models' quantization on Windows. Refer `example script <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows/torch_onnx/diffusers>`_ for details.
+- Add `Perplexity <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows/accuracy_benchmark/perplexity_metrics>`_ and `KL-Divergence <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows/accuracy_benchmark/kl_divergence_metrics>`_ accuracy benchmarks.
+
+0.40.0 (2025-12-12)
+^^^^^^^^^^^^^^^^^^^
+
+**Bug Fixes**
+
+- Fix a bug in FastNAS pruning (computer vision models) where the model parameters were sorted twice messing up the ordering.
+- Fix Q/DQ/Cast node placements in 'FP32 required' tensors in custom ops in the ONNX quantization workflow.
+
+**New Features**
+
+- Add MoE (e.g. Qwen3-30B-A3B, gpt-oss-20b) pruning support for ``num_moe_experts``, ``moe_ffn_hidden_size`` and ``moe_shared_expert_intermediate_size`` parameters in Minitron pruning (``mcore_minitron``).
+- Add ``specdec_bench`` example to benchmark speculative decoding performance. See `examples/specdec_bench/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/specdec_bench#speculative-decoding-benchmark>`_ for more details.
+- Add FP8/NVFP4 KV cache quantization support for Megatron Core models.
+- Add KL Divergence loss based auto_quantize method. See `auto_quantize API docs <https://nvidia.github.io/Model-Optimizer/reference/generated/modelopt.torch.quantization.model_quant.html#modelopt.torch.quantization.model_quant.auto_quantize>`_ for more details.
+- Add support for saving and resuming auto_quantize search state. This speeds up the auto_quantize process by skipping the score estimation step if the search state is provided.
+- Add flag ``trt_plugins_precision`` in ONNX autocast to indicate custom ops precision. This is similar to the flag already existing in the quantization workflow.
+- Add support for PyTorch Geometric quantization.
+- Add per tensor and per channel MSE calibrator support.
+- Added support for PTQ/QAT checkpoint export and loading for running fakequant evaluation in vLLM. See `examples/vllm_serve/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/vllm_serve#load-qatptq-model-and-serve-in-vllm-wip>`_ for more details.
+
+**Documentation**
+
+- Deprecate ``examples/megatron-lm`` in favor of more detailed documentation in `Megatron-LM/examples/post_training/modelopt <https://github.com/NVIDIA/Megatron-LM/tree/main/examples/post_training/modelopt>`_.
+
+**Misc**
+
+- NVIDIA TensorRT Model Optimizer is now officially rebranded as NVIDIA Model Optimizer. GitHub will automatically redirect the old repository path (``NVIDIA/TensorRT-Model-Optimizer``) to the new one (``NVIDIA/Model-Optimizer``). Documentation URL is also changed to `nvidia.github.io/Model-Optimizer <https://nvidia.github.io/Model-Optimizer>`_.
+- Bump TensorRT-LLM docker to 1.2.0rc4.
+- Bump minimum recommended transformers version to 4.53.
+- Replace ONNX simplification package from ``onnxsim`` to ``onnxslim``.
+
+0.39.0 (2025-11-13)
+^^^^^^^^^^^^^^^^^^^
+
+**Deprecations**
+
+- Deprecated ``modelopt.torch._deploy.utils.get_onnx_bytes`` API. Please use ``modelopt.torch._deploy.utils.get_onnx_bytes_and_metadata`` instead to access the ONNX model bytes with external data. see `examples/onnx_ptq/download_example_onnx.py <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/onnx_ptq/download_example_onnx.py>`_ for example usage.
+
+**New Features**
+
+- Add flag ``op_types_to_exclude_fp16`` in ONNX quantization to exclude ops from being converted to FP16/BF16. Alternatively, for custom TensorRT ops, this can also be done by indicating ``'fp32'`` precision in ``trt_plugins_precision``.
+- Add LoRA mode support for MCore in a new peft submodule: ``modelopt.torch.peft.update_model(model, LORA_CFG)``.
+- Support PTQ and fakequant in vLLM for fast evaluation of arbitrary quantization formats. See ``examples/vllm_serve`` for more details.
+- Add support for ``nemotron-post-training-dataset-v2`` and ``nemotron-post-training-dataset-v1`` in ``examples/llm_ptq``. Default to a mix of ``cnn_dailymail`` and ``nemotron-post-training-dataset-v2`` (gated dataset accessed using ``HF_TOKEN`` environment variable) if no dataset is specified.
+- Allow specifying ``calib_seq`` in ``examples/llm_ptq`` to set the maximum sequence length for calibration.
+- Add support for MCore MoE PTQ/QAT/QAD.
+- Add support for multi-node PTQ and export with FSDP2 in ``examples/llm_ptq/multinode_ptq.py``. See `examples/llm_ptq/README.md <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq#multi-node-post-training-quantization-with-fsdp2>`_ for more details.
+- Add support for Nemotron Nano VL v1 & v2 models in FP8/NVFP4 PTQ workflow.
+- Add flags ``nodes_to_include`` and ``op_types_to_include`` in AutoCast to force-include nodes in low precision, even if they would otherwise be excluded by other rules.
+- Add support for ``torch.compile`` and benchmarking in ``examples/diffusers/quantization/diffusion_trt.py``.
+- Enabled native Modelopt quantization support for FP8 and NVFP4 formats in SGLang. See `SGLang quantization documentation <https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/quantization.md#using-nvidia-modelopt>`_ for more details.
+- Added modelopt quantized checkpoints in vLLM/SGLang CI/CD pipelines (PRs are under review).
+- Add support for exporting QLoRA checkpoint fintuned using ModelOpt.
+- Update NVFP4 AWQ checkpoint export. It now fuses scaling factors of o_proj and down_proj layers into the model when possible to facilitate deployment.
+
+**Documentation**
+
+- Add general guidelines for Minitron pruning and distillation. See `pruning guidelines <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning#pruning-guidelines>`_ for more details.
+- Added example for exporting QLoRA checkpoint for vLLM deployment. Refer to `examples/llm_qat/README.md <https://github.com/NVIDIA/Model-Optimizer/blob/79ef31bc7269ba4da0cfab446da5b64509cbfcef/examples/llm_qat/README.md#qlora-deployment>`_ for more details
+
+0.37.0 (2025-10-08)
+^^^^^^^^^^^^^^^^^^^
+
+**Deprecations**
+
+- Deprecated ModelOpt's custom docker images. Please use the PyTorch, TensorRT-LLM or TensorRT docker image directly or refer to the `installation guide <https://nvidia.github.io/Model-Optimizer/getting_started/2_installation.html>`_ for more details.
+- Deprecated ``quantize_mode`` argument in ``examples/onnx_ptq/evaluate.py`` to support strongly typing. Use ``engine_precision`` instead.
+- Deprecated TRT-LLM's TRT backend in ``examples/llm_ptq`` and ``examples/vlm_ptq``. Tasks ``build`` and ``benchmark`` support are removed and replaced with ``quant``. ``engine_dir`` is replaced with ``checkpoint_dir`` in ``examples/llm_ptq`` and ``examples/vlm_ptq``. For performance evaluation, please use ``trtllm-bench`` directly.
+- ``--export_fmt`` flag in ``examples/llm_ptq`` is removed. By default we export to the unified Hugging Face checkpoint format.
+- Deprecated ``examples/vlm_eval`` as it depends on the deprecated TRT-LLM's TRT backend.
+
+**New Features**
+
+- ``high_precision_dtype`` default to fp16 in ONNX quantization, i.e. quantized output model weights are now FP16 by default.
+- Upgrade TensorRT-LLM dependency to 1.1.0rc2.
+- Support Phi-4-multimodal and Qwen2.5-VL quantized HF checkpoint export in ``examples/vlm_ptq``.
+- Support storing and restoring Minitron pruning activations and scores for re-pruning without running the forward loop again.
+- Add Minitron pruning example for Megatron-LM framework. See `Megatron-LM/examples/post_training/modelopt <https://github.com/NVIDIA/Megatron-LM/tree/main/examples/post_training/modelopt>`_ for more details.
+
+0.35.1 (2025-09-20)
+^^^^^^^^^^^^^^^^^^^
+
+**Bug Fixes**
+
+- Import fixes
+
+
+0.35.0 (2025-09-04)
+^^^^^^^^^^^^^^^^^^^
+
+**Deprecations**
+
+- Deprecate ``torch<2.6`` support.
+- Deprecate NeMo 1.0 model support.
+
+**Bug Fixes**
+
+- Fix attention head ranking logic for pruning Megatron Core GPT models.
+
+**New Features**
+
+- ModelOpt now supports PTQ and QAT for GPT-OSS models. See ``examples/gpt_oss`` for end-to-end PTQ/QAT example.
+- Add support for QAT with HuggingFace + DeepSpeed. See ``examples/gpt_oss`` for an example.
+- Add support for QAT with LoRA. The LoRA adapters can be folded into the base model after QAT and deployed just like a regular PTQ model. See ``examples/gpt_oss`` for an example.
+- ModelOpt provides convenient trainers such as :class:`QATTrainer`, :class:`QADTrainer`, :class:`KDTrainer`, :class:`QATSFTTrainer` which inherits from Huggingface trainers.
+  ModelOpt trainers can be used as drop in replacement of the corresponding Huggingface trainer. See usage examples in ``examples/gpt_oss``, ``examples/llm_qat`` or ``examples/llm_distill``.
+- (Experimental) Add quantization support for custom TensorRT op in ONNX models.
+- Add support for Minifinetuning (MFT; https://arxiv.org/abs/2506.15702) self-corrective distillation, which enables training on small datasets with severely mitigated catastrophic forgetting.
+- Add tree decoding support for Megatron Eagle models.
+- For most VLMs, we now explicitly disable quant on the vision part so we add them to the excluded_modules during HF export.
+- Add support for ``mamba_num_heads``, ``mamba_head_dim``, ``hidden_size`` and ``num_layers`` pruning for Megatron Core Mamba or Hybrid Transformer Mamba models in ``mcore_minitron`` (previously ``mcore_gpt_minitron``) mode.
+- Add example for QAT/QAD training with `LLaMA Factory <https://github.com/hiyouga/LLaMA-Factory/tree/main>`_. See ``examples/llm_qat/llama_factory`` for more details.
+- Upgrade TensorRT-LLM dependency to 1.0.0rc6.
+- Add unified HuggingFace model export support for quantized NVFP4 GPT-OSS models.
+
+0.33.1 (2025-08-12)
+^^^^^^^^^^^^^^^^^^^
+
+**Bug Fixes**
+
+- Fix a Qwen3 MOE model export issue.
+
+
+0.33.0 (2025-07-14)
+^^^^^^^^^^^^^^^^^^^
+
+**Backward Breaking Changes**
+
+- PyTorch dependencies for ``modelopt.torch`` features are no longer optional and ``pip install nvidia-modelopt`` is now same as ``pip install nvidia-modelopt[torch]``.
+
+**New Features**
+
+- Upgrade TensorRT-LLM dependency to 0.20.
+- Add new CNN QAT example to demonstrate how to use ModelOpt for QAT.
+- Add support for ONNX models with custom TensorRT ops in Autocast.
+- Add quantization aware distillation (QAD) support in ``llm_qat`` example.
+- Add support for BF16 in ONNX quantization.
+- Add per node calibration support in ONNX quantization.
+- ModelOpt now supports quantization of tensor-parallel sharded Huggingface transformer models. This requires ``transformers>=4.52.0``.
+- Support quantization of FSDP2 wrapped models and add FSDP2 support in the ``llm_qat`` example.
+- Add NeMo 2 Simplified Flow examples for quantization aware training/distillation (QAT/QAD), speculative decoding, pruning & distillation.
+
+**Windows Support**
+
+- Model Optimizer for Windows now supports `NvTensorRtRtx <https://onnxruntime.ai/docs/execution-providers/TensorRTRTX-ExecutionProvider.html>`_ execution-provider.
+
+0.31.0 (2025-06-05)
+^^^^^^^^^^^^^^^^^^^
+
+**Backward Breaking Changes**
+
+- NeMo and Megatron-LM distributed checkpoint (``torch-dist``) stored with legacy version can no longer be loaded. The remedy is to load the legacy distributed checkpoint with 0.29 and store a ``torch`` checkpoint and resume with 0.31 to convert to a new format. The following changes only apply to storing and resuming distributed checkpoint.
+    - ``quantizer_state`` of :class:`TensorQuantizer <modelopt.torch.quantization.nn.modules.TensorQuantizer>` is now stored in ``extra_state`` of :class:`QuantModule <modelopt.torch.quantization.nn.module.QuantModule>` where it used to be stored in the sharded ``modelopt_state``.
+    - The dtype and shape of ``amax`` and ``pre_quant_scale`` stored in the distributed checkpoint are now restored. Some dtype and shape are previously changed to make all decoder layers to have homogeneous structure in the checkpoint.
+    - Together with megatron.core-0.13, quantized model will store and resume distributed checkpoint in a heterogenous format.
+- auto_quantize API now accepts a list of quantization config dicts as the list of quantization choices.
+    - This API previously accepts a list of strings of quantization format names. It was therefore limited to only pre-defined quantization formats unless through some hacks.
+    - With this change, now user can easily use their own custom quantization formats for auto_quantize.
+    - In addition, the ``quantization_formats`` now exclude ``None`` (indicating "do not quantize") as a valid format because the auto_quantize internally always add "do not quantize" as an option anyway.
+- Model export config is refactored. The quant config in ``hf_quant_config.json`` is converted and saved to ``config.json``. ``hf_quant_config.json`` will be deprecated soon.
+
+
+**Deprecations**
+
+- Deprecate ``Python 3.9`` support.
+
+**New Features**
+
+- Upgrade LLM examples to use TensorRT-LLM 0.19.
+- Add new model support in the ``llm_ptq`` example: Qwen3 MoE.
+- ModelOpt now supports advanced quantization algorithms such as AWQ, SVDQuant and SmoothQuant for cpu-offloaded Huggingface models.
+- Add AutoCast tool to convert ONNX models to FP16 or BF16.
+- Add ``--low_memory_mode`` flag in the llm_ptq example support to initialize HF models with compressed weights and reduce peak memory of PTQ and quantized checkpoint export.
+- Support ``NemotronHForCausalLM``, ``Qwen3ForCausalLM``, ``Qwen3MoeForCausalLM`` Megatron Core model import/export (from/to HuggingFace).
+
+0.29.0 (2025-05-09)
+^^^^^^^^^^^^^^^^^^^
+
+**Backward Breaking Changes**
+
+- Refactor ``SequentialQuantizer`` to improve its implementation and maintainability while preserving its functionality.
+
+**Deprecations**
+
+- Deprecate ``torch<2.4`` support.
+
+**New Features**
+
+- Upgrade LLM examples to use TensorRT-LLM 0.18.
+- Add new model support in the ``llm_ptq`` example: Gemma-3, Llama-Nemotron.
+- Add INT8 real quantization support.
+- Add an FP8 GEMM per-tensor quantization kernel for real quantization. After PTQ, you can leverage the :meth:`mtq.compress <modelopt.torch.quantization.compress>` API to accelerate evaluation of quantized models.
+- Use the shape of Pytorch parameters and buffers of :class:`TensorQuantizer <modelopt.torch.quantization.nn.modules.TensorQuantizer>` to initialize them during restore. This makes quantized model restoring more robust.
+- Support adding new custom quantization calibration algorithms. Please refer to :func:`mtq.calibrate <modelopt.torch.quantization.model_quant.calibrate>` or :ref:`custom calibration algorithm <custom_calibration_algorithm>` for more details.
+- Add EAGLE3 (``LlamaForCausalLMEagle3``) training and unified ModelOpt checkpoint export support for Megatron-LM.
+- Add support for ``--override_shapes`` flag to ONNX quantization.
+   - ``--calibration_shapes`` is reserved for the input shapes used for calibration process.
+   - ``--override_shapes`` is used to override the input shapes of the model with static shapes.
+- Add support for UNet ONNX quantization.
+- Enable ``concat_elimination`` pass by default to improve the performance of quantized ONNX models.
+- Enable Redundant Cast elimination pass by default in :meth:`moq.quantize <modelopt.onnx.quantization.quantize>`.
+- Add new attribute ``parallel_state`` to :class:`QuantModule <modelopt.torch.quantization.nn.modules.quant_module.QuantModule>` to support distributed parallelism such as data parallel and tensor parallel.
+- Add MXFP8, NVFP4 quantized ONNX export support.
+- Add new example for torch quantization to ONNX for MXFP8, NVFP4 precision.
+
+0.27.1 (2025-04-15)
+^^^^^^^^^^^^^^^^^^^
+
+**New Features**
+
+- Add experimental quantization support for Llama4, QwQ and Qwen MOE models.
+
+
+0.27.0 (2025-04-03)
+^^^^^^^^^^^^^^^^^^^
+
+**Deprecations**
+
+- Deprecate real quantization configs, please use :meth:`mtq.compress <modelopt.torch.quantization.compress>` API for model compression after quantization.
+
+**New Features**
+
+- Add new model support in the ``llm_ptq`` example: OpenAI Whisper.
+- Add blockwise FP8 quantization support in unified model export.
+- Add quantization support to the Transformer Engine Linear module.
+- Add support for SVDQuant. Currently, only simulation is available; real deployment (for example, TensorRT deployment) support is coming soon.
+- Store ``modelopt_state`` in Megatron Core distributed checkpoint (used in NeMo and Megatron-LM) differently to support distributed checkpoint resume expert-parallel (EP). The legacy ``modelopt_state`` in the distributed checkpoint generated by previous modelopt version can still be loaded in 0.27 and 0.29 but will need to be stored in the new format.
+- Add triton-based NVFP4 quantization kernel that delivers approximately 40% performance improvement over the previous implementation.
+- Add a new API :meth:`mtq.compress <modelopt.torch.quantization.compress>` for model compression for weights after quantization.
+- Add option to simplify ONNX model before quantization is performed.
+- Add FP4 KV cache support for unified HF and TensorRT-LLM export.
+- Add speculative decoding support to Multi-Token Prediction (MTP) in Megatron Core models.
+- (Experimental) Improve support for ONNX models with custom TensorRT op:
+   - Add support for ``--calibration_shapes`` flag.
+   - Add automatic type and shape tensor propagation for full ORT support with TensorRT EP.
+
+**Windows Support**
+
+- New LLM models like DeepSeek etc. are supported with ONNX INT4 AWQ quantization on Windows. Refer `Windows Support Matrix <https://nvidia.github.io/Model-Optimizer/guides/0_support_matrix.html>`_ for details about supported features and models.
+- Model Optimizer for Windows now supports ONNX INT8 and FP8 quantization (W8A8) of SAM2 and Whisper models. Check `example scripts <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows/onnx_ptq>`_ for getting started with quantizing these models.
+
+**Known Issues**
+
+- Quantization of T5 models is broken. Please use ``nvidia-modelopt==0.25.0`` with ``transformers<4.50`` meanwhile.
+
+0.25.0 (2025-03-03)
+^^^^^^^^^^^^^^^^^^^
+
+**Deprecations**
+
+- Deprecate Torch 2.1 support.
+- Deprecate ``humaneval`` benchmark in ``llm_eval`` examples. Please use the newly added ``simple_eval`` instead.
+- Deprecate ``fp8_naive`` quantization format in ``llm_ptq`` examples. Please use ``fp8`` instead.
+
+**New Features**
+
+- Support fast hadamard transform in :class:`TensorQuantizer <modelopt.torch.quantization.nn.modules.TensorQuantizer>`.
+  It can be used for rotation based quantization methods, e.g. QuaRot. Users need to install the package `fast_hadamard_transform <https://github.com/Dao-AILab/fast-hadamard-transform>`_ to use this feature.
+- Add affine quantization support for the KV cache, resolving the low accuracy issue in models such as Qwen2.5 and Phi-3/3.5.
+- Add FSDP2 support. FSDP2 can now be used for QAT.
+- Add `LiveCodeBench <https://livecodebench.github.io/>`_  and `Simple Evals <https://github.com/openai/simple-evals>`_ to the ``llm_eval`` examples.
+- Disabled saving modelopt state in unified hf export APIs by default, i.e., added ``save_modelopt_state`` flag in ``export_hf_checkpoint`` API and by default set to False.
+- Add FP8 and NVFP4 real quantization support with LLM QLoRA example.
+- The :class:`modelopt.deploy.llm.LLM` now support use the :class:`tensorrt_llm._torch.LLM` backend for the quantized HuggingFace checkpoints.
+- Add `NVFP4 PTQ example for DeepSeek-R1 <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/deepseek>`_.
+- Add end-to-end `AutoDeploy example for AutoQuant LLM models <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_autodeploy>`_.
+
+0.23.2 (2025-02-19)
+^^^^^^^^^^^^^^^^^^^
+
+**Bug Fixes**
+
+- Fix export for Nvidia NeMo models.
+
+
+0.23.1 (2025-02-14)
+^^^^^^^^^^^^^^^^^^^
+
+**Bug Fixes**
+
+- Set ``torch.load(..., weights_only=False)`` where Model Optimizer state is restored since torch 2.6 makes the default value to ``True``.
+- Other minor fixes.
+
+
+0.23.0 (2025-01-29)
+^^^^^^^^^^^^^^^^^^^
+
+**Backward Breaking Changes**
+
+- Support TensorRT-LLM to 0.17. Examples (e.g. benchmark task in llm_ptq) may not be fully compatible with TensorRT-LLM 0.15.
+- Nvidia Model Optimizer has changed its LICENSE from NVIDIA Proprietary (library wheel) and MIT (examples) to Apache 2.0 in this first full OSS release.
+- Deprecate Python 3.8, Torch 2.0, and Cuda 11.x support.
+- ONNX Runtime dependency upgraded to 1.20 which no longer supports Python 3.9.
+- In the Huggingface examples, the ``trust_remote_code`` is by default set to false and require users to explicitly turning it on with ``--trust_remote_code`` flag.
+
+**New Features**
+
+- Added OCP Microscaling Formats (MX) for fake quantization support, including FP8 (E5M2, E4M3), FP6 (E3M2, E2M3), FP4, INT8.
+- Added NVFP4 quantization support for NVIDIA Blackwell GPUs along with updated examples.
+- Allows export lm_head quantized TensorRT-LLM checkpoint. Quantize lm_head could benefit smaller sized models at a potential cost of additional accuracy loss.
+- TensorRT-LLM now supports Moe FP8 and w4a8_awq inference on SM89 (Ada) GPUs.
+- New models support in the ``llm_ptq`` example: Llama 3.3, Phi 4.
+- Added Minitron pruning support for NeMo 2.0 GPT models.
+- Exclude modules in TensorRT-LLM export configs are now wildcards
+- The unified llama3.1 FP8 huggingface checkpoints can be deployed on `SGLang <https://github.com/sgl-project/sglang/pull/2535>`_.
+
+0.21.0 (2024-12-03)
+^^^^^^^^^^^^^^^^^^^
+
+**Backward Breaking Changes**
+
+- Support TensorRT-LLM to 0.15. Examples (e.g. benchmark task in llm_ptq) may not be fully compatible with TensorRT-LLM 0.14.
+- Remove the deprecated arg ``export_npz`` from the :meth:`mt.export.export_tensorrt_llm_checkpoint <modelopt.torch.export.export_tensorrt_llm_checkpoint>` API
+- Deprecate :meth:`mt.export.export_to_vllm <modelopt.torch.export.export_to_vllm>` API for :meth:`mt.export.export_hf_checkpoint <modelopt.torch.export.export_hf_checkpoint>`
+- Rename decoder type ``gptnext`` to ``gpt`` in ``llm_ptq`` to align with TensorRT-LLM model definition.
+
+**New Features**
+
+- Added new tutorial notebooks for Minitron pruning and distillation in NVIDIA NeMo framework.
+- New models support in the ``llm_ptq`` example: Minitron, Phi3.5 MOE.
+- New models support in the ``vlm_ptq`` example: Llama3.2(Mllama)
+- :meth:`mt.export.export_tensorrt_llm_checkpoint <modelopt.torch.export.export_tensorrt_llm_checkpoint>` and :meth:`mt.export.export_hf_checkpoint <modelopt.torch.export.export_hf_checkpoint>` no longer requires the ``dtype`` arg.
+- Added an example to deploy and run quantized fp8 llama3.1 8B instruct model from HuggingFace modelopt model hub on both TensorRT and vLLM.
+
+**Bug Fixes**
+
+- Improve Minitron pruning quality by avoiding possible bf16 overflow in importance calculation and minor change in ``hidden_size`` importance ranking.
+
+**Misc**
+
+- Added deprecation warnings for Python 3.8, torch 2.0, and CUDA 11.x. Support will be dropped in the next release.
+
+0.19.0 (2024-10-23)
+^^^^^^^^^^^^^^^^^^^
+
+**Backward Breaking Changes**
+
+- Deprecated the summarize task in the ``llm_ptq`` example.
+- Deprecated the ``type`` flag in the `huggingface_example.sh <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq/scripts/huggingface_example.sh>`_
+- Deprecated Python plugin support in ONNX.
+- Support TensorRT-LLM 0.13. Examples not compatible with TensorRT-LLM 0.12.
+- :meth:`mtq.auto_quantize <modelopt.torch.quantization.model_quant.auto_quantize>` API has been updated. The API now
+  accepts ``forward_step`` and ``forward_backward_step`` as arguments instead of ``loss_func`` and ``collect_func``.
+  Please see the API documentation for more details.
+
+**New Features**
+
+- ModelOpt is compatible for SBSA aarch64 (e.g. GH200) now!
+  Except ONNX PTQ with plugins is not supported.
+- Add ``effective_bits`` as a constraint for :meth:`mtq.auto_qauntize <modelopt.torch.quantization.model_quant.auto_quantize>`.
+- ``lm_evaluation_harness`` is fully integrated to modelopt backed by TensorRT-LLM.
+  ``lm_evaluation_harness`` benchmarks are now available in the examples for LLM accuracy evaluation.
+- A new ``--perf`` flag is introduced in the ``modelopt_to_tensorrt_llm.py`` example to build engines with max perf.
+- Users can choose the execution provider to run the calibration in ONNX quantization.
+- Added automatic detection of custom ops in ONNX models using TensorRT plugins.
+  This requires the ``tensorrt`` python package to be installed.
+- Replaced ``jax`` with ``cupy`` for faster INT4 ONNX quantization.
+- :meth:`mtq.auto_quantize <modelopt.torch.quantization.model_quant.auto_quantize>` now supports search based automatic
+  quantization for NeMo & MCore models (in addition to HuggingFace models).
+- Add ``num_layers`` and ``hidden_size`` pruning support for NeMo / Megatron-core models.
+
+**Windows Support**
+
+- This is the first official release of Model Optimizer for Windows
+- **ONNX INT4 Quantization:** :meth:`modelopt.onnx.quantization.quantize_int4 <modelopt.onnx.quantization.int4.quantize>` now supports ONNX INT4 quantization for DirectML and TensorRT* deployment. See :ref:`Support_Matrix` for details about supported features and models.
+- **LLM Quantization with Olive:** Enabled LLM quantization through Olive, streamlining model optimization workflows. Refer `Olive example <https://github.com/microsoft/Olive/tree/main/examples/phi3#quantize-models-with-nvidia-Model-Optimizer>`_.
+- **DirectML Deployment Guide:** Added DML deployment guide. Refer :ref:`Onnxruntime_Deployment` deployment guide for details.
+- **MMLU Benchmark for Accuracy Evaluations:** Introduced `MMLU benchmarking <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows/accuracy_benchmark/README.md>`_ for accuracy evaluation of ONNX models on DirectML (DML).
+- **Published quantized ONNX models collection:** Published quantized ONNX models at HuggingFace `NVIDIA collections <https://huggingface.co/collections/nvidia/optimized-onnx-models-for-nvidia-rtx-gpus>`_.
+
+
+\* *This version includes experimental features such as TensorRT deployment of ONNX INT4 models, PyTorch quantization and sparsity. These are currently unverified on Windows.*
+
+
+0.17.0 (2024-09-11)
+^^^^^^^^^^^^^^^^^^^
+
+**Backward Breaking Changes**
+
+- Deprecated ``torch<2.0`` support.
+- :meth:`modelopt.torch.utils.dataset_utils.get_dataset_dataloader` now returns a key value pair instead of the tensor.
+
+**New Features**
+
+- New APIs and examples: :mod:`modelopt.torch.prune` for pruning Conv, Linear, and Attention heads for
+  NVIDIA Megatron-core GPT-style models (e.g. Llama 3), PyTorch Computer Vision models, and HuggingFace Bert/GPT-J models.
+- New API: :mod:`modelopt.torch.distill` for knowledge distillation, along with guides and example.
+- New Example: HF BERT Prune, Distill & Quantize
+  showcasing how to chain pruning, distillation, and quantization to achieve the best performance on a given model.
+- Added INT8/FP8 DQ-only support for ONNX model.
+- New API: :mod:`modelopt.torch.speculative` for end-to-end support of Medusa models.
+- Added Medusa QAT and End-to-end examples.
+- Modelopt now supports automatic save/restore of ``modelopt_state`` with the ``.save_pretrained`` and ``.from_pretrained`` APIs
+  from Huggingface libraries, such as ``transformers`` and ``diffusers``. This feature can be enabled by calling
+  :meth:`mto.enable_huggingface_checkpointing() <modelopt.torch.opt.plugins.huggingface.enable_huggingface_checkpointing>`.
+- ONNX FP8 quantization support with amax calibration.
+- TensorRT-LLM dependency upgraded to 0.12.0. Huggingface tokenizer files are now also stored in the engine dir.
+- The unified model export API :meth:`modelopt.torch.export.export_hf_checkpoint <modelopt.torch.export.unified_export_hf.export_hf_checkpoint>`
+  supports exporting ``fp8`` and ``int4_awq`` quantized checkpoints with packed weights for
+  Hugging Face models with namings aligned with its original checkpoints. The exported ``fp8`` checkpoints can be deployed with both TensorRT-LLM and VLLM.
+- Add int8 and fp8 quantization support for the FLUX.1-dev model.
+- Add a Python-friendly TensorRT inference pipeline for diffusion models.
+
+**Misc**
+
+- Added deprecation warning for :meth:`set_data_parallel_group <modelopt.torch.utils.distributed.set_data_parallel_group>`
+  and :meth:`set_tensor_parallel_group <modelopt.torch.utils.distributed.set_tensor_parallel_group>`. These APIs are
+  no longer needed for supporting distributed data and tensor parallelism in quantization. They will be removed in
+  a future release.
+
+
+0.15.0 (2024-07-25)
+^^^^^^^^^^^^^^^^^^^
+
+**Backward Breaking Changes**
+
+- Deprecated :class:`QuantDescriptor <modelopt.torch.quantization.tensor_quant.QuantDescriptor>`.
+  Use :class:`QuantizerAttributeConfig <modelopt.torch.quantization.config.QuantizerAttributeConfig>` to
+  configure :class:`TensorQuantizer <modelopt.torch.quantization.nn.modules.TensorQuantizer>`.
+  :meth:`set_from_attribute_config <modelopt.torch.quantization.nn.modules.TensorQuantizer.set_from_attribute_config>`
+  can be used to set the quantizer attributes from the config class or attribute dictionary. This change applies only
+  to backend APIs. The change is backward compatible if you are using
+  only the :meth:`mtq.quantize <modelopt.torch.quantization.model_quant.quantize>` API.
+
+**New Features**
+
+- Added quantization support for torch ``RNN, LSTM, GRU`` modules. Only available for ``torch>=2.0``.
+- ``modelopt.torch.quantization`` now supports module class based quantizer attribute setting for
+  :meth:`mtq.quantize <modelopt.torch.quantization.model_quant.quantize>` API.
+- Added new LLM PTQ example for DBRX model.
+- Added new LLM (Gemma 2) PTQ and TensorRT-LLM checkpoint export support.
+- Added new LLM QAT example for NVIDIA NeMo framework.
+- TensorRT-LLM dependency upgraded to 0.11.0.
+- (Experimental): :meth:`mtq.auto_quantize <modelopt.torch.quantization.model_quant.auto_quantize>` API which quantizes a model
+  by searching for the best per-layer quantization formats.
+- (Experimental): Added new LLM QLoRA example with NF4 and INT4_AWQ quantization.
+- (Experimental): ``modelopt.torch.export`` now supports exporting quantized checkpoints with packed weights for
+  Hugging Face models with namings aligned with its original checkpoints.
+- (Experimental) Added support for quantization of ONNX models with TensorRT plugin.
+
+**Misc**
+
+- Added deprecation warning for ``torch<2.0``. Support will be dropped in next release.
+
+
+0.13.0 (2024-06-14)
+^^^^^^^^^^^^^^^^^^^
+
+**Backward Breaking Changes**
+
+- `PTQ examples <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq>`_ have been
+  upgraded to use TensorRT-LLM 0.10.
+
+**New Features**
+
+- Adding TensorRT-LLM checkpoint export support for Medusa decoding (official ``MedusaModel`` and Megatron Core ``GPTModel``).
+- Enable support for mixtral, recurrentgemma, starcoder, qwen in `PTQ examples <https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq>`_.
+- Adding TensorRT-LLM checkpoint export and engine building support for sparse models.
+- Import scales from TensorRT calibration cache and use them for quantization.
+- (Experimental) Enable low GPU memory FP8 calibration for the Hugging Face models when the original model size does not fit into the GPU memory.
+- (Experimental) Support exporting FP8 calibrated model to VLLM deployment.
+- (Experimental) Python 3.12 support added.
+
+
+0.11.0 (2024-05-07)
+^^^^^^^^^^^^^^^^^^^
+
+**Backward Breaking Changes**
+
+- [!!!] The package was renamed from ``ammo`` to ``modelopt``. The new full product
+  name is *Nvidia Model Optimizer*. PLEASE CHANGE ALL YOUR REFERENCES FROM ``ammo`` to
+  ``modelopt`` including any paths and links!
+- Default installation ``pip install nvidia-modelopt`` will now only install minimal core
+  dependencies. Following optional dependencies are available depending on the features that are
+  being used: ``[deploy], [onnx], [torch], [hf]``. To install all dependencies, use
+  ``pip install "nvidia-modelopt[all]"``.
+- Deprecated ``inference_gpus`` arg in ``modelopt.torch.export.model_config_export.torch_to_tensorrt_llm_checkpoint``. User should use ``inference_tensor_parallel`` instead.
+- Experimental ``modelopt.torch.deploy`` module is now available as ``modelopt.torch._deploy``.
+
+**New Features**
+
+- ``modelopt.torch.sparsity`` now supports sparsity-aware training (SAT). Both SAT and post-training
+  sparsification supports chaining with other modes, e.g. SAT + QAT.
+- ``modelopt.torch.quantization`` natively support distributed data and tensor parallelism while estimating quantization parameters.
+  The data and tensor parallel groups needs to be registered with ``modelopt.torch.utils.distributed.set_data_parallel_group`` and ``modelopt.torch.utils.distributed.set_tensor_parallel_group`` APIs.
+  By default, the data parallel group is set as the default distributed group and the tensor parallel group is disabled.
+- ``modelopt.torch.opt`` now supports chaining multiple optimization techniques that each require
+  modifications to the same model, e.g., you can now sparsify and quantize a model at the same time.
+- ``modelopt.onnx.quantization`` supports FLOAT8 quantization format with Distribution calibration algorithm.
+- Native support of ``modelopt.torch.opt`` with FSDP (Fully Sharded Data Parallel) for ``torch>=2.1``. This includes
+  sparsity, quantization, and any other model modification & optimization.
+- Added FP8 ONNX quantization support in ``modelopt.onnx.quantization``.
+- Added Windows (``win_amd64``) support for ModelOpt released wheels. Currently supported for ``modelopt.onnx`` submodule only.
+
+**Bug Fixes**
+
+- Fixed the compatibility issue of ``modelopt.torch.sparsity`` with FSDP.
+- Fixed an issue in dynamic dim handling in ``modelopt.onnx.quantization`` with random calibration data.
+- Fixed graph node naming issue after opset conversion operation.
+- Fixed an issue in negative dim handling like dynamic dim in ``modelopt.onnx.quantization`` with random calibration data.
+- Fixed allowing to accept ``.pb`` file for input file.
+- Fixed copy extra data to tmp folder issue for ONNX PTQ.

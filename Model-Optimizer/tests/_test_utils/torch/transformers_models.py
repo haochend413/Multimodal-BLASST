@@ -1,0 +1,1076 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import contextlib
+import json
+import re
+from collections import defaultdict
+from functools import partial
+from pathlib import Path
+
+import pytest
+import torch
+from _test_utils.torch.misc import set_seed
+from safetensors.torch import load_file, save_file
+
+transformers = pytest.importorskip("transformers")
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForImageClassification,
+    AutoModelForImageTextToText,
+    AutoModelForQuestionAnswering,
+    AutoProcessor,
+    AutoTokenizer,
+    BertConfig,
+    DeepseekV3Config,
+    Gemma3Config,
+    GptOssConfig,
+    LlamaConfig,
+    LlamaForSequenceClassification,
+    MixtralConfig,
+    NemotronConfig,
+    NemotronHConfig,
+    PreTrainedModel,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3Config,
+    Qwen3MoeConfig,
+    Qwen3VLConfig,
+    T5Config,
+    T5ForConditionalGeneration,
+    ViTConfig,
+    ViTImageProcessor,
+)
+from transformers.conversion_mapping import (
+    get_checkpoint_conversion_mapping,
+    register_checkpoint_conversion_mapping,
+)
+
+import modelopt.torch.opt as mto
+
+SEED = 1234
+
+TINY_TOKENIZER_PATH = Path(__file__).parent / "tokenizer"
+
+
+def get_tiny_tokenizer(*, pad_side: str = "left") -> "transformers.PreTrainedTokenizerBase":
+    """Returns a tiny tokenizer for tests.
+
+    Default to left padding, which is what decoder-LM calibration/generation expects and what
+    ``get_dataset_dataloader`` warns about otherwise. Callers needing right padding can override
+    with ``pad_side="right"``.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(TINY_TOKENIZER_PATH)
+    tokenizer.padding_side = pad_side
+    return tokenizer
+
+
+def _pad_vocab_size(vocab_size: int, multiple: int = 128) -> int:
+    """Round a vocab size up to a multiple."""
+    return ((vocab_size + multiple - 1) // multiple) * multiple
+
+
+def _create_tiny_llm_dir(
+    dir_path: Path | str,
+    build_model,
+    *,
+    with_tokenizer: bool = False,
+    return_model: bool = False,
+    tokenizer_factory=get_tiny_tokenizer,
+    **config_kwargs,
+) -> Path | tuple[Path, PreTrainedModel]:
+    """Save a tiny model (and, if ``with_tokenizer``, a tokenizer sized to it) to ``dir_path``."""
+    dir_path = Path(dir_path)
+    if with_tokenizer:
+        tokenizer = tokenizer_factory()
+        tokenizer.save_pretrained(dir_path)
+        config_kwargs["vocab_size"] = tokenizer.vocab_size
+    model = build_model(**config_kwargs)
+    model.save_pretrained(dir_path)
+    return (dir_path, model) if return_model else dir_path
+
+
+def _get_tiny_vlm_tokenizer(ref_tokenizer: "transformers.PreTrainedTokenizerBase"):
+    """Tiny tokenizer re-registering ``ref_tokenizer``'s named vision tokens + chat template, so the
+    saved processor and the model config (built from the same tokenizer) share small, matching ids."""
+    # transformers' model-agnostic base special-token attributes; anything beyond these on a tokenizer
+    # is a model-specific named token (e.g. a VLM's image_token / vision_start_token).
+    _base_special_token_attrs = {
+        "bos_token",
+        "eos_token",
+        "unk_token",
+        "sep_token",
+        "pad_token",
+        "cls_token",
+        "mask_token",
+        "additional_special_tokens",
+    }
+
+    named = {
+        attr: str(getattr(ref_tokenizer, attr))
+        for attr in ref_tokenizer.SPECIAL_TOKENS_ATTRIBUTES
+        if attr not in _base_special_token_attrs and getattr(ref_tokenizer, attr, None) is not None
+    }
+    tokenizer = get_tiny_tokenizer()
+    tokenizer.add_special_tokens({"additional_special_tokens": list(named.values())})
+    # Register the named tokens so ``<name>`` + ``<name>_id`` resolve and round-trip through save.
+    tokenizer._set_model_specific_special_tokens(named)
+    tokenizer.chat_template = ref_tokenizer.chat_template
+    return tokenizer
+
+
+def get_tiny_vlm_processor(
+    ref_model_id: str, *, trust_remote_code: bool = False
+) -> "transformers.ProcessorMixin":
+    """Tiny-vocab VLM processor: the real ``ref_model_id`` image/video processor + chat template,
+    paired with a tiny tokenizer that carries the ref's vision tokens (so the vocab stays small)."""
+    real = AutoProcessor.from_pretrained(ref_model_id, trust_remote_code=trust_remote_code)
+    tokenizer = _get_tiny_vlm_tokenizer(real.tokenizer)
+    kwargs = {"image_processor": real.image_processor, "tokenizer": tokenizer}
+    if getattr(real, "video_processor", None) is not None:
+        kwargs["video_processor"] = real.video_processor
+    return type(real)(**kwargs)
+
+
+def _create_tiny_vlm_dir(
+    dir_path: Path | str,
+    ref_model_id: str,
+    build_model,
+    *,
+    with_processor: bool,
+    return_model: bool,
+    **config_kwargs,
+) -> Path | tuple[Path, PreTrainedModel]:
+    """Save a tiny VLM (and, if ``with_processor``, its small-vocab processor) to ``dir_path``."""
+    dir_path = Path(dir_path)
+    if with_processor:
+        get_tiny_vlm_processor(ref_model_id).save_pretrained(dir_path)
+    model = build_model(**config_kwargs)
+    model.save_pretrained(dir_path)
+    return (dir_path, model) if return_model else dir_path
+
+
+##### Qwen3 (dense or MoE) #####
+def _get_tiny_qwen3(moe: bool = False, **config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 32,
+        "vocab_size": 32,
+    }
+    if moe:
+        kwargs.update(
+            {
+                "moe_intermediate_size": 32,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+            }
+        )
+    kwargs.update(config_kwargs)
+    # NOTE: Use AutoModelForCausalLM.from_config() instead of Qwen3[Moe]ForCausalLM() for correct dtype handling
+    return AutoModelForCausalLM.from_config((Qwen3MoeConfig if moe else Qwen3Config)(**kwargs))
+
+
+def _create_tiny_qwen3_dir(
+    tmp_path: Path | str,
+    with_tokenizer: bool = False,
+    return_model: bool = False,
+    *,
+    moe: bool = False,
+    **config_kwargs,
+) -> Path | tuple[Path, PreTrainedModel]:
+    return _create_tiny_llm_dir(
+        Path(tmp_path) / ("tiny_qwen3_moe" if moe else "tiny_qwen3"),
+        _get_tiny_qwen3,
+        with_tokenizer=with_tokenizer,
+        return_model=return_model,
+        moe=moe,
+        **config_kwargs,
+    )
+
+
+get_tiny_qwen3 = partial(_get_tiny_qwen3, moe=False)
+create_tiny_qwen3_dir = partial(_create_tiny_qwen3_dir, moe=False)
+get_tiny_qwen3_moe = partial(_get_tiny_qwen3, moe=True)
+create_tiny_qwen3_moe_dir = partial(_create_tiny_qwen3_dir, moe=True)
+
+
+##### Qwen3-VL #####
+def get_tiny_qwen3vl(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+
+    # Defaults: hidden_size=num_attention_heads*head_dim (e.g. 4*8=32).
+    # Pass config_kwargs to override for multi-GPU tests (e.g. num_attention_heads=num_gpus,
+    # num_key_value_heads=num_gpus, hidden_size=num_gpus*head_dim).
+    text_kwargs = {
+        "dtype": torch.bfloat16,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "max_position_embeddings": 32,
+        "vocab_size": 32,
+        "rope_scaling": {"rope_type": "default", "mrope_section": [1, 1, 2]},
+    }
+    text_kwargs["rope_parameters"] = {"rope_type": "default", "mrope_section": [1, 1, 2]}
+    text_kwargs.update(config_kwargs)
+    # Pass as dicts — transformers 5.3.0 Qwen3VLConfig.__init__ only handles
+    # vision_config/text_config when they are dicts or None, not instances.
+    vision_kwargs = {
+        "depth": 1,
+        "hidden_size": 16,
+        "intermediate_size": 16,
+        "num_heads": 2,
+        "in_channels": 3,
+        "patch_size": 4,
+        "spatial_merge_size": 1,
+        "temporal_patch_size": 1,
+        "out_hidden_size": text_kwargs["hidden_size"],  # must match text hidden_size
+        # Single deepstack injection (the bridge requires len <= num language-model layers, so keep
+        # this small for tiny models; defaults to [8, 16, 24] which needs >= 3 layers).
+        "deepstack_visual_indexes": [0],
+    }
+    cfg = Qwen3VLConfig(text_config=text_kwargs, vision_config=vision_kwargs, dtype=torch.bfloat16)
+    return AutoModelForImageTextToText.from_config(cfg)
+
+
+def create_tiny_qwen3vl_dir(
+    tmp_path: Path | str, with_tokenizer: bool = False, return_model: bool = False, **config_kwargs
+) -> Path | tuple[Path, PreTrainedModel]:
+    return _create_tiny_llm_dir(
+        Path(tmp_path) / "tiny_qwen3vl",
+        get_tiny_qwen3vl,
+        with_tokenizer=with_tokenizer,
+        return_model=return_model,
+        **config_kwargs,
+    )
+
+
+##### Gemma3-VL #####
+# Real tiny Gemma3 reused (via get_tiny_vlm_processor) for the fixture's image processor + chat
+# template; the vision geometry below matches it so the processor's pixel_values fit the tiny tower.
+GEMMA3_VL_REF = "hf-internal-testing/tiny-random-Gemma3ForConditionalGeneration"
+
+
+def get_tiny_gemma3vl(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+
+    # Vocab + vision token ids derive from the ref tokenizer to match the saved processor.
+    tokenizer = _get_tiny_vlm_tokenizer(AutoTokenizer.from_pretrained(GEMMA3_VL_REF))
+
+    # layer_types auto-generates (sliding/full attention) so the pruning code path is exercised.
+    text_kwargs = {
+        "dtype": torch.bfloat16,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "max_position_embeddings": 1024,  # >= 256 image tokens + text for image calibration
+        "sliding_window": 16,
+        "vocab_size": _pad_vocab_size(len(tokenizer)),
+    }
+    text_kwargs.update(config_kwargs)
+    text_kwargs.setdefault("query_pre_attn_scalar", text_kwargs["head_dim"])
+    # Tiny SigLIP vision tower; the multimodal projector maps it to the text hidden size.
+    # Match Megatron-Bridge Gemma3VL (and real Gemma3 checkpoints): no SigLIP pooling head.
+    vision_kwargs = {
+        "hidden_size": 16,
+        "intermediate_size": 16,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        # Real patch geometry so the processor's pixel_values feed the tiny vision tower.
+        "image_size": 896,
+        "patch_size": 14,
+        "num_channels": 3,
+        "vision_use_head": False,
+    }
+    cfg = Gemma3Config(
+        text_config=text_kwargs,
+        vision_config=vision_kwargs,
+        mm_tokens_per_image=256,  # 896 / 14 -> 4096 patches pooled to 256 image tokens
+        # Token ids (from the tiny tokenizer) must match the processor for vision-token merging.
+        image_token_index=tokenizer.image_token_id,
+        boi_token_index=tokenizer.boi_token_id,
+        eoi_token_index=tokenizer.eoi_token_id,
+        dtype=torch.bfloat16,
+    )
+    return AutoModelForImageTextToText.from_config(cfg)
+
+
+def create_tiny_gemma3vl_dir(
+    tmp_path: Path | str, with_processor: bool = False, return_model: bool = False, **config_kwargs
+) -> Path | tuple[Path, PreTrainedModel]:
+    return _create_tiny_vlm_dir(
+        Path(tmp_path) / "tiny_gemma3vl",
+        GEMMA3_VL_REF,
+        get_tiny_gemma3vl,
+        with_processor=with_processor,
+        return_model=return_model,
+        **config_kwargs,
+    )
+
+
+##### Qwen3.5-VL (dense or MoE, hybrid GatedDeltaNet + gated attention) #####
+QWEN3_5_VL_REF = "Qwen/Qwen3.5-0.8B"
+
+
+class _TinyQwen35Tokenizer:
+    """Minimal offline tokenizer contract required to construct a tiny Qwen3.5-VL model."""
+
+    image_token_id = 1
+    video_token_id = 2
+    vision_bos_token_id = 3
+    vision_eos_token_id = 4
+
+    def __len__(self):
+        return 32
+
+
+def _get_tiny_qwen3_5_vl(moe: bool = False, *, tokenizer=None, **config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+
+    # Vocab + vision token ids normally derive from the reference tokenizer. Tests that do not
+    # exercise processing may inject the minimal offline contract above instead.
+    if tokenizer is None:
+        tokenizer = _get_tiny_vlm_tokenizer(AutoTokenizer.from_pretrained(QWEN3_5_VL_REF))
+
+    # Hybrid GatedDeltaNet (linear attention) + gated full-attention (layer_types auto-generated).
+    text_kwargs = {
+        "dtype": torch.bfloat16,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "max_position_embeddings": 32,
+        # Pad to a multiple of 128 (Megatron pads the vocab to make_vocab_size_divisible_by=128;
+        # matching here avoids an embedding-size mismatch on import). Token ids stay < len(tokenizer).
+        "vocab_size": _pad_vocab_size(len(tokenizer)),
+        # GatedDeltaNet linear-attention dims (kept small for tiny models).
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "linear_conv_kernel_dim": 4,
+    }
+    if moe:
+        # Replace the dense MLP with a tiny MoE (Qwen3.5-MoE: hybrid GatedDeltaNet + gated attention + MoE).
+        text_kwargs.update(
+            {
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 64,
+                "shared_expert_intermediate_size": 64,
+            }
+        )
+    text_kwargs.update(config_kwargs)
+    vision_kwargs = {
+        "hidden_size": 16,
+        "intermediate_size": 16,
+        "depth": 2,
+        "num_heads": 2,
+        # Real patch params so the processor's pixel_values fit the tiny tower; only hidden dims shrink.
+        "patch_size": 16,
+        "temporal_patch_size": 2,
+        "in_channels": 3,
+        "spatial_merge_size": 2,
+        "out_hidden_size": text_kwargs["hidden_size"],  # must match text hidden_size
+        "deepstack_visual_indexes": [],  # no deepstack injection (unlike Qwen3-VL)
+    }
+    cfg = (Qwen3_5MoeConfig if moe else Qwen3_5Config)(
+        text_config=text_kwargs,
+        vision_config=vision_kwargs,
+        dtype=torch.bfloat16,
+        # Token ids (from the tiny tokenizer) must match the processor for vision-token merging.
+        image_token_id=tokenizer.image_token_id,
+        video_token_id=tokenizer.video_token_id,
+        vision_start_token_id=tokenizer.vision_bos_token_id,
+        vision_end_token_id=tokenizer.vision_eos_token_id,
+    )
+    return AutoModelForImageTextToText.from_config(cfg)
+
+
+def _pack_qwen3_5_moe_experts(dir_path: Path | str) -> None:
+    """Repack a saved Qwen3.5-MoE fixture's experts the way released checkpoints store them.
+
+    transformers unpacks routed experts on save, but the released BF16 Qwen3.5 checkpoints store
+    them packed as ``experts.gate_up_proj`` / ``experts.down_proj``, so the fixture matches those.
+    Quantized export deliberately writes per-expert instead, matching the NVFP4 releases.
+    """
+    dir_path = Path(dir_path)
+    shards = sorted(dir_path.glob("*.safetensors"))
+    state_dict: dict[str, torch.Tensor] = {}
+    for shard in shards:
+        state_dict.update(load_file(str(shard)))
+
+    per_expert = re.compile(r"^(.*\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+    grouped: dict[str, dict[int, dict[str, torch.Tensor]]] = defaultdict(lambda: defaultdict(dict))
+    for key in list(state_dict):
+        match = per_expert.match(key)
+        if match:
+            base, expert_id, proj = match.groups()
+            grouped[base][int(expert_id)][proj] = state_dict.pop(key)
+    if not grouped:
+        return
+
+    for base, experts in grouped.items():
+        ids = sorted(experts)
+        # gate first, then up, along the output dim -- the order the packed tensor is split on.
+        state_dict[f"{base}.gate_up_proj"] = torch.stack(
+            [torch.cat([experts[i]["gate_proj"], experts[i]["up_proj"]], dim=0) for i in ids]
+        )
+        state_dict[f"{base}.down_proj"] = torch.stack([experts[i]["down_proj"] for i in ids])
+
+    for shard in shards:
+        shard.unlink()
+    save_file(state_dict, str(dir_path / "model.safetensors"), metadata={"format": "pt"})
+    index = dir_path / "model.safetensors.index.json"
+    if index.exists():
+        index.unlink()
+
+
+def _create_tiny_qwen3_5_vl_dir(
+    tmp_path: Path | str,
+    with_processor: bool = False,
+    return_model: bool = False,
+    *,
+    moe: bool = False,
+    **config_kwargs,
+) -> Path | tuple[Path, PreTrainedModel]:
+    result = _create_tiny_vlm_dir(
+        Path(tmp_path) / ("tiny_qwen3_5_moe_vl" if moe else "tiny_qwen3_5_vl"),
+        QWEN3_5_VL_REF,
+        _get_tiny_qwen3_5_vl,
+        with_processor=with_processor,
+        return_model=return_model,
+        moe=moe,
+        **config_kwargs,
+    )
+    if moe:
+        _pack_qwen3_5_moe_experts(result[0] if isinstance(result, tuple) else result)
+    return result
+
+
+get_tiny_qwen3_5_vl = partial(_get_tiny_qwen3_5_vl, moe=False)
+create_tiny_qwen3_5_vl_dir = partial(_create_tiny_qwen3_5_vl_dir, moe=False)
+get_tiny_qwen3_5_moe_vl = partial(_get_tiny_qwen3_5_vl, moe=True)
+create_tiny_qwen3_5_moe_vl_dir = partial(_create_tiny_qwen3_5_vl_dir, moe=True)
+
+
+def get_tiny_qwen3_5_vl_offline(**config_kwargs) -> PreTrainedModel:
+    """Build a dense tiny Qwen3.5-VL without downloading its reference tokenizer."""
+    return _get_tiny_qwen3_5_vl(moe=False, tokenizer=_TinyQwen35Tokenizer(), **config_kwargs)
+
+
+##### NEMOTRON #####
+def get_tiny_nemotron(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+
+    # hidden_size=64, ffn_hidden_size=128: relu2 activation needs non-trivial dims
+    # to avoid all-zero activations (scaling factor 0) in NVFP4 quantization.
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 1,
+        "max_position_embeddings": 32,
+        "vocab_size": 32,
+    }
+    kwargs.update(config_kwargs)
+    return AutoModelForCausalLM.from_config(NemotronConfig(**kwargs))
+
+
+def create_tiny_nemotron_dir(
+    tmp_path: Path | str, with_tokenizer: bool = False, **config_kwargs
+) -> Path:
+    return _create_tiny_llm_dir(
+        Path(tmp_path) / "tiny_nemotron",
+        get_tiny_nemotron,
+        with_tokenizer=with_tokenizer,
+        **config_kwargs,
+    )
+
+
+##### NEMOTRON-H (Mamba + Attention + MoE/MLP hybrid) #####
+def _match_released_nemotron_h_embedding_name() -> None:
+    """Save NemotronH's embedding as ``backbone.embeddings`` like released checkpoints do.
+
+    transformers <= 5.15 renames it to the legacy singular on save, so a saved fixture disagrees
+    with every real checkpoint on one tensor. Dropped upstream in 5.16, where this is a no-op
+    since there is no such rule left to remove.
+    """
+    mapping = get_checkpoint_conversion_mapping("nemotron_h")
+    if mapping is None:
+        return
+    kept = [m for m in mapping if getattr(m, "source_patterns", None) != ["embedding.weight"]]
+    if len(kept) != len(mapping):
+        register_checkpoint_conversion_mapping("nemotron_h", kept, overwrite=True)
+
+
+def get_tiny_nemotron_h(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+
+    _match_released_nemotron_h_embedding_name()
+
+    # Tiny NemotronH hybrid. hybrid_override_pattern letters: M=Mamba, E=MoE/FFN, *=Attention.
+    # "ME*E" matches the NemotronH default and exercises Mamba + MoE + attention layers.
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 4,
+        "hybrid_override_pattern": "ME*E",
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 8,
+        "mamba_num_heads": 8,
+        "mamba_head_dim": 16,
+        "ssm_state_size": 32,
+        "n_groups": 2,
+        "conv_kernel": 4,
+        # MoE
+        "n_routed_experts": 8,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 64,
+        "n_shared_experts": 1,
+        "moe_shared_expert_intermediate_size": 32,
+        "vocab_size": 32,
+        "max_position_embeddings": 32,
+    }
+    kwargs.update(config_kwargs)
+    return AutoModelForCausalLM.from_config(NemotronHConfig(**kwargs))
+
+
+def create_tiny_nemotron_h_dir(
+    tmp_path: Path | str, with_tokenizer: bool = False, **config_kwargs
+) -> Path:
+    return _create_tiny_llm_dir(
+        Path(tmp_path) / "tiny_nemotron_h",
+        get_tiny_nemotron_h,
+        with_tokenizer=with_tokenizer,
+        **config_kwargs,
+    )
+
+
+##### DeepSeek V3 #####
+def get_tiny_deepseek_v3(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "vocab_size": 128,
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "moe_intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 1,
+        "first_k_dense_replace": 0,
+        "kv_lora_rank": 16,
+        "q_lora_rank": 32,
+        "qk_rope_head_dim": 16,
+        "qk_nope_head_dim": 16,
+        "v_head_dim": 16,
+        "max_position_embeddings": 128,
+        # Required so vLLM allocates ``gate.e_score_correction_bias`` (HF saves it unconditionally).
+        "topk_method": "noaux_tc",
+    }
+    kwargs.update(config_kwargs)
+    cfg = DeepseekV3Config(**kwargs)
+    # Survive transformers versions that drop unknown kwargs from the dataclass.
+    cfg.topk_method = kwargs["topk_method"]
+    return AutoModelForCausalLM.from_config(cfg)
+
+
+def create_tiny_deepseek_v3_dir(
+    tmp_path: Path | str, with_tokenizer: bool = False, **config_kwargs
+) -> Path:
+    return _create_tiny_llm_dir(
+        Path(tmp_path) / "tiny_deepseek_v3",
+        get_tiny_deepseek_v3,
+        with_tokenizer=with_tokenizer,
+        **config_kwargs,
+    )
+
+
+##### GLM-5.3-FLASH #####
+def get_tiny_glm5_next(**text_config_kwargs) -> PreTrainedModel:
+    """Tiny GLM-5.3-Flash VLM: one KDA + dense-MLP layer, one sparse-MLA + MoE layer, one vision block."""
+    set_seed(SEED)
+
+    # Lazy import — glm5_next is native only from transformers 5.16.1.
+    from transformers import Glm5NextConfig
+
+    text_kwargs = {
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "moe_intermediate_size": 32,
+        "num_hidden_layers": 2,
+        # "full_attention" maps to the sparse-MLA name of the installed transformers version.
+        "layer_types": ["linear_attention", "full_attention"],
+        "mlp_layer_types": ["dense", "sparse"],
+        "indexer_types": ["full", "full"],
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "q_lora_rank": 32,
+        "kv_lora_rank": 16,
+        "qk_nope_head_dim": 16,
+        "v_head_dim": 16,
+        # Megatron-Bridge reads these released-checkpoint fields, which transformers doesn't define.
+        "linear_attn_config": {"num_heads": 4, "head_dim": 16, "short_conv_kernel_size": 4},
+        "scoring_func": "sigmoid",
+        "index_n_heads": 2,
+        "index_head_dim": 16,
+        "index_topk": 8,
+        "index_kpool": 4,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 1,
+        "max_position_embeddings": 64,
+        "pad_token_id": 0,
+    }
+    text_kwargs.update(text_config_kwargs)
+    vision_kwargs = {
+        "depth": 1,
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_heads": 2,
+        "image_size": 28,
+        "patch_size": 14,
+        "out_hidden_size": text_kwargs["hidden_size"],
+        "projection_intermediate_size": 64,
+    }
+    cfg = Glm5NextConfig(text_config=text_kwargs, vision_config=vision_kwargs)
+    model = AutoModelForImageTextToText.from_config(cfg, dtype=torch.bfloat16)
+    with torch.no_grad():
+        for name, tensor in [*model.named_parameters(), *model.named_buffers()]:
+            # Perturb the constant-initialized norms, gates and mHC scales, so export tests catch swaps.
+            if (tensor == tensor.flatten()[0]).all():
+                tensor.add_(torch.rand_like(tensor) * 0.1)
+            # FP32 in the released checkpoint, so export tests check them bit-exact.
+            if name.endswith(
+                ("_hc.base", "_hc.scale", "A_log", "dt_bias", "e_score_correction_bias")
+            ):
+                tensor.data = tensor.data.float()
+    return model
+
+
+def create_tiny_glm5_next_dir(
+    tmp_path: Path | str, with_tokenizer: bool = False, return_model: bool = False, **config_kwargs
+) -> Path | tuple[Path, PreTrainedModel]:
+    """Save :func:`get_tiny_glm5_next` with the MTP layer released checkpoints have.
+
+    transformers doesn't build the MTP layer, so it is added to the checkpoint here: a copy of the
+    last (sparse) decoder layer without mHC, plus random MTP norms and ``eh_proj``.
+    """
+    dir_path, model = _create_tiny_llm_dir(
+        Path(tmp_path) / "tiny_glm5_next_vl",
+        get_tiny_glm5_next,
+        with_tokenizer=with_tokenizer,
+        return_model=True,
+        num_nextn_predict_layers=1,
+        **config_kwargs,
+    )
+    text_config = model.config.text_config
+    last = f"model.language_model.layers.{text_config.num_hidden_layers - 1}."
+    mtp = f"model.language_model.layers.{text_config.num_hidden_layers}."
+    path = dir_path / "model.safetensors"
+    state_dict = load_file(str(path))
+    for key in list(state_dict):
+        if key.startswith(last) and ".hc_" not in key:
+            state_dict[mtp + key.removeprefix(last)] = state_dict[key].clone()
+    hidden = text_config.hidden_size
+    for name, shape in [
+        ("enorm.weight", (hidden,)),
+        ("hnorm.weight", (hidden,)),
+        ("eh_proj.weight", (hidden, 2 * hidden)),
+        ("shared_head.norm.weight", (hidden,)),
+    ]:
+        state_dict[mtp + name] = torch.randn(shape, dtype=torch.bfloat16)
+    save_file(state_dict, str(path), metadata={"format": "pt"})
+    return (dir_path, model) if return_model else dir_path
+
+
+##### GLM-5.3-FLASH / DEEPSEEK-V4 (config-only, for vLLM ``load_format="dummy"``) #####
+def _write_config_dir(dir_path: Path, config: dict) -> Path:
+    dir_path.mkdir(parents=True, exist_ok=True)
+    (dir_path / "config.json").write_text(json.dumps(config, indent=2))
+    return dir_path
+
+
+def create_tiny_glm5_next_config_dir(tmp_path: Path | str, **config_kwargs) -> Path:
+    """Text-only zai-org/GLM-5.3-Flash config with one KDA and one sparse-attention layer, 8 experts.
+
+    Hidden and attention shapes stay at the released values because vLLM's sparse-attention and
+    k-pool indexer kernels only support those. There are no weights: boot vLLM with dummy weights.
+    """
+    config = {
+        "architectures": ["Glm5NextForCausalLM"],
+        "model_type": "glm5_next",
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "first_k_dense_replace": 1,
+        "hc_eps": 1e-06,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "head_dim": 0,
+        "hidden_act": "silu",
+        "hidden_size": 4096,
+        "index_head_dim": 128,
+        "index_kpool": 4,
+        "index_kpool_always_select_tail": True,
+        "index_kpool_compress": True,
+        "index_n_heads": 32,
+        "index_topk": 2048,
+        "index_share_for_mtp_iteration": True,
+        "indexer_rope_interleave": True,
+        "indexer_types": ["full", "full"],
+        "initializer_range": 0.02,
+        "intermediate_size": 12288,
+        "kv_lora_rank": 512,
+        "layer_types": ["linear_attention", "deepseek_sparse_attention"],
+        "linear_attn_config": {
+            "num_heads": 64,
+            "gate_lower_bound": -5.0,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [0],
+            "full_attn_layers": [1],
+        },
+        "max_position_embeddings": 1048576,
+        "mhc": True,
+        "mla_use_nope": True,
+        "mlp_layer_types": ["dense", "sparse"],
+        "moe_intermediate_size": 2048,
+        "moe_router_dtype": "float32",
+        "n_group": 1,
+        "n_routed_experts": 8,
+        "n_shared_experts": 1,
+        "norm_topk_prob": True,
+        "num_attention_heads": 64,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 64,
+        "num_nextn_predict_layers": 0,
+        "q_lora_rank": 1536,
+        "qk_head_dim": 256,
+        "qk_nope_head_dim": 256,
+        "qk_rope_head_dim": 0,
+        "rms_norm_eps": 1e-05,
+        "routed_scaling_factor": 2.5,
+        "scoring_func": "sigmoid",
+        "swiglu_limit": 10.0,
+        "tie_word_embeddings": False,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "v_head_dim": 256,
+        "vocab_size": 154880,
+        **config_kwargs,
+    }
+    return _write_config_dir(Path(tmp_path) / "tiny_glm5_next", config)
+
+
+def create_tiny_deepseek_v4_config_dir(tmp_path: Path | str, **config_kwargs) -> Path:
+    """deepseek-ai/DeepSeek-V4-Pro config with two layers (compress ratios 128 and 4) and 8 experts.
+
+    The ratio-4 layer carries the lightning indexer. Shapes stay at the released values because
+    vLLM's sparse-attention kernels only support those. There are no weights: boot vLLM with dummy
+    weights. The released FP8/FP4 checkpoint quantization is dropped, so weights are bf16.
+    """
+    config = {
+        "architectures": ["DeepseekV4ForCausalLM"],
+        "model_type": "deepseek_v4",
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "bos_token_id": 0,
+        "eos_token_id": 1,
+        "compress_ratios": [128, 4],
+        "compress_rope_theta": 160000,
+        "hc_eps": 1e-06,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "head_dim": 512,
+        "hidden_act": "silu",
+        "hidden_size": 7168,
+        "index_head_dim": 128,
+        "index_n_heads": 64,
+        "index_topk": 1024,
+        "initializer_range": 0.02,
+        "max_position_embeddings": 1048576,
+        "moe_intermediate_size": 3072,
+        "n_routed_experts": 8,
+        "n_shared_experts": 1,
+        "norm_topk_prob": True,
+        "num_attention_heads": 128,
+        "num_experts_per_tok": 2,
+        "num_hash_layers": 1,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 1,
+        "num_nextn_predict_layers": 0,
+        "o_groups": 16,
+        "o_lora_rank": 1024,
+        "q_lora_rank": 1536,
+        "qk_rope_head_dim": 64,
+        "rms_norm_eps": 1e-06,
+        "rope_scaling": {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 16,
+            "original_max_position_embeddings": 65536,
+            "type": "yarn",
+        },
+        "rope_theta": 10000,
+        "routed_scaling_factor": 2.5,
+        "scoring_func": "sqrtsoftplus",
+        "sliding_window": 128,
+        "swiglu_limit": 10.0,
+        "tie_word_embeddings": False,
+        "topk_method": "noaux_tc",
+        "vocab_size": 129280,
+        **config_kwargs,
+    }
+    return _write_config_dir(Path(tmp_path) / "tiny_deepseek_v4", config)
+
+
+##### GPT-OSS #####
+def get_tiny_gpt_oss(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "num_hidden_layers": 4,
+        "num_local_experts": 8,
+        "vocab_size": 32,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "head_dim": 16,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+    }
+    kwargs.update(config_kwargs)
+    return AutoModelForCausalLM.from_config(GptOssConfig(**kwargs))
+
+
+def create_tiny_gpt_oss_dir(
+    tmp_path: Path | str, with_tokenizer: bool = False, **config_kwargs
+) -> Path:
+    return _create_tiny_llm_dir(
+        Path(tmp_path) / "tiny_gpt_oss",
+        get_tiny_gpt_oss,
+        with_tokenizer=with_tokenizer,
+        **config_kwargs,
+    )
+
+
+##### MIXTRAL #####
+def get_tiny_mixtral(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "max_position_embeddings": 32,
+        "vocab_size": 32,
+    }
+    kwargs.update(config_kwargs)
+    return AutoModelForCausalLM.from_config(MixtralConfig(**kwargs))
+
+
+##### LLAMA #####
+def get_tiny_llama(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 32,
+        "vocab_size": 32,
+    }
+    kwargs.update(config_kwargs)
+    return AutoModelForCausalLM.from_config(LlamaConfig(**kwargs))
+
+
+def create_tiny_llama_dir(
+    tmp_path: Path | str, with_tokenizer: bool = False, **config_kwargs
+) -> Path:
+    return _create_tiny_llm_dir(
+        Path(tmp_path) / "tiny_llama",
+        get_tiny_llama,
+        with_tokenizer=with_tokenizer,
+        **config_kwargs,
+    )
+
+
+def get_tiny_llama_seq_cls(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 32,
+        "vocab_size": 32,
+        "num_labels": 1,
+        "pad_token_id": 0,
+    }
+    kwargs.update(config_kwargs)
+    return LlamaForSequenceClassification(LlamaConfig(**kwargs))
+
+
+def create_tiny_llama_seq_cls_dir(
+    tmp_path: Path | str, with_tokenizer: bool = False, **config_kwargs
+) -> Path:
+    return _create_tiny_llm_dir(
+        Path(tmp_path) / "tiny_llama_seq_cls",
+        get_tiny_llama_seq_cls,
+        with_tokenizer=with_tokenizer,
+        **config_kwargs,
+    )
+
+
+##### T5 #####
+def get_tiny_t5(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "vocab_size": 32,
+        "d_model": 32,
+        "d_kv": 32,
+        "d_ff": 32,
+        "num_layers": 2,
+        "num_heads": 16,
+        "relative_attention_num_buckets": 8,
+        "relative_attention_max_distance": 32,
+        "decoder_start_token_id": 0,
+    }
+    kwargs.update(config_kwargs)
+    return T5ForConditionalGeneration(T5Config(**kwargs)).to(torch.bfloat16)
+
+
+def create_tiny_t5_dir(tmp_path: Path | str, with_tokenizer: bool = False, **config_kwargs) -> Path:
+    return _create_tiny_llm_dir(
+        Path(tmp_path) / "tiny_t5",
+        get_tiny_t5,
+        with_tokenizer=with_tokenizer,
+        tokenizer_factory=lambda: AutoTokenizer.from_pretrained(
+            "hf-internal-testing/tiny-random-T5Model"
+        ),
+        **config_kwargs,
+    )
+
+
+##### BERT #####
+def get_tiny_bert(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 16,
+        "max_position_embeddings": 32,
+        "vocab_size": 32,
+    }
+    kwargs.update(config_kwargs)
+    return AutoModelForQuestionAnswering.from_config(BertConfig(**kwargs))
+
+
+##### ViT (vision) #####
+def get_tiny_vit(**config_kwargs) -> PreTrainedModel:
+    set_seed(SEED)
+
+    # Keep num_channels=3 and a 16x16 patch so the patch-embedding stem conv matches a
+    # real ViT; image_size=32 gives a 2x2 patch grid, keeping the model tiny.
+    kwargs = {
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "image_size": 32,
+        "patch_size": 16,
+        "num_channels": 3,
+        "num_labels": 2,
+    }
+    kwargs.update(**config_kwargs)
+    return AutoModelForImageClassification.from_config(ViTConfig(**kwargs))
+
+
+def create_tiny_vit_dir(tmp_path: Path | str, **config_kwargs) -> Path:
+    vit_dir = Path(tmp_path) / "tiny_vit"
+    tiny_vit = get_tiny_vit(**config_kwargs)
+    tiny_vit.save_pretrained(vit_dir)
+    # A vision model also needs a saved image processor so the example's
+    # AutoImageProcessor.from_pretrained(dir) resolves; size it to the tiny image.
+    image_size = tiny_vit.config.image_size
+    ViTImageProcessor(size={"height": image_size, "width": image_size}).save_pretrained(vit_dir)
+    return vit_dir
+
+
+##### TESTERS #####
+def tf_output_tester(model_ref, model_test):
+    inputs = model_ref.dummy_inputs
+    model_ref.eval()
+    model_test.to(model_ref.dtype).eval()
+    output_ref = model_ref(**inputs)
+    output_test = model_test(**inputs)
+    atol = 1e-2 if model_ref.dtype == torch.bfloat16 else 1e-6
+    if hasattr(output_ref, "logits"):
+        assert torch.allclose(output_ref.logits, output_test.logits, atol=atol)
+    else:
+        assert torch.allclose(output_ref.start_logits, output_test.start_logits, atol=atol)
+        assert torch.allclose(output_ref.end_logits, output_test.end_logits, atol=atol)
+
+
+def tf_modelopt_state_and_output_tester(model_ref, model_test):
+    # Huggingface adds a _is_hf_initialized attribute to the model's modules
+    for module in model_test.modules():
+        if hasattr(module, "_is_hf_initialized"):
+            # AttributeError for PEFT models, PEFT models get `_is_hf_initialized` from model.base_model
+            with contextlib.suppress(AttributeError):
+                delattr(module, "_is_hf_initialized")
+
+    model_ref_state = mto.modelopt_state(model_ref)
+    model_test_state = mto.modelopt_state(model_test)
+    assert model_ref_state == model_test_state
+
+    tf_output_tester(model_ref, model_test)

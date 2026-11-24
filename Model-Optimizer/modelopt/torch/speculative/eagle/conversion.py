@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Eagle conversion/restore utilities."""
+
+from torch import nn
+
+from modelopt.torch.opt.conversion import ModelLikeModule
+from modelopt.torch.opt.dynamic import _DMRegistryCls
+from modelopt.torch.opt.mode import ConvertReturnType, MetadataDict
+from modelopt.torch.speculative.config import eagle3_default_config, kimik2_eagle_default_config
+
+from ..config import EagleConfig
+
+EagleDMRegistry = _DMRegistryCls(prefix="Eagle")  # global instance for the registry
+
+
+def convert_to_eagle_model(model: nn.Module, config: EagleConfig) -> ConvertReturnType:
+    """Convert the model to a eagle model as per `config`."""
+    # initialize the true module if necessary
+    model = model.init_modellike() if isinstance(model, ModelLikeModule) else model
+
+    EagleDMRegistry.register_subclass(type(model), "base_model_class")
+
+    if config.eagle_loss_type not in EagleDMRegistry[type(model)]._supported_loss_types:
+        raise ValueError(
+            f"eagle_loss_type={config.eagle_loss_type!r} is not supported for {type(model).__name__}"
+        )
+
+    # merge custom config with default config
+    default_arch_config = {
+        "llama": eagle3_default_config,
+        "kimik2": kimik2_eagle_default_config,
+    }[config.eagle_decoder_type]
+    custom_config = config.eagle_architecture_config
+    arch_config = {**default_arch_config, **custom_config}
+    if config.eagle_loss_type == "lk_lambda":
+        base_config = (
+            getattr(model.config, "text_config", None)
+            or getattr(model.config, "llm_config", None)
+            or model.config
+        )
+        if arch_config.get("draft_vocab_size", base_config.vocab_size) != base_config.vocab_size:
+            raise ValueError(
+                "eagle_loss_type='lk_lambda' requires the full target vocabulary. "
+                "Use eagle_loss_type='soft_target_ce' for reduced-vocabulary EAGLE."
+            )
+    config.eagle_architecture_config = arch_config
+
+    eagle_model = EagleDMRegistry.convert(model)
+    eagle_model.modify(config)
+
+    # no metadata, all specified via config.
+    metadata = {}
+
+    return eagle_model, metadata
+
+
+def restore_eagle_model(model: nn.Module, config: EagleConfig, metadata: MetadataDict) -> nn.Module:
+    """Function for restoring a previously convert model to a eagle model."""
+    # the metadata should be empty
+    assert not metadata, "No metadata expected!"
+
+    return convert_to_eagle_model(model, config)[0]

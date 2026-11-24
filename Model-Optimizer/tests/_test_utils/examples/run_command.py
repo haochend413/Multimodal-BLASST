@@ -1,0 +1,192 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Utility functions for running example commands reused in multiple example tests."""
+
+import contextlib
+import os
+import signal
+import subprocess
+import threading
+import warnings
+from pathlib import Path
+
+from _test_utils.torch.distributed.utils import get_free_port
+from _test_utils.transient_errors import TransientError, find_transient_marker
+
+MODELOPT_ROOT = Path(__file__).parents[3]
+
+
+def extend_cmd_parts(cmd_parts: list[str], **kwargs):
+    for key, value in kwargs.items():
+        if value is not None:
+            cmd_parts.extend([f"--{key}", str(value)])
+    if kwargs.get("trust_remote_code", False):
+        cmd_parts.append("--trust_remote_code")
+    return cmd_parts
+
+
+# Grace period for descendants to flush and close the inherited output pipe after the command exits,
+# then a short bound on the post-SIGKILL drain (the fds close as the kernel tears the group down).
+_ORPHAN_PIPE_TIMEOUT_S = 30
+_KILLED_PIPE_TIMEOUT_S = 5
+
+
+def _run_capturing(cmd_parts: list[str], cwd: Path, env: dict[str, str]) -> tuple[int, str]:
+    """Run a command, streaming and capturing combined stdout/stderr to catch transient errors.
+
+    Drained by a reader thread rather than ``subprocess.run``, which waits for EOF: a descendant
+    outliving the command keeps the pipe open, hanging the read and discarding every log line.
+    """
+    chunks: list[str] = []
+    process = subprocess.Popen(
+        cmd_parts,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    # start_new_session makes the child its own group leader, so the group id is its pid (read now:
+    # os.getpgid() stops resolving it once wait() reaps the child).
+    pgid = process.pid
+
+    def _kill_process_group():
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            if os.name == "posix":
+                os.killpg(pgid, signal.SIGKILL)
+            else:  # no process groups; the command itself is the best we can reach
+                process.kill()
+
+    def _drain():
+        with contextlib.suppress(ValueError):  # the stream is closed under us on the escape path
+            for line in process.stdout:  # type: ignore[union-attr]
+                print(line, end="")
+                chunks.append(line)
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    try:
+        if os.name == "posix":
+            # Wait *without* reaping: a reaped pid can be recycled, and pgid == the child's pid, so
+            # reaping before the kill below would risk signalling an unrelated group.
+            os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+        else:  # no process groups, so nothing to protect the pid for
+            process.wait()
+    except BaseException:
+        # Interrupted (most likely pytest-timeout) while the command runs: its own process group is
+        # not swept up with pytest's, so take the descendants down rather than leak them.
+        _kill_process_group()
+        with contextlib.suppress(Exception):
+            process.wait(timeout=_KILLED_PIPE_TIMEOUT_S)  # reap: WNOWAIT left it waitable
+        raise
+    reader.join(_ORPHAN_PIPE_TIMEOUT_S)
+
+    if reader.is_alive():
+        warnings.warn(
+            f"{cmd_parts[0]} left descendants holding its output pipe open; killing the process "
+            "group. Output may be truncated."
+        )
+        _kill_process_group()
+        reader.join(_KILLED_PIPE_TIMEOUT_S)
+
+    returncode = process.wait()
+
+    with contextlib.suppress(Exception):
+        process.stdout.close()  # type: ignore[union-attr]
+    return returncode, "".join(chunks)
+
+
+# Set by a suite's conftest to run a command without spawning a subprocess (see
+# ``_test_utils.examples.megatron_example_runner``). Unset means always use a subprocess.
+_in_process_runner = None
+
+
+def set_in_process_runner(runner) -> None:
+    """Register ``runner(cmd_parts, example_path) -> str``; it must not fall back to a subprocess."""
+    global _in_process_runner
+    _in_process_runner = runner
+
+
+def _exception_chain_text(exc: BaseException | None) -> str:
+    """``Type: message`` of ``exc`` and of each exception it was raised from or while handling."""
+    lines, seen = [], set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        lines.append(f"{type(exc).__name__}: {exc}")
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    return "\n".join(lines)
+
+
+def run_example_command(
+    cmd_parts: list[str],
+    example_path: str,
+    setup_free_port: bool = False,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Run an example command, raising ``TransientError`` on a transient failure so the test reruns."""
+    print(f"[{example_path}] Running command: {cmd_parts}")
+    in_process = _in_process_runner if env is None else None
+    if _in_process_runner is not None and env is not None:
+        # The in-process runner uses the ambient environment, so a caller-supplied env would be
+        # silently dropped. Fall back to a subprocess rather than run with the wrong environment.
+        warnings.warn(f"[{example_path}] env= given; running this step as a subprocess")
+    env = os.environ.copy() if env is None else env
+    cwd = MODELOPT_ROOT / "examples" / example_path
+
+    if in_process is not None:
+        try:
+            result = in_process(cmd_parts, example_path)
+        except Exception as e:
+            # Match the messages of the exception chain (a Hub ConnectionError typically surfaces
+            # wrapped in a DatasetGenerationError) and what the step printed, for launcher-level
+            # failures. Not a formatted traceback: its source lines can contain a marker.
+            marker = find_transient_marker(
+                f"{_exception_chain_text(e)}\n{getattr(e, 'captured_output', '')}"
+            )
+            if marker is None:
+                raise  # a real failure keeps its own traceback
+            raise TransientError(f"[{example_path}] transient error: {marker!r}") from e
+        assert result is not None, "an in-process runner must return output, not fall back"
+        return result
+
+    if setup_free_port:
+        # Subprocess steps only: an in-process runner picks its own free port, since env is a
+        # copy it never sees.
+        env["MASTER_PORT"] = str(get_free_port())
+    returncode, output = _run_capturing(cmd_parts, cwd, env)
+    if returncode == 0:
+        return output
+    error = subprocess.CalledProcessError(returncode, cmd_parts, output=output)
+    marker = find_transient_marker(output)
+    if marker is None:
+        raise error
+    raise TransientError(f"[{example_path}] transient error: {marker!r}") from error
+
+
+def run_hf_ptq_command(*, model: str, quant: str | None = None, vlm: bool = False, **kwargs):
+    kwargs.update({"model": model, "quant": quant})
+    kwargs.setdefault("tasks", "quant")
+    kwargs.setdefault("calib", 16)
+
+    cmd_parts = ["scripts/huggingface_example.sh", "--no-verbose"]
+    if vlm:
+        # VLM PTQ shares the hf_ptq entry point; --vlm runs the multimodal deploy smoke test.
+        cmd_parts.append("--vlm")
+    cmd_parts = extend_cmd_parts(cmd_parts, **kwargs)
+    # Run a single-GPU TRT-LLM deploy's executor in the script's process. By default it spawns an
+    # MPI worker that imports TRT-LLM again, adding ~20s to every deploy.
+    env = {**os.environ, "TLLM_WORKER_USE_SINGLE_PROCESS": "1"}
+    run_example_command(cmd_parts, "hf_ptq", env=env)

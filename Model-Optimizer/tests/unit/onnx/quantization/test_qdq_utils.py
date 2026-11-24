@@ -1,0 +1,1581 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import warnings
+
+import ml_dtypes
+import numpy as np
+import onnx
+import onnx_graphsurgeon as gs
+import onnxruntime as ort
+import pytest
+from onnx import TensorProto, helper, numpy_helper
+
+from modelopt.onnx.export import (
+    FP8QuantExporter,
+    INT4QuantExporter,
+    MXFP8QuantExporter,
+    NVFP4QuantExporter,
+)
+from modelopt.onnx.export.nvfp4_exporter import _cast_fp4
+from modelopt.onnx.quantization.gs_patching import _export_value_info_proto
+from modelopt.onnx.quantization.qdq_utils import (
+    _cast_fp8,
+    apply_column_major_transformation,
+    fp4qdq_to_2dq,
+    insert_transpose_nodes_for_column_major,
+    qdq_to_dq,
+    quantize_weights_to_int4,
+    quantize_weights_to_mxfp8,
+    replace_zero_scale_with_smallest_nonzero,
+)
+from modelopt.onnx.quantization.quant_utils import pack_float32_to_4bit_cpp_based
+from modelopt.onnx.utils import get_opset_version
+
+
+def create_test_model_with_int4_dq_reshape_transpose_matmul(constant_scale: bool = False):
+    """Create a test ONNX model with DequantizeLinear -> Reshape -> Transpose -> MatMul pattern for INT4.
+    If constant_scale is True, the scale is a Constant node instead of an initializer."""
+    # Create weight tensor (4x8 matrix scaled by 32 blocks)
+    weight_data = np.random.randint(-8, 8, size=(32, 8), dtype=np.int8)
+    weight_tensor = numpy_helper.from_array(weight_data, "weight")
+
+    # Create scale tensor for block quantization (block_size = 32)
+    scale_data = np.random.uniform(0.1, 1.0, size=(32, 1)).astype(np.float32)
+    scale_tensor = numpy_helper.from_array(scale_data, "scale")
+
+    # Create reshape shape tensor
+    reshape_shape = np.array([16, 16], dtype=np.int64)
+
+    # Create input tensor for MatMul
+    input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT, [None, 2])
+
+    if constant_scale:
+        scale_constant = helper.make_node(
+            "Constant",
+            inputs=[],
+            outputs=["Constant_output_0"],
+            value=numpy_helper.from_array(scale_data),
+            name="scale_constant",
+        )
+
+    # Create nodes
+    dq_inputs = ["weight", "Constant_output_0"] if constant_scale else ["weight", "scale"]
+    dq_node = helper.make_node(
+        "DequantizeLinear", inputs=dq_inputs, outputs=["dq_output"], name="weight_dq"
+    )
+
+    reshape_constant = helper.make_node(
+        "Constant",
+        inputs=[],
+        outputs=["reshape_shape_Constant"],
+        value=numpy_helper.from_array(reshape_shape),
+        name="reshape_constant",
+    )
+
+    reshape_node = helper.make_node(
+        "Reshape",
+        inputs=["dq_output", "reshape_shape_Constant"],
+        outputs=["reshape_output"],
+        name="weight_reshape",
+    )
+
+    cast_node = helper.make_node(
+        "Cast",
+        inputs=["reshape_output"],
+        outputs=["cast_output"],
+        to=TensorProto.FLOAT,
+        name="weight_cast",
+    )
+
+    transpose_node = helper.make_node(
+        "Transpose",
+        inputs=["cast_output"],
+        outputs=["transpose_output"],
+        perm=[1, 0],
+        name="weight_transpose",
+    )
+
+    matmul_node = helper.make_node(
+        "MatMul", inputs=["input", "transpose_output"], outputs=["output"], name="matmul"
+    )
+
+    # Create value info for intermediate tensors
+    reshape_output_info = helper.make_tensor_value_info(
+        "reshape_output", TensorProto.FLOAT, [16, 16]
+    )
+
+    # Create graph
+    nodes = [dq_node, reshape_constant, reshape_node, cast_node, transpose_node, matmul_node]
+    if constant_scale:
+        nodes.append(scale_constant)
+    graph = helper.make_graph(
+        nodes=nodes,
+        name="test_graph",
+        inputs=[input_tensor],
+        outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, [None, 16])],
+        initializer=[weight_tensor, scale_tensor],
+        value_info=[reshape_output_info],
+    )
+
+    model = helper.make_model(graph)
+    return model
+
+
+def create_test_model_with_cast_nodes():
+    """Create a test model with various Cast nodes to test float32->float16 conversion."""
+    # Create a simple model with Cast nodes
+    input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT, [4])
+
+    # Cast to float32 (should be converted to float16)
+    cast_fp32 = helper.make_node(
+        "Cast",
+        inputs=["input"],
+        outputs=["cast_fp32_output"],
+        to=TensorProto.FLOAT,
+        name="regular_cast",
+    )
+
+    # Cast in normalization (should be preserved)
+    cast_norm = helper.make_node(
+        "Cast",
+        inputs=["input"],
+        outputs=["cast_norm_output"],
+        to=TensorProto.FLOAT,
+        name="layer_norm/Cast",
+    )
+
+    # Output cast (should be preserved)
+    cast_output = helper.make_node(
+        "Cast", inputs=["input"], outputs=["final_output"], to=TensorProto.FLOAT, name="/Cast"
+    )
+
+    graph = helper.make_graph(
+        nodes=[cast_fp32, cast_norm, cast_output],
+        name="test_graph",
+        inputs=[input_tensor],
+        outputs=[helper.make_tensor_value_info("final_output", TensorProto.FLOAT, [4])],
+        initializer=[],
+    )
+
+    model = helper.make_model(graph)
+    return model
+
+
+def create_test_model_with_proj_nodes():
+    """Create a test model with projection nodes to test bias and scale casting."""
+    # Create bias tensor
+    bias_data = np.random.uniform(-1.0, 1.0, size=(16,)).astype(np.float32)
+    bias_tensor = numpy_helper.from_array(bias_data, "proj_bias")
+
+    # Create scale tensor for quantization
+    scale_data = np.random.uniform(0.1, 1.0, size=(1,)).astype(np.float32)
+    scale_tensor = numpy_helper.from_array(scale_data, "quant_scale")
+
+    input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT, [4, 16])
+
+    # Add node (projection bias)
+    add_node = helper.make_node(
+        "Add", inputs=["input", "proj_bias"], outputs=["add_output"], name="o_proj/Add"
+    )
+
+    # Mul node (quantization scale)
+    mul_node = helper.make_node(
+        "Mul",
+        inputs=["add_output", "quant_scale"],
+        outputs=["output"],
+        name="o_proj/input_quantizer/Mul",
+    )
+
+    graph = helper.make_graph(
+        nodes=[add_node, mul_node],
+        name="test_graph",
+        inputs=[input_tensor],
+        outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, [4, 16])],
+        initializer=[bias_tensor, scale_tensor],
+    )
+
+    model = helper.make_model(graph)
+    return model
+
+
+def create_test_model_with_mxfp8_dq():
+    """Create a test ONNX model with TRT_MXFP8DequantizeLinear nodes for testing MXFP8."""
+    # Create weight tensor
+    weight_data = np.random.uniform(-1.0, 1.0, size=(64, 32)).astype(np.float32)
+    weight_tensor = numpy_helper.from_array(weight_data, "linear.weight")
+
+    # Create scale tensor (constant node) - MXFP8 uses block_size=32
+    scale_data = np.random.uniform(0.1, 1.0, size=(2, 1)).astype(np.float32)
+
+    # Create input tensor
+    input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT, [4, 32])
+
+    # Create scale constant node
+    scale_constant = helper.make_node(
+        "Constant",
+        inputs=[],
+        outputs=["Constant_output_0"],
+        value=numpy_helper.from_array(scale_data),
+        name="scale_constant",
+    )
+
+    # Create TRT_MXFP8DequantizeLinear node
+    dq_node = helper.make_node(
+        "TRT_MXFP8DequantizeLinear",
+        inputs=["linear.weight", "Constant_output_0"],
+        outputs=["dq_output"],
+        name="weight_dq",
+        axis=-1,
+        block_size=32,
+        output_dtype=TensorProto.FLOAT,
+    )
+
+    # Create MatMul node
+    matmul_node = helper.make_node(
+        "MatMul", inputs=["input", "dq_output"], outputs=["output"], name="matmul"
+    )
+
+    # Create optional Gelu node to test Gelu approximation update
+    gelu_node = helper.make_node(
+        "Gelu", inputs=["output"], outputs=["gelu_output"], name="gelu", approximate="none"
+    )
+
+    graph = helper.make_graph(
+        nodes=[scale_constant, dq_node, matmul_node, gelu_node],
+        name="test_graph",
+        inputs=[input_tensor],
+        outputs=[helper.make_tensor_value_info("gelu_output", TensorProto.FLOAT, [4, 64])],
+        initializer=[weight_tensor],
+    )
+
+    model = helper.make_model(graph)
+    return model
+
+
+def create_test_model_with_nvfp4_qdq(with_transpose: bool = False):
+    """Create a test ONNX model with TRT_FP4QDQ nodes for testing NVFP4.
+
+    Args:
+        with_transpose: If True, adds a Transpose node between TRT_FP4QDQ and MatMul.
+    """
+    if with_transpose:
+        # For transpose case, weight shape is (32, 64) to match transpose output
+        weight_data = np.random.uniform(-1.0, 1.0, size=(32, 64)).astype(np.float32)
+        fp4qdq_output_shape = [32, 64]
+        transpose_output_shape = [64, 32]
+    else:
+        # For non-transpose case, weight shape is (64, 32) (FP16 for testing BFloat16 detection)
+        weight_data = np.random.uniform(-1.0, 1.0, size=(64, 32)).astype(np.float16)
+        fp4qdq_output_shape = [64, 32]
+        transpose_output_shape = None
+
+    weight_tensor = numpy_helper.from_array(weight_data, "linear.weight")
+
+    # Create input tensor
+    input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT, [4, 32])
+
+    # Create TRT_FP4QDQ node with correct block_size=16 for NVFP4
+    fp4qdq_node = helper.make_node(
+        "TRT_FP4QDQ",
+        inputs=["linear.weight"],
+        outputs=["fp4qdq_output"],
+        name="weight_fp4qdq",
+        block_size=16,
+    )
+
+    nodes = [fp4qdq_node]
+    value_info = []
+
+    # Create value info for fp4qdq output
+    fp4qdq_output_dtype = TensorProto.FLOAT16 if not with_transpose else TensorProto.FLOAT
+    fp4qdq_output_info = helper.make_tensor_value_info(
+        "fp4qdq_output", fp4qdq_output_dtype, fp4qdq_output_shape
+    )
+    value_info.append(fp4qdq_output_info)
+
+    if with_transpose:
+        # Create Transpose node
+        transpose_node = helper.make_node(
+            "Transpose",
+            inputs=["fp4qdq_output"],
+            outputs=["transpose_output"],
+            name="transpose",
+            perm=[1, 0],
+        )
+        nodes.append(transpose_node)
+
+        # Create value info for transpose output
+        transpose_output_info = helper.make_tensor_value_info(
+            "transpose_output", TensorProto.FLOAT, transpose_output_shape
+        )
+        value_info.append(transpose_output_info)
+
+        # MatMul uses transpose output
+        matmul_input = "transpose_output"
+    else:
+        # MatMul uses fp4qdq output directly
+        matmul_input = "fp4qdq_output"
+
+    # Create MatMul node
+    matmul_node = helper.make_node(
+        "MatMul", inputs=["input", matmul_input], outputs=["output"], name="matmul"
+    )
+    nodes.append(matmul_node)
+
+    graph = helper.make_graph(
+        nodes=nodes,
+        name="test_graph",
+        inputs=[input_tensor],
+        outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, [4, 64])],
+        initializer=[weight_tensor],
+        value_info=value_info,
+    )
+
+    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 20)])
+
+
+class TestQuantizeWeightsToInt4:
+    """Test suite for quantize_weights_to_int4 function."""
+
+    def test_basic_quantization_with_reshape_transpose(self):
+        """Test basic INT4 quantization with Reshape and Transpose removal."""
+        model = create_test_model_with_int4_dq_reshape_transpose_matmul()
+
+        # Run quantization
+        quantized_model = INT4QuantExporter.process_model(model)
+
+        # Verify weight is converted to INT4
+        weight_tensor = next(
+            init for init in quantized_model.graph.initializer if init.name == "weight"
+        )
+        assert weight_tensor.data_type == TensorProto.INT4
+
+        # Verify Reshape and Transpose nodes are removed
+        node_types = [node.op_type for node in quantized_model.graph.node]
+        assert "Reshape" not in node_types
+        assert "Transpose" not in node_types
+
+        # Verify MatMul input is connected directly to DequantizeLinear output
+        matmul_node = next(node for node in quantized_model.graph.node if node.op_type == "MatMul")
+        dq_node = next(
+            node for node in quantized_model.graph.node if node.op_type == "DequantizeLinear"
+        )
+        assert matmul_node.input[1] == dq_node.output[0]
+
+    def test_quantization_with_constant_scale(self):
+        """Test quantization when scale comes from a Constant node."""
+        model = create_test_model_with_int4_dq_reshape_transpose_matmul(constant_scale=True)
+
+        # Run quantization
+        quantized_model = INT4QuantExporter.process_model(model)
+
+        # Verify Constant node is removed
+        constant_nodes = [node for node in quantized_model.graph.node if node.op_type == "Constant"]
+        assert len(constant_nodes) == 0
+
+        # Verify new scale initializer is created
+        scale_initializers = [
+            init for init in quantized_model.graph.initializer if "scale" in init.name
+        ]
+        assert len(scale_initializers) > 0
+
+        # Verify DequantizeLinear references the new scale
+        dq_node = next(
+            node for node in quantized_model.graph.node if node.op_type == "DequantizeLinear"
+        )
+        assert any("scale" in input_name for input_name in dq_node.input)
+
+    def test_projection_bias_and_scale_casting(self):
+        """Test that projection biases and quantization scales are cast to float16."""
+        model = create_test_model_with_proj_nodes()
+
+        # Run quantization
+        quantized_model = INT4QuantExporter.process_model(model)
+
+        # Verify bias tensor is cast to float16
+        bias_tensor = next(
+            init for init in quantized_model.graph.initializer if "proj_bias" in init.name
+        )
+        assert bias_tensor.data_type == TensorProto.FLOAT16
+
+        # Verify quantization scale is cast to float16
+        scale_tensor = next(
+            init for init in quantized_model.graph.initializer if "quant_scale" in init.name
+        )
+        assert scale_tensor.data_type == TensorProto.FLOAT16
+
+
+class TestCastFunctions:
+    """Test suite for _cast_fp8 and _cast_fp4 functions."""
+
+    @pytest.mark.parametrize(
+        ("input_array", "expected_array"),
+        [
+            (
+                np.array([1.0, 0.5, 2.0], dtype=np.float32),
+                np.array([56, 48, 64], dtype=(np.uint8, [("e4m3fn", "u1")])),
+            ),
+            (
+                np.array([-1.0, -0.5, -2.0], dtype=np.float32),
+                np.array([184, 176, 192], dtype=(np.uint8, [("e4m3fn", "u1")])),
+            ),
+            (
+                np.array([0.0, -0.0], dtype=np.float32),
+                np.array([0, 128], dtype=(np.uint8, [("e4m3fn", "u1")])),
+            ),
+            (
+                np.array([1e10, -1e10, 1e-10, -1e-10], dtype=np.float32),
+                np.array([126, 254, 0, 128], dtype=(np.uint8, [("e4m3fn", "u1")])),
+            ),
+        ],
+    )
+    def test_cast_fp8(self, input_array, expected_array):
+        """Test FP8 casting functionality."""
+        result = _cast_fp8(input_array)
+        assert result.dtype == np.dtype((np.uint8, [("e4m3fn", "u1")]))
+        assert result.shape == expected_array.shape
+        assert np.all(result == expected_array)
+
+    @pytest.mark.parametrize(
+        ("input_array", "expected_array"),
+        [
+            # Basic positive values
+            (
+                np.array([[0.0, 0.5], [1.0, 1.5]], dtype=np.float32),
+                np.array([[16, 50]], dtype=np.uint8),
+            ),
+            # Basic negative values
+            (
+                np.array([[-0.5, -1.0], [-1.5, 1.75]], dtype=np.float32),
+                np.array([[169, 75]], dtype=np.uint8),
+            ),
+            # Boundary values with rounding
+            (
+                np.array([[0.0, 0.75], [1.75, 3.5]], dtype=np.float32),
+                np.array([[32, 100]], dtype=np.uint8),
+            ),
+            # Large values (saturate to max)
+            (
+                np.array([[10.0], [-10.0]], dtype=np.float32),
+                np.array([[247]], dtype=np.uint8),
+            ),
+            # Very small values (map to zero)
+            (
+                np.array([[0.1], [-0.1]], dtype=np.float32),
+                np.array([[128]], dtype=np.uint8),
+            ),
+            # Zero and negative zero
+            (
+                np.array([[0.0], [-0.0]], dtype=np.float32),
+                np.array([[0]], dtype=np.uint8),
+            ),
+        ],
+    )
+    def test_cast_fp4(self, input_array, expected_array):
+        """Test FP4 casting functionality."""
+        result = _cast_fp4(input_array)
+        assert result.dtype == np.dtype(np.uint8)
+        assert result.shape == expected_array.shape
+        assert np.all(result == expected_array)
+
+
+class TestFP8QuantExporter:
+    """Test suite for FP8QuantExporter."""
+
+    def test_bf16_weights_and_scale_are_compressed(self):
+        weight_data = np.array([0.001312255859375], dtype=ml_dtypes.bfloat16)
+        scale_data = np.array(0.00099945068359375, dtype=ml_dtypes.bfloat16)
+        weight = gs.Constant("weight", weight_data)
+        scale = gs.Constant("linear/weight_quantizer/scale", scale_data)
+        quantized = gs.Variable("quantized", dtype=np.uint8, shape=weight_data.shape)
+        dequantized = gs.Variable(
+            "dequantized", dtype=TensorProto.BFLOAT16, shape=weight_data.shape
+        )
+        value_info = _export_value_info_proto(dequantized, do_type_check=True)
+        assert value_info.type.tensor_type.elem_type == TensorProto.BFLOAT16
+        graph = gs.Graph(
+            nodes=[
+                gs.Node(
+                    op="TRT_FP8QuantizeLinear",
+                    inputs=[weight, scale],
+                    outputs=[quantized],
+                ),
+                gs.Node(
+                    op="TRT_FP8DequantizeLinear",
+                    inputs=[quantized, scale],
+                    outputs=[dequantized],
+                ),
+            ],
+            outputs=[dequantized],
+            opset=23,
+        )
+
+        converted_model = FP8QuantExporter.compress_weights(gs.export_onnx(graph))
+
+        onnx.checker.check_model(converted_model)
+        assert [node.op_type for node in converted_model.graph.node] == ["DequantizeLinear"]
+        assert converted_model.graph.output[0].type.tensor_type.elem_type == TensorProto.BFLOAT16
+        fp8_weight = next(
+            initializer
+            for initializer in converted_model.graph.initializer
+            if initializer.name == "linear/weight_quantizer/fp8_weights"
+        )
+        assert fp8_weight.data_type == TensorProto.FLOAT8E4M3FN
+        assert fp8_weight.raw_data == b"\x3b"
+        output_scale = next(
+            initializer
+            for initializer in converted_model.graph.initializer
+            if initializer.name == scale.name
+        )
+        assert output_scale.data_type == TensorProto.BFLOAT16
+
+
+class TestMXFP8QuantExporter:
+    """Test suite for MXFP8QuantExporter."""
+
+    def test_basic_mxfp8_quantization(self):
+        """Test basic MXFP8 quantization with TRT_MXFP8DequantizeLinear nodes."""
+        model = create_test_model_with_mxfp8_dq()
+
+        # Run MXFP8 quantization
+        quantized_model = MXFP8QuantExporter.process_model(model)
+
+        # Verify weight is converted to FP8
+        weight_tensor = next(
+            init for init in quantized_model.graph.initializer if init.name == "linear.weight"
+        )
+        assert weight_tensor.data_type == TensorProto.FLOAT8E4M3FN
+
+        # Verify scale tensor is created and is uint8
+        scale_tensors = [init for init in quantized_model.graph.initializer if "scale" in init.name]
+        assert len(scale_tensors) > 0
+        scale_tensor = scale_tensors[0]
+        assert scale_tensor.data_type == TensorProto.UINT8
+
+        # Verify Constant node is removed
+        constant_nodes = [node for node in quantized_model.graph.node if node.op_type == "Constant"]
+        assert len(constant_nodes) == 0
+
+        # Verify DQ node references the new scale
+        dq_node = next(
+            node
+            for node in quantized_model.graph.node
+            if node.op_type == "TRT_MXFP8DequantizeLinear"
+        )
+        assert any("scale" in input_name for input_name in dq_node.input)
+
+    def test_mxfp8_output_dtype_update(self):
+        """Test that output_dtype attribute is updated to FP16."""
+        model = create_test_model_with_mxfp8_dq()
+
+        # Run MXFP8 quantization
+        quantized_model = MXFP8QuantExporter.process_model(model)
+
+        # Verify output_dtype is set to FP16
+        dq_node = next(
+            node
+            for node in quantized_model.graph.node
+            if node.op_type == "TRT_MXFP8DequantizeLinear"
+        )
+        output_dtype_attr = next(attr for attr in dq_node.attribute if attr.name == "output_dtype")
+        assert output_dtype_attr.i == TensorProto.FLOAT16
+
+    def test_mxfp8_gelu_approximation_update(self):
+        """Test that Gelu nodes are updated to use tanh approximation."""
+        model = create_test_model_with_mxfp8_dq()
+
+        # Run MXFP8 quantization
+        quantized_model = MXFP8QuantExporter.process_model(model)
+
+        # Verify Gelu approximation is set to tanh
+        gelu_node = next(node for node in quantized_model.graph.node if node.op_type == "Gelu")
+        approximate_attr = next(attr for attr in gelu_node.attribute if attr.name == "approximate")
+        assert approximate_attr.s == b"tanh"
+
+    def test_mxfp8_with_missing_attributes(self):
+        """Test MXFP8 quantization with missing axis and block_size attributes."""
+        # Create a model without axis and block_size attributes
+        weight_data = np.random.uniform(-1.0, 1.0, size=(64, 32)).astype(np.float32)
+        weight_tensor = numpy_helper.from_array(weight_data, "linear.weight")
+
+        input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT, [4, 32])
+
+        scale_data = np.random.uniform(0.1, 1.0, size=(2, 1)).astype(np.float32)
+        scale_constant = helper.make_node(
+            "Constant",
+            inputs=[],
+            outputs=["Constant_output_0"],
+            value=numpy_helper.from_array(scale_data),
+            name="scale_constant",
+        )
+
+        # Create TRT_MXFP8DequantizeLinear node without axis and block_size
+        dq_node = helper.make_node(
+            "TRT_MXFP8DequantizeLinear",
+            inputs=["linear.weight", "Constant_output_0"],
+            outputs=["dq_output"],
+            name="weight_dq",
+            output_dtype=TensorProto.FLOAT,
+        )
+
+        matmul_node = helper.make_node(
+            "MatMul", inputs=["input", "dq_output"], outputs=["output"], name="matmul"
+        )
+
+        graph = helper.make_graph(
+            nodes=[scale_constant, dq_node, matmul_node],
+            name="test_graph",
+            inputs=[input_tensor],
+            outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, [4, 64])],
+            initializer=[weight_tensor],
+        )
+
+        model = helper.make_model(graph)
+
+        # Run MXFP8 quantization (should use default values)
+        quantized_model = MXFP8QuantExporter.process_model(model)
+
+        # Verify the model is still processed correctly
+        weight_tensor = next(
+            init for init in quantized_model.graph.initializer if init.name == "linear.weight"
+        )
+        assert weight_tensor.data_type == TensorProto.FLOAT8E4M3FN
+
+
+class TestFP4QDQTo2DQ:
+    """Test suite for NVFP4QuantExporter."""
+
+    @pytest.mark.parametrize("with_transpose", [False, True])
+    def test_fp4qdq_conversion(self, with_transpose):
+        """Test FP4QDQ to 2DQ conversion with and without Transpose node."""
+        model = create_test_model_with_nvfp4_qdq(with_transpose=with_transpose)
+
+        # Run FP4QDQ to 2DQ conversion
+        converted_model = NVFP4QuantExporter.process_model(model)
+
+        assert get_opset_version(converted_model) == 23
+
+        # Verify TRT_FP4QDQ node is removed
+        fp4qdq_nodes = [node for node in converted_model.graph.node if node.op_type == "TRT_FP4QDQ"]
+        assert len(fp4qdq_nodes) == 0
+
+        # Verify two DequantizeLinear nodes are created
+        dq_nodes = [
+            node for node in converted_model.graph.node if node.op_type == "DequantizeLinear"
+        ]
+        assert len(dq_nodes) == 2
+
+        # Verify new initializers are created
+        initializer_names = {init.name for init in converted_model.graph.initializer}
+        assert "linear.weight_f4" in initializer_names
+        assert "linear.weight_f8_scale" in initializer_names
+        assert "linear.weight_f8_scale_f32_scale" in initializer_names
+
+        # Verify original weight initializer is removed
+        assert "linear.weight" not in initializer_names
+
+        # Verify FP4 weight tensor has correct data type
+        fp4_weight = next(
+            init for init in converted_model.graph.initializer if init.name == "linear.weight_f4"
+        )
+        assert fp4_weight.data_type == TensorProto.FLOAT4E2M1
+
+        # Verify FP8 scale tensor has correct data type
+        fp8_scale = next(
+            init
+            for init in converted_model.graph.initializer
+            if init.name == "linear.weight_f8_scale"
+        )
+        assert fp8_scale.data_type == TensorProto.FLOAT8E4M3FN
+
+        # Additional verification for transpose case
+        if with_transpose:
+            # Verify Cast nodes are added for input type conversion
+            cast_nodes = [node for node in converted_model.graph.node if node.op_type == "Cast"]
+            assert len(cast_nodes) >= 1  # At least one cast node should be added
+
+
+def create_test_model_with_int4_dq_matmul():
+    """Create a simple test model with INT4 DequantizeLinear -> MatMul pattern.
+
+    Returns the model and original weight/scale arrays for verification.
+    """
+    # Create INT4 quantized weight tensor (K=32, N=16)
+    # Using int8 storage for INT4 values in range [-8, 7]
+    weight_data = np.random.randint(-8, 8, size=(32, 16), dtype=np.int8)
+
+    # Pack INT4 data (2 values per byte) for ORT compatibility
+    packed_weight = pack_float32_to_4bit_cpp_based(weight_data, signed=True).astype(np.int8)
+    weight_tensor = helper.make_tensor(
+        "weight",
+        TensorProto.INT4,
+        dims=weight_data.shape,
+        vals=packed_weight.tobytes(),
+        raw=True,
+    )
+
+    # Create scale tensor for block quantization (block_size=32, so 1 scale per column)
+    scale_data = np.random.uniform(0.1, 1.0, size=(1, 16)).astype(np.float16)
+    scale_tensor = numpy_helper.from_array(scale_data, "scale")
+
+    # Create input tensor for MatMul (batch=4, K=32)
+    input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT16, [4, 32])
+
+    # Create DequantizeLinear node with INT4 blocked quantization
+    dq_node = helper.make_node(
+        "DequantizeLinear",
+        inputs=["weight", "scale"],
+        outputs=["dq_output"],
+        name="weight_dq",
+        axis=0,
+        block_size=32,
+    )
+
+    # Create MatMul node: input (4, 32) @ weight (32, 16) -> output (4, 16)
+    matmul_node = helper.make_node(
+        "MatMul",
+        inputs=["input", "dq_output"],
+        outputs=["output"],
+        name="matmul",
+    )
+
+    graph = helper.make_graph(
+        nodes=[dq_node, matmul_node],
+        name="test_graph",
+        inputs=[input_tensor],
+        outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT16, [4, 16])],
+        initializer=[weight_tensor, scale_tensor],
+    )
+
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10  # ORT only supports IR version up to 10
+    return model, weight_data, scale_data
+
+
+class TestColumnMajorTransformation:
+    """Test suite for column-major storage transformation functions."""
+
+    def test_column_major_transformation_graph_structure(self):
+        """Test that column-major transformation produces correct graph structure.
+
+        Verifies: DQ(W) -> MatMul becomes DQ(W^T) -> Transpose -> MatMul
+        """
+        model, original_weight, original_scale = create_test_model_with_int4_dq_matmul()
+
+        # Get weights and scales as dicts (simulating what int4.py does)
+        weights_dict = {"weight": original_weight.copy()}
+        scales_dict = {"scale": original_scale.copy()}
+
+        # Apply column-major transformation (transposes in-place)
+        apply_column_major_transformation(weights_dict, scales_dict)
+
+        # Verify weights and scales are transposed
+        assert weights_dict["weight"].shape == (16, 32), (
+            f"Expected transposed weight shape (16, 32), got {weights_dict['weight'].shape}"
+        )
+        assert scales_dict["scale"].shape == (16, 1), (
+            f"Expected transposed scale shape (16, 1), got {scales_dict['scale'].shape}"
+        )
+
+        # Verify the transposed values match
+        assert np.array_equal(weights_dict["weight"], original_weight.T)
+        assert np.array_equal(scales_dict["scale"], original_scale.T)
+
+        # Now test insert_transpose_nodes_for_column_major on a graph
+        # Create a fresh model and apply the full transformation
+        model2, _, _ = create_test_model_with_int4_dq_matmul()
+        graph2 = gs.import_onnx(model2)
+
+        # Add transpose nodes for column-major
+        insert_transpose_nodes_for_column_major(graph2)
+
+        # Export and verify structure
+        transformed_model = gs.export_onnx(graph2)
+
+        # Check that Transpose node was added
+        node_types = [node.op_type for node in transformed_model.graph.node]
+        assert "Transpose" in node_types, "Transpose node should be added after DQ"
+        assert "DequantizeLinear" in node_types
+        assert "MatMul" in node_types
+
+        # Verify the order: DQ -> Transpose -> MatMul
+        dq_node = next(n for n in transformed_model.graph.node if n.op_type == "DequantizeLinear")
+        transpose_node = next(n for n in transformed_model.graph.node if n.op_type == "Transpose")
+        matmul_node = next(n for n in transformed_model.graph.node if n.op_type == "MatMul")
+
+        # DQ output should be Transpose input
+        assert dq_node.output[0] == transpose_node.input[0], "DQ output should feed into Transpose"
+        # Transpose output should be MatMul weight input
+        assert transpose_node.output[0] == matmul_node.input[1], (
+            "Transpose output should feed into MatMul"
+        )
+
+        # Verify transpose permutation is [1, 0]
+        perm_attr = next((a for a in transpose_node.attribute if a.name == "perm"), None)
+        assert perm_attr is not None, "Transpose should have perm attribute"
+        assert list(perm_attr.ints) == [1, 0], "Transpose perm should be [1, 0]"
+
+    def test_column_major_transformation_output_equivalence(self):
+        """Test that column-major transformed graph produces equivalent output.
+
+        Creates two graphs:
+        1. Original: DQ(W) -> MatMul
+        2. Transformed: DQ(W^T) -> Transpose -> MatMul
+
+        Verifies both produce the same output for the same input.
+        """
+        # Create original model
+        original_model, original_weight, original_scale = create_test_model_with_int4_dq_matmul()
+
+        # Create input data
+        input_data = np.random.randn(4, 32).astype(np.float16)
+
+        # Run original model
+        # Compare the graph rewrites without version-dependent ORT quantization fusions.
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        original_session = ort.InferenceSession(
+            original_model.SerializeToString(), sess_options=options
+        )
+        original_output = original_session.run(None, {"input": input_data})[0]
+
+        # Create transformed model
+        # We need to manually create a model with transposed weights
+        transposed_weight = original_weight.T.copy()  # Shape: (16, 32)
+        transposed_scale = original_scale.T.copy()  # Shape: (16, 1)
+
+        # Pack INT4 data (2 values per byte) for ORT compatibility
+        packed_transposed_weight = pack_float32_to_4bit_cpp_based(
+            transposed_weight, signed=True
+        ).astype(np.int8)
+        weight_tensor = helper.make_tensor(
+            "weight",
+            TensorProto.INT4,
+            dims=transposed_weight.shape,
+            vals=packed_transposed_weight.tobytes(),
+            raw=True,
+        )
+        scale_tensor = numpy_helper.from_array(transposed_scale, "scale")
+
+        input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT16, [4, 32])
+
+        # DQ node with axis=1 for column-major (transposed weight)
+        dq_node = helper.make_node(
+            "DequantizeLinear",
+            inputs=["weight", "scale"],
+            outputs=["dq_output"],
+            name="weight_dq",
+            axis=1,
+            block_size=32,
+        )
+
+        # Transpose node to convert back: (16, 32) -> (32, 16)
+        transpose_node = helper.make_node(
+            "Transpose",
+            inputs=["dq_output"],
+            outputs=["transpose_output"],
+            name="transpose_back",
+            perm=[1, 0],
+        )
+
+        # MatMul: input (4, 32) @ transposed_back (32, 16) -> output (4, 16)
+        matmul_node = helper.make_node(
+            "MatMul",
+            inputs=["input", "transpose_output"],
+            outputs=["output"],
+            name="matmul",
+        )
+
+        transformed_graph = helper.make_graph(
+            nodes=[dq_node, transpose_node, matmul_node],
+            name="test_graph",
+            inputs=[input_tensor],
+            outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT16, [4, 16])],
+            initializer=[weight_tensor, scale_tensor],
+        )
+
+        transformed_model = helper.make_model(
+            transformed_graph, opset_imports=[helper.make_opsetid("", 21)]
+        )
+        transformed_model.ir_version = 10  # ORT only supports IR version up to 10
+
+        # Run transformed model
+        transformed_session = ort.InferenceSession(
+            transformed_model.SerializeToString(), sess_options=options
+        )
+        transformed_output = transformed_session.run(None, {"input": input_data})[0]
+
+        # Print output values for visibility
+        print(f"Original model output shape: {original_output.shape}")
+        print(f"Transformed model output shape: {transformed_output.shape}")
+        print(f"Original output (first 5): {original_output.flatten()[:5]}")
+        print(f"Transformed output (first 5): {transformed_output.flatten()[:5]}")
+
+        # Verify outputs are equivalent (allowing small numerical tolerance)
+        assert original_output.shape == transformed_output.shape, (
+            f"Output shapes should match: {original_output.shape} vs {transformed_output.shape}"
+        )
+        np.testing.assert_allclose(
+            original_output,
+            transformed_output,
+            rtol=1e-3,
+            atol=1e-3,
+            err_msg="Column-major transformed model should produce equivalent output",
+        )
+
+    def test_column_major_gemm_trans_b_flip(self):
+        """Test that Gemm with transB=1 gets flipped to transB=0 for column-major.
+
+        When weights are already transposed (column-major), Gemm nodes with transB=1
+        should have transB flipped to 0 instead of inserting a Transpose node.
+        Also verifies output equivalence between original and transformed models.
+        """
+
+        # Original model: weight (N=16, K=32) with Gemm transB=1
+        # Gemm computes: A @ B^T = (4, 32) @ (16, 32)^T = (4, 16)
+        weight_data = np.random.randint(-8, 8, size=(16, 32), dtype=np.int8)  # Shape (N, K)
+        scale_data = np.random.uniform(0.1, 1.0, size=(16, 1)).astype(np.float16)
+
+        # Pack INT4 data for original model
+        packed_weight = pack_float32_to_4bit_cpp_based(weight_data, signed=True).astype(np.int8)
+        weight_tensor = helper.make_tensor(
+            "weight",
+            TensorProto.INT4,
+            dims=weight_data.shape,
+            vals=packed_weight.tobytes(),
+            raw=True,
+        )
+        scale_tensor = numpy_helper.from_array(scale_data, "scale")
+
+        input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT16, [4, 32])
+
+        dq_node = helper.make_node(
+            "DequantizeLinear",
+            inputs=["weight", "scale"],
+            outputs=["dq_output"],
+            name="weight_dq",
+            axis=1,
+            block_size=32,
+        )
+
+        gemm_node = helper.make_node(
+            "Gemm",
+            inputs=["input", "dq_output"],
+            outputs=["output"],
+            name="gemm",
+            transB=1,
+        )
+
+        graph = helper.make_graph(
+            nodes=[dq_node, gemm_node],
+            name="test_graph",
+            inputs=[input_tensor],
+            outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT16, [4, 16])],
+            initializer=[weight_tensor, scale_tensor],
+        )
+
+        original_model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+        original_model.ir_version = 10
+
+        # Run original model
+        input_data = np.random.randn(4, 32).astype(np.float16)
+        # Compare the graph rewrites without version-dependent ORT quantization fusions.
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        original_session = ort.InferenceSession(
+            original_model.SerializeToString(), sess_options=options
+        )
+        original_output = original_session.run(None, {"input": input_data})[0]
+
+        # Apply column-major transformation using the actual functions
+        weights_dict = {"weight": weight_data.copy()}
+        scales_dict = {"scale": scale_data.copy()}
+        apply_column_major_transformation(weights_dict, scales_dict)
+
+        # Build transformed model with transposed weights/scales
+        transposed_weight = weights_dict["weight"]  # Now (32, 16)
+        transposed_scale = scales_dict["scale"]  # Now (1, 16)
+
+        packed_transposed = pack_float32_to_4bit_cpp_based(transposed_weight, signed=True).astype(
+            np.int8
+        )
+        transposed_weight_tensor = helper.make_tensor(
+            "weight",
+            TensorProto.INT4,
+            dims=transposed_weight.shape,
+            vals=packed_transposed.tobytes(),
+            raw=True,
+        )
+        transposed_scale_tensor = numpy_helper.from_array(transposed_scale, "scale")
+
+        # Build model with transposed weights but keep transB=1 initially
+        dq_node_col = helper.make_node(
+            "DequantizeLinear",
+            inputs=["weight", "scale"],
+            outputs=["dq_output"],
+            name="weight_dq",
+            axis=0,
+            block_size=32,
+        )
+
+        gemm_node_col = helper.make_node(
+            "Gemm",
+            inputs=["input", "dq_output"],
+            outputs=["output"],
+            name="gemm",
+            transB=1,  # Still transB=1, will be flipped by insert_transpose_nodes_for_column_major
+        )
+
+        col_graph = helper.make_graph(
+            nodes=[dq_node_col, gemm_node_col],
+            name="test_graph",
+            inputs=[input_tensor],
+            outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT16, [4, 16])],
+            initializer=[transposed_weight_tensor, transposed_scale_tensor],
+        )
+
+        col_model = helper.make_model(col_graph, opset_imports=[helper.make_opsetid("", 21)])
+        col_model.ir_version = 10
+
+        # Apply insert_transpose_nodes_for_column_major to flip transB
+        gs_graph = gs.import_onnx(col_model)
+        insert_transpose_nodes_for_column_major(gs_graph)
+        transformed_model = gs.export_onnx(gs_graph)
+        transformed_model.ir_version = 10  # ORT only supports IR version up to 10
+
+        # Verify transB was flipped to 0
+        gemm_nodes = [n for n in transformed_model.graph.node if n.op_type == "Gemm"]
+        assert len(gemm_nodes) == 1
+        trans_b_attr = next((a for a in gemm_nodes[0].attribute if a.name == "transB"), None)
+        trans_b_value = trans_b_attr.i if trans_b_attr else 0
+        assert trans_b_value == 0, f"transB should be 0, got {trans_b_value}"
+
+        # Verify no Transpose node was added
+        transpose_nodes = [n for n in transformed_model.graph.node if n.op_type == "Transpose"]
+        assert len(transpose_nodes) == 0, (
+            f"No Transpose should be added, found {len(transpose_nodes)}"
+        )
+
+        # Run transformed model and verify output equivalence
+        transformed_session = ort.InferenceSession(
+            transformed_model.SerializeToString(), sess_options=options
+        )
+        transformed_output = transformed_session.run(None, {"input": input_data})[0]
+
+        print(f"Original model output shape: {original_output.shape}")
+        print(f"Transformed model output shape: {transformed_output.shape}")
+        print(f"Original output (first 5): {original_output.flatten()[:5]}")
+        print(f"Transformed output (first 5): {transformed_output.flatten()[:5]}")
+
+        np.testing.assert_allclose(
+            original_output,
+            transformed_output,
+            rtol=1e-3,
+            atol=1e-3,
+            err_msg="Gemm transB flip should produce equivalent output",
+        )
+
+        print(f"transB flipped: 1 -> {trans_b_value}")
+        print(f"Transpose nodes: {len(transpose_nodes)}")
+
+
+def _build_model_with_zero_scale_initializer(dq_op_type: str):
+    """Build an ONNX model whose scale initializer feeds a (Quantize|Dequantize)Linear node.
+
+    Mirrors the INT4_AWQ failure mode from NVBug 6110209: scales live in graph initializers
+    (not Constant nodes) and feed DequantizeLinear (default or trt:: domain) consumers.
+    """
+    weight_data = np.random.randint(-8, 8, size=(6, 8), dtype=np.int8)
+    weight_tensor = numpy_helper.from_array(weight_data, "weight")
+
+    scale_data = np.array([1e-3, 0.0, 5e-4, 0.0, 0.0, 2e-3], dtype=np.float16).reshape(6, 1)
+    scale_tensor = numpy_helper.from_array(scale_data, "scale")
+
+    input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT16, [None, 6])
+    dq_node = helper.make_node(
+        dq_op_type, inputs=["weight", "scale"], outputs=["dq_output"], name="weight_dq"
+    )
+    matmul_node = helper.make_node(
+        "MatMul", inputs=["input", "dq_output"], outputs=["output"], name="matmul"
+    )
+    graph = helper.make_graph(
+        nodes=[dq_node, matmul_node],
+        name="test_graph",
+        inputs=[input_tensor],
+        outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT16, [None, 8])],
+        initializer=[weight_tensor, scale_tensor],
+    )
+    return helper.make_model(graph)
+
+
+class TestReplaceZeroScaleWithSmallestNonzero:
+    """Regression tests for ``replace_zero_scale_with_smallest_nonzero`` (NVBug 6110209)."""
+
+    @pytest.mark.parametrize("dq_op_type", ["DequantizeLinear", "TRT_INT4DequantizeLinear"])
+    def test_zero_scale_initializer_fed_to_dq_is_patched(self, dq_op_type):
+        model = _build_model_with_zero_scale_initializer(dq_op_type)
+        scale_before = numpy_helper.to_array(
+            next(init for init in model.graph.initializer if init.name == "scale")
+        )
+        assert (scale_before == 0).any(), "fixture must contain zeros to exercise the fix"
+
+        patched = replace_zero_scale_with_smallest_nonzero(model)
+
+        scale_after_init = next(init for init in patched.graph.initializer if init.name == "scale")
+        scale_after = numpy_helper.to_array(scale_after_init)
+        assert not (scale_after == 0).any()
+        assert (scale_after > 0).all()
+        assert scale_after_init.data_type == TensorProto.FLOAT16
+
+    def test_constant_node_scale_path_still_patched(self):
+        """Legacy Constant-node QDQ path must continue to be patched."""
+
+        scale_data = np.array([1e-3, 0.0, 2e-3], dtype=np.float16)
+        scale_const = helper.make_node(
+            "Constant",
+            inputs=[],
+            outputs=["scale_out"],
+            value=numpy_helper.from_array(scale_data),
+            name="scale_constant",
+        )
+        input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT, [3])
+        q_node = helper.make_node(
+            "QuantizeLinear",
+            inputs=["input", "scale_out"],
+            outputs=["q_output"],
+            name="q",
+        )
+        graph = helper.make_graph(
+            nodes=[scale_const, q_node],
+            name="test_graph",
+            inputs=[input_tensor],
+            outputs=[helper.make_tensor_value_info("q_output", TensorProto.INT8, [3])],
+            initializer=[],
+        )
+        model = helper.make_model(graph)
+
+        patched = replace_zero_scale_with_smallest_nonzero(model)
+
+        const = next(n for n in patched.graph.node if n.op_type == "Constant")
+        value_attr = next(a for a in const.attribute if a.name == "value")
+        scale_arr = numpy_helper.to_array(value_attr.t)
+        assert not (scale_arr == 0).any()
+        assert (scale_arr > 0).all()
+
+
+def create_test_model_with_dq_transpose_matmul(
+    out_features: int,
+    in_features: int,
+    *,
+    perm: tuple[int, ...] | None = (1, 0),
+    q_axis: int = 0,
+    transpose: bool = True,
+    declare_axis: bool = True,
+    single_scale: bool = False,
+):
+    """Create weight[out, in] -> Q -> DQ -> Transpose -> MatMul, per-channel on the out axis.
+
+    This is how a torch ``Linear`` exports when the weight reaches MatMul transposed, as in
+    MaxViT's attention blocks. ``perm=None`` omits the attribute, which ONNX defines as
+    reversing the axes.
+    """
+    rng = np.random.RandomState(7)
+    weight = rng.randn(out_features, in_features).astype(np.float32)
+    if single_scale:
+        # One element: covers the whole weight and broadcasts, whatever the axis says.
+        scale = np.array([np.abs(weight).max() / 127.0], dtype=np.float32)
+        zero_point = np.zeros(1, dtype=np.int8)
+    else:
+        reduced = tuple(axis for axis in range(2) if axis != q_axis)
+        scale = (np.abs(weight).max(axis=reduced) / 127.0).astype(np.float32)
+        zero_point = np.zeros(weight.shape[q_axis], dtype=np.int8)
+
+    # ONNX defaults an omitted `axis` to 1, so a caller omitting it must pass q_axis=1.
+    axis_attr = {"axis": q_axis} if declare_axis else {}
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear", ["weight", "w_scale", "w_zp"], ["w_q"], name="w_q", **axis_attr
+        ),
+        helper.make_node(
+            "DequantizeLinear", ["w_q", "w_scale", "w_zp"], ["w_dq"], name="w_dq", **axis_attr
+        ),
+    ]
+    matmul_rhs = "w_dq"
+    if transpose:
+        nodes.append(
+            helper.make_node(
+                "Transpose",
+                ["w_dq"],
+                ["w_t"],
+                name="w_t",
+                **({} if perm is None else {"perm": list(perm)}),
+            )
+        )
+        matmul_rhs = "w_t"
+    nodes.append(helper.make_node("MatMul", ["input", matmul_rhs], ["output"], name="matmul"))
+
+    rows, cols = (in_features, out_features) if transpose else (out_features, in_features)
+    graph = helper.make_graph(
+        nodes=nodes,
+        name="dq_transpose_matmul",
+        inputs=[helper.make_tensor_value_info("input", TensorProto.FLOAT, [3, rows])],
+        outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, [3, cols])],
+        initializer=[
+            numpy_helper.from_array(weight, "weight"),
+            numpy_helper.from_array(scale, "w_scale"),
+            numpy_helper.from_array(zero_point, "w_zp"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    return model
+
+
+def create_test_model_with_matmul_qdq(zero_point: np.ndarray, scale: np.ndarray, weight):
+    """Create weight -> Q -> DQ -> MatMul, per-channel on the weight's output axis."""
+    graph = helper.make_graph(
+        nodes=[
+            helper.make_node(
+                "QuantizeLinear", ["weight", "w_scale", "w_zp"], ["w_q"], name="w_q", axis=1
+            ),
+            helper.make_node(
+                "DequantizeLinear", ["w_q", "w_scale", "w_zp"], ["w_dq"], name="w_dq", axis=1
+            ),
+            helper.make_node("MatMul", ["input", "w_dq"], ["output"], name="matmul"),
+        ],
+        name="matmul_qdq",
+        inputs=[helper.make_tensor_value_info("input", TensorProto.FLOAT, [4, weight.shape[0]])],
+        outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, [4, weight.shape[1]])],
+        initializer=[
+            numpy_helper.from_array(weight, "weight"),
+            numpy_helper.from_array(scale, "w_scale"),
+            numpy_helper.from_array(zero_point, "w_zp"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    return model
+
+
+class TestQdqToDqTranspose:
+    """qdq_to_dq must trace a Transpose and follow the Q/DQ pair's own quantization axis."""
+
+    # Square weights are the dangerous shape: the scale length matches either axis, so a
+    # wrong axis passes validation and silently changes the model's output.
+    @pytest.mark.parametrize(
+        ("out_features", "in_features", "q_axis", "transpose", "declare_axis"),
+        [
+            (96, 32, 0, True, True),
+            (32, 32, 0, True, True),
+            (32, 32, 0, False, True),
+            (32, 32, 1, True, True),
+            (32, 32, 1, True, False),
+        ],
+    )
+    def test_conversion_matches_qdq(
+        self, out_features, in_features, q_axis, transpose, declare_axis
+    ):
+        """The DequantizeLinear left in the graph dequantizes along its own axis."""
+        model = create_test_model_with_dq_transpose_matmul(
+            out_features,
+            in_features,
+            q_axis=q_axis,
+            transpose=transpose,
+            declare_axis=declare_axis,
+        )
+        rows = in_features if transpose else out_features
+        inputs = {"input": np.random.RandomState(11).randn(3, rows).astype(np.float32)}
+
+        def run(m):
+            return ort.InferenceSession(
+                m.SerializeToString(), providers=["CPUExecutionProvider"]
+            ).run(None, inputs)[0]
+
+        expected = run(model)
+        converted = qdq_to_dq(onnx.ModelProto.FromString(model.SerializeToString()))
+
+        assert not [n for n in converted.graph.node if n.op_type == "QuantizeLinear"]
+        weight = next(t for t in converted.graph.initializer if t.name == "weight")
+        assert weight.data_type == TensorProto.INT8
+        assert np.array_equal(run(converted), expected)
+
+    def test_dq_transpose_without_perm_is_traced(self):
+        """ONNX lets Transpose omit `perm`; the MatMul behind it must still be found."""
+        model = create_test_model_with_dq_transpose_matmul(96, 32, perm=None)
+        initializer = {t.name: numpy_helper.to_array(t) for t in model.graph.initializer}
+
+        converted = qdq_to_dq(model)
+
+        # onnxruntime cannot execute DQ -> Transpose(no perm) -> MatMul, so check the
+        # converted weight directly. The Q/DQ pair declares axis 0.
+        expected = np.clip(
+            np.round(initializer["weight"] / initializer["w_scale"][:, None]), -128, 127
+        ).astype(np.int8)
+        actual = next(t for t in converted.graph.initializer if t.name == "weight")
+        assert np.array_equal(numpy_helper.to_array(actual), expected)
+
+    def test_one_element_scale_is_not_per_axis(self):
+        """A one-element scale is broadcast over the whole weight, not indexed per axis."""
+        # A single-output-channel Conv: reading the (1,) scale as per-axis would pick the
+        # DQ's default axis 1 and reject a graph that converts fine.
+        weight = np.random.RandomState(3).randn(1, 3, 3, 3).astype(np.float32)
+        graph = helper.make_graph(
+            nodes=[
+                helper.make_node(
+                    "QuantizeLinear", ["weight", "w_scale", "w_zp"], ["w_q"], name="w_q"
+                ),
+                helper.make_node(
+                    "DequantizeLinear", ["w_q", "w_scale", "w_zp"], ["w_dq"], name="w_dq"
+                ),
+                helper.make_node(
+                    "Conv", ["input", "w_dq"], ["output"], name="conv", kernel_shape=[3, 3]
+                ),
+            ],
+            name="one_element_scale",
+            inputs=[helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])],
+            outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1, 6, 6])],
+            initializer=[
+                numpy_helper.from_array(weight, "weight"),
+                numpy_helper.from_array(
+                    np.array([np.abs(weight).max() / 127.0], np.float32), "w_scale"
+                ),
+                numpy_helper.from_array(np.array([0], np.int8), "w_zp"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+        model.ir_version = 10
+        onnx.checker.check_model(model)
+        inputs = {"input": np.random.RandomState(5).randn(1, 3, 8, 8).astype(np.float32)}
+
+        def run(m):
+            return ort.InferenceSession(
+                m.SerializeToString(), providers=["CPUExecutionProvider"]
+            ).run(None, inputs)[0]
+
+        expected = run(model)
+        converted = qdq_to_dq(onnx.ModelProto.FromString(model.SerializeToString()))
+        assert np.array_equal(run(converted), expected)
+
+    @pytest.mark.parametrize(("out_features", "in_features"), [(1, 32), (32, 1)])
+    def test_one_element_scale_broadcasts_through_transpose(self, out_features, in_features):
+        """A single scale covers the whole weight, so no axis of it has to be length 1."""
+        model = create_test_model_with_dq_transpose_matmul(
+            out_features, in_features, single_scale=True
+        )
+        inputs = {"input": np.random.RandomState(11).randn(3, in_features).astype(np.float32)}
+
+        def run(m):
+            return ort.InferenceSession(
+                m.SerializeToString(), providers=["CPUExecutionProvider"]
+            ).run(None, inputs)[0]
+
+        expected = run(model)
+        converted = qdq_to_dq(onnx.ModelProto.FromString(model.SerializeToString()))
+
+        assert not [n for n in converted.graph.node if n.op_type == "QuantizeLinear"]
+        assert np.array_equal(run(converted), expected)
+
+    def test_disagreeing_qdq_axes_raise(self):
+        """Following the DQ while the Q declares another axis would change the output."""
+        model = create_test_model_with_dq_transpose_matmul(32, 32, q_axis=0, transpose=False)
+        q_node = next(node for node in model.graph.node if node.name == "w_q")
+        next(attr for attr in q_node.attribute if attr.name == "axis").i = 1
+
+        with pytest.raises(RuntimeError, match="disagrees with DequantizeLinear axis"):
+            qdq_to_dq(model)
+
+
+class TestQdqToDqWeightType:
+    """The converted weight must keep the type of the zero point the DQ node still uses."""
+
+    @pytest.mark.parametrize("unsigned", [False, True])
+    def test_converted_weight_matches_zero_point_type(self, unsigned):
+        weight = np.random.RandomState(3).randn(16, 32).astype(np.float32)
+        if unsigned:
+            # Asymmetric UINT8: the zero point is non-zero and the weight spans 0..255.
+            low, high = weight.min(axis=0), weight.max(axis=0)
+            scale = ((high - low) / 255.0).astype(np.float32)
+            zero_point = np.round(-low / scale).astype(np.uint8)
+            expected_type = TensorProto.UINT8
+        else:
+            scale = (np.abs(weight).max(axis=0) / 127.0).astype(np.float32)
+            zero_point = np.zeros(32, dtype=np.int8)
+            expected_type = TensorProto.INT8
+
+        model = create_test_model_with_matmul_qdq(zero_point, scale, weight)
+        inputs = {"input": np.random.RandomState(5).randn(4, 16).astype(np.float32)}
+
+        def run(m):
+            return ort.InferenceSession(
+                m.SerializeToString(), providers=["CPUExecutionProvider"]
+            ).run(None, inputs)[0]
+
+        expected = run(model)
+        converted = qdq_to_dq(onnx.ModelProto.FromString(model.SerializeToString()))
+
+        stored = next(t for t in converted.graph.initializer if t.name == "weight")
+        assert stored.data_type == expected_type
+        # onnx.checker does not catch a weight/zero-point type mismatch, so load it.
+        assert np.array_equal(run(converted), expected)
+
+
+class TestQdqToDqValidation:
+    """Regression tests for qdq_to_dq input validation."""
+
+    def test_quantize_linear_without_inputs_raises_value_error(self):
+        q_node = helper.make_node("QuantizeLinear", inputs=[], outputs=["q_output"], name="bad_q")
+        graph = helper.make_graph(
+            nodes=[q_node],
+            name="test_graph",
+            inputs=[],
+            outputs=[helper.make_tensor_value_info("q_output", TensorProto.INT8, [1])],
+        )
+        model = helper.make_model(graph)
+
+        with pytest.raises(ValueError, match="QuantizeLinear node bad_q has no inputs"):
+            qdq_to_dq(model)
+
+    def test_preserves_floating_weight_graph_output(self):
+        """Keep an exposed floating weight unchanged when folding its Q into an initializer."""
+        weight = np.array([[0.3, -0.6], [0.9, 1.1]], dtype=np.float32)
+        data = np.array([[2.0, -1.0]], dtype=np.float32)
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node(
+                        "QuantizeLinear", ["weight", "scale", "zero"], ["quantized"], name="q"
+                    ),
+                    helper.make_node(
+                        "DequantizeLinear",
+                        ["quantized", "scale", "zero"],
+                        ["dequantized"],
+                        name="dq",
+                    ),
+                    helper.make_node("MatMul", ["input", "dequantized"], ["output"], name="matmul"),
+                ],
+                "exposed_weight",
+                [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 2])],
+                [
+                    helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2]),
+                    helper.make_tensor_value_info("weight", TensorProto.FLOAT, [2, 2]),
+                ],
+                [
+                    numpy_helper.from_array(weight, "weight"),
+                    numpy_helper.from_array(np.array([0.25, 0.25], dtype=np.float32), "scale"),
+                    numpy_helper.from_array(np.array([0, 0], dtype=np.int8), "zero"),
+                ],
+            ),
+            opset_imports=[helper.make_opsetid("", 19)],
+            ir_version=10,
+        )
+
+        converted = qdq_to_dq(model)
+        onnx.checker.check_model(converted, full_check=True)
+        assert not any(node.op_type == "QuantizeLinear" for node in converted.graph.node)
+        # Keep this check on the graph output, independent of ORT fusion numerics.
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        options.intra_op_num_threads = 2
+        options.inter_op_num_threads = 1
+        session = ort.InferenceSession(
+            converted.SerializeToString(), sess_options=options, providers=["CPUExecutionProvider"]
+        )
+        output, exposed_weight = session.run(None, {"input": data})
+        np.testing.assert_array_equal(output, np.array([[-0.5, -2.0]], dtype=np.float32))
+        np.testing.assert_array_equal(exposed_weight, weight)
+
+
+class TestLegacyEdgeLLMShims:
+    """Smoke tests for the deprecated top-level shims kept for TensorRT-Edge-LLM 0.6.1.
+
+    These are the functions edgellm 0.6.1 imports from
+    ``modelopt.onnx.quantization.qdq_utils`` directly (not via the staged exporters).
+    Tests verify each shim runs end-to-end on the same fixtures used for the staged
+    exporters and emits a ``DeprecationWarning``.
+    """
+
+    def test_quantize_weights_to_int4_shim(self):
+        model = create_test_model_with_int4_dq_reshape_transpose_matmul()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            quantized_model = quantize_weights_to_int4(model)
+
+        assert any(
+            issubclass(w.category, DeprecationWarning)
+            and "quantize_weights_to_int4" in str(w.message)
+            for w in caught
+        )
+
+        weight_tensor = next(
+            init for init in quantized_model.graph.initializer if init.name == "weight"
+        )
+        assert weight_tensor.data_type == TensorProto.INT4
+
+        node_types = [node.op_type for node in quantized_model.graph.node]
+        assert "Reshape" not in node_types
+        assert "Transpose" not in node_types
+
+    def test_quantize_weights_to_mxfp8_shim(self):
+        model = create_test_model_with_mxfp8_dq()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            quantized_model = quantize_weights_to_mxfp8(model)
+
+        assert any(
+            issubclass(w.category, DeprecationWarning)
+            and "quantize_weights_to_mxfp8" in str(w.message)
+            for w in caught
+        )
+
+        weight_tensor = next(
+            init for init in quantized_model.graph.initializer if init.name == "linear.weight"
+        )
+        assert weight_tensor.data_type == TensorProto.FLOAT8E4M3FN
+
+        gelu_node = next(node for node in quantized_model.graph.node if node.op_type == "Gelu")
+        approximate_attr = next(attr for attr in gelu_node.attribute if attr.name == "approximate")
+        assert approximate_attr.s == b"tanh"
+
+    @pytest.mark.parametrize("with_transpose", [False, True])
+    def test_fp4qdq_to_2dq_shim(self, with_transpose):
+        model = create_test_model_with_nvfp4_qdq(with_transpose=with_transpose)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            converted_model = fp4qdq_to_2dq(model)
+
+        assert any(
+            issubclass(w.category, DeprecationWarning) and "fp4qdq_to_2dq" in str(w.message)
+            for w in caught
+        )
+
+        fp4qdq_nodes = [node for node in converted_model.graph.node if node.op_type == "TRT_FP4QDQ"]
+        assert len(fp4qdq_nodes) == 0
+
+        dq_nodes = [
+            node for node in converted_model.graph.node if node.op_type == "DequantizeLinear"
+        ]
+        assert len(dq_nodes) == 2
+
+        initializer_names = {init.name for init in converted_model.graph.initializer}
+        assert "linear.weight_f4" in initializer_names
+        assert "linear.weight_f8_scale" in initializer_names
+        assert "linear.weight_f8_scale_f32_scale" in initializer_names
+        assert "linear.weight" not in initializer_names

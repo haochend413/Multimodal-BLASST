@@ -1,0 +1,238 @@
+# modelopt-mcp
+
+MCP server exposing the ModelOpt launcher (`tools/launcher/`) as typed tools for codex / Claude Code agents.
+
+Anchor design: [OMNIML-5123](https://jirasw.nvidia.com/browse/OMNIML-5123).
+
+## What this is
+
+A thin MCP wrapper around `tools/launcher/core.py`. Agents that want to submit ModelOpt jobs — PTQ, QAT, training, evaluation — call typed tools here instead of shelling out to `uv run launch.py --yaml ...` and parsing prose output.
+
+Two executors, one tool surface:
+
+* **Docker** (local GPU) — `submit_job(yaml_path, hf_local=...)`. The launcher runs the job in a container on the local machine.
+* **Slurm** (remote cluster via SSH) — `submit_job(yaml_path, cluster_host=..., cluster_user=..., identity=...)`. The launcher tunnels in and submits via sbatch.
+
+Mode is determined by which args you pass, not by which tool you call. One tool, two backends.
+
+## Tool surface
+
+| Tool | Description |
+|---|---|
+| `list_examples` | Enumerate bundled launcher YAMLs under `tools/launcher/examples/` with model + description metadata extracted from each YAML. Discovery primitive — call this first when you don't know which YAML to launch. |
+| `verify_setup(executor, ...)` | Fail-fast probe for the named executor. Docker: `docker info` (daemon up) + `docker info --format` runtime-registry check (looks for `"nvidia"` runtime registered by the NVIDIA Container Toolkit — no image pull, daemon-fast). Slurm: `ssh -o BatchMode=yes -o ConnectTimeout=5` to the cluster login node. Returns structured failure on auth / network / daemon issues — no exception. |
+| `submit_job(yaml_path, hf_local? \| cluster_host?, ..., dry_run?, source_repo?, enable_mlflow?)` | Submit a launcher YAML. Mode resolved from mutually-exclusive args. Before launching, materializes a managed Model-Optimizer checkout at `MODELOPT_MCP_SOURCE_REF` (branch, tag, or SHA; default `main`) and initializes recursive submodules, then runs that checkout's launcher. Returns `experiment_id` (Slurm) or PID plus captured `experiment_id` when available (Docker) immediately; if Docker's short tail times out, it still returns PID with `experiment_id=None` and a persistent `stdout_log` under `$NEMORUN_HOME/.modelopt-mcp/docker-submit-logs/` for diagnostics. The actual job runs detached. Auto-runs `verify_setup` first by default (skippable). When `enable_mlflow=True`, creates an MLflow run before launch and passes standard `MLFLOW_RUN_ID` / `MLFLOW_TRACKING_URI` into the job. **Pass `dry_run=True`** to validate the YAML via `launch.py --dryrun --yes` without contacting the cluster / spawning a container / running sbatch — returns `{ok, dry_run: True, validated: bool, diagnostic?, exit_code, stdout_tail, stderr_tail, argv, source_sha, source_root}` instead of `experiment_id`. |
+| `job_status(experiment_id)` | Filesystem-based status from nemo_run's experiment dir (`_DONE`, `status_*.out`). Returns `done` / `failed` / `running` plus per-task statuses. No in-memory registry; survives MCP server restarts. |
+| `job_logs(experiment_id, task?, tail?)` | Read `log_<task>.out` from the experiment dir. Per-task filtering + optional tail to truncate. |
+| `wait_for_experiment(experiment_id, timeout_sec?, poll_interval_sec?, finalize_mlflow?, mlflow_run_id?, mlflow_tracking_uri?)` | Block until `job_status` returns `done` / `failed`, or until `timeout_sec` elapses. Single tool call replaces the agent's `while True: status; sleep` loop — saves tool-call turns and avoids overshooting the poll interval. When `finalize_mlflow=True`, fetches terminal Nemo/Slurm logs with `nemo experiment logs`, then attaches final pass/fail status and launcher logs to the MLflow run created by `submit_job(enable_mlflow=True)`. |
+| `finalize_mlflow_run(experiment_id, mlflow_run_id, mlflow_tracking_uri?)` | Fetch terminal Nemo/Slurm logs and attach final status plus launcher logs to an already-created MLflow run. Usually use `wait_for_experiment(..., finalize_mlflow=True)` instead. |
+| `provision_passwordless_ssh_dry_run(cluster_host, cluster_user, identity?)` | Operator UX helper. Inspects `~/.ssh/` and emits the exact `ssh-keygen` / `ssh-copy-id` commands the user should run to make `verify_setup(executor='slurm')` pass. No side effects — pure inspection + shell-command formatting. |
+| `read_cluster_artifact(experiment_id, path?, job_idx?)` | Pull artifact content from the remote cluster via nemo_run's tunnel primitives. With `path=None`, wraps `nemo experiment logs <id> <job_idx>` (built-in log fetch). With a `path`, uses the experiment's `Tunnel` to `cat` the file. No reinvented SSH. |
+| `open_draft_pr(target_repo, title, body, base_branch?, cwd?)` | Push the current branch and open a draft PR via `gh pr create --draft`. Validates `cwd` is a git repo before doing anything. On `gh` failure after a successful push, returns `branch_pushed=True` so the operator can retry just the PR-open step. |
+
+## Install
+
+Two paths, both **from source via uv**. No PyPI wheel — OMNIML-5123 deliberately picks `uvx`-from-git over publication overhead.
+
+### End-user install (recommended)
+
+```bash
+# Claude Code
+claude mcp add modelopt -- uvx --from \
+  "git+https://github.com/NVIDIA/Model-Optimizer.git#subdirectory=tools/mcp" \
+  modelopt-mcp
+
+# Codex
+codex mcp add modelopt -- uvx --from \
+  "git+https://github.com/NVIDIA/Model-Optimizer.git#subdirectory=tools/mcp" \
+  modelopt-mcp
+```
+
+`uvx` clones the whole repo to its cache, installs `tools/mcp/` as the entry point, and resolves the sibling `modelopt-launcher` dep via `[tool.uv.sources]` (path → `../launcher`) inside the cloned tree. That install clone is only the server runtime; job submission uses the managed source checkout described below.
+
+### Dev install (local checkout)
+
+```bash
+uv pip install -e tools/launcher    # sibling dep first
+uv pip install -e tools/mcp         # then this package
+modelopt-mcp                         # stdio server entry on PATH
+```
+
+Both packages share the launcher's `core.py` orchestrator. The dev path relies on `[tool.uv.sources]` to point `modelopt-launcher` at `../launcher`.
+
+MLflow is optional. For tracking-enabled development installs, use
+`uv pip install -e 'tools/mcp[mlflow]'`. For the Git install above, use
+`modelopt-mcp[mlflow] @ git+https://github.com/NVIDIA/Model-Optimizer.git#subdirectory=tools/mcp`
+as the `--from` value. Requesting tracking without the extra fails before submission.
+
+## Tracking ownership
+
+`enable_mlflow=True` creates an MCP-owned metric run. If CI already creates and
+finalizes its own run, leave this option disabled and supply its standard
+`MLFLOW_RUN_ID`, `MLFLOW_TRACKING_URI`, and optional `MLFLOW_EXPERIMENT_ID` to
+the launcher instead. The submitter remains responsible for finalizing that run.
+Forwarding variables alone does not create a run or publish workload metrics.
+
+The launcher also forwards the separate `PENSIEVE_MLFLOW_RUN_ID`,
+`PENSIEVE_MLFLOW_TRACKING_URI`, `PENSIEVE_MLFLOW_EXPERIMENT_ID`, and
+`PENSIEVE_LAUNCH_ID` context. These never replace standard MLflow variables or
+cause implicit run creation. If present in the MCP server environment,
+MCP-created metric runs record these references as `pensieve.*` tags. Context
+supplied only in task YAML is visible to that workload; its metric logger must
+explicitly link to the lifecycle run. Finalizing an MCP metric run does not
+finalize the externally owned lifecycle run.
+
+## Managed source checkouts
+
+`submit_job` does not rely on the uvx install clone or on the caller being inside a Model-Optimizer checkout. For each launch it resolves:
+
+1. `MODELOPT_MCP_SOURCE_REF`, if set.
+2. `main`.
+
+The ref is not a tool argument, so only the operator chooses it. Callers can still pick `source_repo`, but only the default repo or `MODELOPT_MCP_SOURCE_REPO`, and the same ref can point to different code in each.
+
+It resolves that ref against `source_repo` / `MODELOPT_MCP_SOURCE_REPO` / `https://github.com/NVIDIA/Model-Optimizer.git`, creates a cached checkout under `MODELOPT_MCP_SOURCE_CACHE` (default `$XDG_CACHE_HOME/modelopt-mcp/sources` or `~/.cache/modelopt-mcp/sources`), and runs:
+
+```bash
+uv run --project <source_root>/tools/launcher modelopt-launcher --yaml <resolved-yaml> ...
+```
+
+The checkout is keyed by resolved commit SHA, so multiple agents using different branches or SHAs get separate source roots. Recursive submodules are initialized in the managed checkout, so launcher packagers can include `tools/launcher/modules/...` content even when MCP was installed outside a repo checkout.
+
+Set `MODELOPT_MCP_DISABLE_MANAGED_SOURCE=1` only for local development when you deliberately want the already-installed `modelopt-launcher` entrypoint.
+
+### Why no plain `pip install` today
+
+`modelopt-mcp` and `modelopt-launcher` are not on PyPI. Plain `pip` doesn't read `[tool.uv.sources]`, so even from a local checkout, `pip install -e tools/mcp` fails to resolve the bare `modelopt-launcher` name. Stick with `uv` / `uvx` while we're git-only.
+
+To enable `pip install` later, two options:
+
+| Path | Tradeoff |
+|---|---|
+| **Publish to PyPI** — versioned wheels for both packages | Clean `pip install`, but requires release machinery + version cadence |
+| **PEP-440 direct URL** — `"modelopt-launcher @ git+...#subdirectory=tools/launcher"` | Works with pip + uv, but double-clones the repo on install |
+
+Out of scope for Phase 1.
+
+## Example workflow
+
+Agent picking a bundled example and running it on a remote cluster:
+
+```python
+# 1. Discover available YAMLs
+examples = mcp__modelopt__list_examples()
+# {"ok": True, "count": 47, "examples": [{"path": "launcher/examples/Qwen/Qwen3-8B/megatron_lm_ptq.yaml", "model": "Qwen/Qwen3-8B", ...}, ...]}
+
+# 2. Pre-flight check before submission
+mcp__modelopt__verify_setup(
+    executor="slurm",
+    cluster_host="login.cluster.example.com",
+    cluster_user="alice",
+)
+# {"ok": True, "ssh_ok": True, "whoami": "alice", "remote_hostname": "login"}
+
+# 3. Submit
+result = mcp__modelopt__submit_job(
+    yaml_path="launcher/examples/Qwen/Qwen3-8B/megatron_lm_ptq.yaml",
+    cluster_host="login.cluster.example.com",
+    cluster_user="alice",
+    identity="/home/alice/.ssh/id_ed25519",
+    skip_verify=True,  # we just probed
+    enable_mlflow=True,  # optional; passes MLFLOW_RUN_ID into the job
+)
+# {"ok": True, "experiment_id": "cicd_1781240000", "mlflow": {"mlflow_run_id": "..."}, ...}
+
+# 4. Poll until done and attach durable logs to MLflow
+status = mcp__modelopt__wait_for_experiment(
+    experiment_id=result["experiment_id"],
+    finalize_mlflow=True,
+    mlflow_run_id=result["mlflow"]["mlflow_run_id"],
+    mlflow_tracking_uri=result["mlflow"]["mlflow_tracking_uri"],
+)
+
+# 5. Fetch logs
+logs = mcp__modelopt__job_logs(
+    experiment_id="cicd_1781240000",
+    task="task_0",
+    tail=200,
+)
+```
+
+For local Docker execution, drop `cluster_host`/`cluster_user`/`identity` and pass `hf_local=<path>` to `submit_job` instead.
+
+## Required env vars
+
+| Var | When | Notes |
+|---|---|---|
+| `NEMORUN_HOME` | submit + status + logs | Where the launcher writes experiment artifacts. Defaults to cwd if unset. `job_status` / `job_logs` search `$NEMORUN_HOME/experiments/<id>/`. |
+| `MODELOPT_MCP_LOG` | (optional) server | Log level. Defaults to `INFO`. Logs go to stderr — stdout is the MCP wire. |
+| `MODELOPT_MCP_SKIP_GPU_CHECK` | (optional) `verify_setup(executor='docker')` | Set to skip the `docker info --format` runtime-registry check. Useful for CI hosts where the daemon is up but the NVIDIA Container Toolkit isn't installed. |
+| `MODELOPT_MCP_SOURCE_REPO` | (optional) `submit_job` | Default git repository for managed source checkouts. Defaults to `https://github.com/NVIDIA/Model-Optimizer.git`. `submit_job(source_repo=...)` accepts only this repo or the default. |
+| `MODELOPT_MCP_SOURCE_REF` | (optional) `submit_job` | Branch, tag, or SHA for managed source checkouts. Defaults to `main`. |
+| `MODELOPT_MCP_SOURCE_CACHE` | (optional) `submit_job` | Root for managed source checkouts. Defaults to `$XDG_CACHE_HOME/modelopt-mcp/sources` or `~/.cache/modelopt-mcp/sources`. |
+| `MODELOPT_MCP_DISABLE_MANAGED_SOURCE` | (optional) local dev | Set to `1` to skip managed checkout and invoke the installed `modelopt-launcher` entrypoint directly. |
+| `MODELOPT_MCP_UV` | (optional) `submit_job` | Override the `uv` binary used for `uv run --project <source>/tools/launcher ...`. |
+| `MODELOPT_LAUNCHER_EXAMPLES_DIR` | (optional) `list_examples` | Override the examples directory location. Defaults to `../launcher/examples/` relative to this package. |
+| `MLFLOW_TRACKING_URI` / `MODELOPT_MCP_MLFLOW_TRACKING_URI` | (optional) `submit_job(enable_mlflow=True)` | Tracking server for MCP-created runs. Defaults to `https://mlflow-modelopt.nvidia.com/`. |
+| `MODELOPT_MCP_MLFLOW_EXPERIMENT` | (optional) `submit_job(enable_mlflow=True)` | Experiment name for MCP-created runs. Defaults to `ci-tests`. |
+
+MCP-created MLflow runs default to the run name
+`<USER>/<cluster-host-or-executor>/<yaml-parent>/<yaml-stem>`. Passing
+`job_name` to `submit_job` overrides that run name.
+
+MCP-created runs remain `RUNNING` until finalization or submission failure.
+Finalization sets the native MLflow status to `FINISHED` or `FAILED` and stores
+full task logs under `logs/`. Remote-log collection is best effort; inspect
+`log_fetch.errors` for missing logs. Both log-reading tools use the resolved
+NeMo-Run metadata home. A launcher-only `local_experiments` layout is reported
+as unsupported by the NeMo-Run CLI rather than routed to an unrelated home.
+
+## Design principles
+
+Three constants drive the surface here:
+
+1. **Single `submit_job` with mode by args.** Not separate `submit_docker` / `submit_slurm` tools. The LLM tool catalog stays compact; the mutual-exclusion is a runtime check that returns structured failure when both or neither mode is specified.
+2. **Filesystem is the source of truth.** Status + logs both read from nemo_run's experiment dir. No in-memory registry — survives MCP server restarts. The bridge module never holds per-job state across calls.
+3. **`verify_setup` is auto-called by `submit_job` by default.** The probe takes ~1 second; the cost of a misconfigured submission is 30+ seconds of cluster timeout or container-pull. Always-on verification pays back immediately. Callers can pass `skip_verify=True` when they just probed.
+
+## Scope: environment tooling, not workflow policy
+
+See [SCOPE.md](SCOPE.md) for the policy that gates what belongs in this MCP family. Short version: tools here are universal verb-shaped operations on the cluster / launcher / engine (`submit_job`, `verify_setup`, `read_cluster_artifact`, …). Workflow-specific logic ("run an EAGLE3 cell", "publish a specdec release") stays in SPEC text + agent reasoning, composed out of these primitives. The policy applies to `nmm-sandbox-mcp` and `pensieve-intern-mcp` too.
+
+## Internal companion (NVIDIA only)
+
+For NVIDIA-internal users running on the in-house clusters, there's a companion server [`nmm-sandbox-mcp`](https://gitlab-master.nvidia.com/omniml/integration/nmm-sandbox/-/tree/main/tools/mcp) that adds:
+
+* `resolve_cluster_factory(name)` — turn `"cw_dfw"` into the `{cluster_host, cluster_user, identity, account, ...}` dict that `submit_job` consumes, so internal users supply 1 arg instead of 6.
+* `submit_via_gitlab_ci(...)` — alternative submission path that triggers the nmm-sandbox CI's `intern-step` pipeline. Useful when the operator doesn't have direct cluster access.
+
+Both servers are registered in the operator's `.mcp.json` side by side. The agent threads results from one into calls to the other. No Python coupling between them.
+
+## Layout
+
+```text
+tools/mcp/
+├── pyproject.toml              # name: modelopt-mcp, console_script
+├── README.md                   # ← this file
+├── modelopt_mcp/
+│   ├── __init__.py
+│   ├── server.py               # FastMCP entry; 9 tool definitions
+│   └── bridge.py               # thin wrapper over launcher's core.py
+│                               # + filesystem status/log helpers
+│                               # + tunnel/PR helpers (Phase 1.5)
+└── tests/
+    └── test_bridge.py          # 32 unit tests, fully hermetic
+                                # (mocked subprocess + tmp_path fixtures)
+```
+
+## Phase 2 & beyond
+
+Tracked under [OMNIML-5123](https://jirasw.nvidia.com/browse/OMNIML-5123) (Epic). Highlights:
+
+**Phase 1.5 — shipped in this PR:** `wait_for_experiment`, `provision_passwordless_ssh_dry_run`, `read_cluster_artifact`, `open_draft_pr`. Anchors: [OMNIML-5128](https://jirasw.nvidia.com/browse/OMNIML-5128) (partial: the three high-leverage tools), [OMNIML-5132](https://jirasw.nvidia.com/browse/OMNIML-5132) (full).
+
+**Phase 2 — shipped:** Docker `submit_job` captures `experiment_id` from launcher subprocess output by tailing a side-channel log file without blocking the detached process.
+
+**Phase 3 — NEL integration + checkpoint introspection:**
+* [OMNIML-5133](https://jirasw.nvidia.com/browse/OMNIML-5133) — `nel_submit`, `nel_status`, `nel_run_eval`, `nel_export`, `nel_compare`, `nel_gate` (wraps `nemo-evaluator-launcher`)
+* [OMNIML-5134](https://jirasw.nvidia.com/browse/OMNIML-5134) — `inspect_checkpoint`, `inspect_model`

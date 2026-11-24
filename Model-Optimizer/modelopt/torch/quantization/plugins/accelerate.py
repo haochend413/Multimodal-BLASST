@@ -1,0 +1,369 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Quantization support for accelerate modified models."""
+
+import inspect
+import os
+import warnings
+from contextlib import contextmanager
+from typing import Any
+
+import torch
+import transformers
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+from accelerate.hooks import AlignDevicesHook, SequentialHook
+from accelerate.utils import get_max_memory, infer_auto_device_map
+from accelerate.utils.dataclasses import CustomDtype
+from accelerate.utils.offload import PrefixedDataset
+
+import modelopt.torch.quantization as mtq
+
+from ..nn import TensorQuantizer
+
+__all__ = ["init_quantized_weights"]
+
+
+def _get_offload_hook(hook):
+    if isinstance(hook, AlignDevicesHook) and hook.offload and hook.weights_map is not None:
+        assert len(hook.weights_map) > 0
+        return hook
+    elif isinstance(hook, SequentialHook):
+        for h in hook.hooks:
+            align_hook = _get_offload_hook(h)
+            if align_hook is not None:
+                return align_hook
+    return None
+
+
+def _writeback_params_to_weights_map(module, align_hook):
+    """Write all non-meta parameters and buffers back to the hook's CPU weights_map."""
+    buffer_names = {name for name, _ in module.named_buffers()}
+    for name, tensor in module.state_dict(keep_vars=True).items():
+        if tensor.device.type == "meta":
+            continue
+        if isinstance(align_hook.weights_map, PrefixedDataset):
+            key = align_hook.weights_map.prefix + name
+            w_map = align_hook.weights_map.dataset.state_dict
+        else:
+            w_map = align_hook.weights_map
+            key = name
+        if key in w_map:
+            w_map[key] = tensor.detach().to(w_map[key].device, dtype=w_map[key].dtype)
+        elif (
+            isinstance(align_hook.weights_map, PrefixedDataset)
+            and hasattr(align_hook.weights_map.dataset, "index")
+            and key in align_hook.weights_map.dataset.index
+        ):
+            # Disk-offloaded weight: promote into state_dict so the next
+            # pre_forward picks up the modified tensor instead of the stale
+            # on-disk version.  OffloadedWeightsLoader.__getitem__ gives
+            # state_dict priority over index, so this is sufficient.
+            w_map[key] = tensor.detach().cpu()
+            warnings.warn(
+                "Accelerate disk-offload writeback is currently kept in CPU state_dict; "
+                "writing updates back to disk offload files is TODO.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        elif align_hook.offload_buffers and name in buffer_names:
+            # A buffer first registered inside the context, such as a GPTQ payload pin: without a
+            # backing value the hook cannot reload it after offloading the module again.
+            w_map[key] = tensor.detach().cpu()
+
+
+def _own_quantizers(module):
+    """Quantizers whose state belongs with ``module``'s weights, not with a hooked descendant's."""
+    for child in module.children():
+        if isinstance(child, TensorQuantizer):
+            yield child
+        elif not hasattr(child, "_hf_hook"):
+            yield from _own_quantizers(child)
+
+
+# A quantizer's calibrators: its amax calibrator, and its bias calibrator under static bias.
+_CALIBRATORS = ("_calibrator", "_bias_calibrator")
+
+
+def _quantizer_tensors(module):
+    """``(key, tensor)`` for the state of ``module``'s own quantizers and their calibrators."""
+    for quantizer in _own_quantizers(module):
+        sources = {"_parameters": quantizer._parameters, "_buffers": quantizer._buffers}
+        for source in _CALIBRATORS:
+            calibrator = getattr(quantizer, source, None)
+            sources[source] = vars(calibrator) if calibrator is not None else {}
+        for source, tensors in sources.items():
+            for name, tensor in tensors.items():
+                if isinstance(tensor, torch.Tensor):
+                    yield (id(quantizer), source, name), tensor
+
+
+def _carry_quantizers_with_offload(hook):
+    """Make an offload ``hook`` move its module's quantizer state on and off the GPU with the weights.
+
+    Accelerate only manages the tensors a module had when it was dispatched, so calibration state
+    such as NVFP4's per-block ``_amax``, and its calibrator's copy, stayed on the execution device
+    for every offloaded layer and added up over the model. The CPU tensors stay the master copy:
+    a forward gets GPU copies, and after it the CPU tensors come back. A quantizer's own tensors
+    are always copied back, since its setters write through ``.data``, which leaves ``_version``
+    unchanged; a calibrator's tensor is copied back only if the forward replaced or modified it.
+    The packed-weight cache is keyed to the weight just released, so it is dropped.
+    """
+    if getattr(hook, "_modelopt_carries_quantizers", False):
+        return
+    pre_forward, post_forward = hook.pre_forward, hook.post_forward
+    onloaded: dict[tuple, tuple[torch.Tensor, torch.Tensor, int]] = {}
+
+    def carrying_pre_forward(module, *args, **kwargs):
+        result = pre_forward(module, *args, **kwargs)
+        if hook.offload:
+            for key, tensor in _quantizer_tensors(module):
+                if tensor.device.type == "cpu":
+                    master = tensor.data
+                    tensor.data = master.to(hook.execution_device)
+                    onloaded[key] = (tensor, master, tensor._version)
+        return result
+
+    def carrying_post_forward(module, output):
+        output = post_forward(module, output)
+        if hook.offload:
+            for key, tensor in _quantizer_tensors(module):
+                # meta: a hook that places submodules offloaded it already.
+                if tensor.device.type in ("cpu", "meta"):
+                    continue
+                entry = onloaded.pop(key, None)
+                if entry is None or entry[0] is not tensor:
+                    tensor.data = tensor.data.cpu()
+                    continue
+                master = entry[1]
+                if key[1] not in _CALIBRATORS or entry[2] != tensor._version:
+                    if master.shape != tensor.shape or master.dtype != tensor.dtype:
+                        tensor.data = tensor.data.cpu()
+                        continue
+                    # Into the existing master: a new CPU tensor costs 8x as much in page faults.
+                    master.copy_(tensor.data)
+                tensor.data = master
+            for quantizer in _own_quantizers(module):
+                quantizer._quantizer_cache = None
+        return output
+
+    hook.pre_forward, hook.post_forward = carrying_pre_forward, carrying_post_forward
+    hook._modelopt_carries_quantizers = True
+
+
+@contextmanager
+def weight_access_and_writeback_context(module, writeback: bool = True):
+    """Context manager for weight access and writeback for modules managed by accelerate.
+
+    Handles CPU-offloaded and disk-offloaded models. Iterates over the module and all
+    its descendants, materializing weights from any offload hook found. If ``writeback``
+    is True, writes materialized tensors back on exit. ``pre_forward`` is skipped on
+    modules whose weights are already
+    materialized (not on meta) to avoid overwriting them with stale CPU copies.
+    """
+    assert hasattr(module, "_hf_hook")
+
+    materialized: list[tuple[torch.nn.Module, AlignDevicesHook, bool]] = []
+    for mod in module.modules():
+        if not hasattr(mod, "_hf_hook"):
+            continue
+        hook = _get_offload_hook(mod._hf_hook)
+        if hook is None:
+            continue
+        # Only call pre_forward if weights need materializing; already-materialized
+        # weights would be overwritten with stale CPU state_dict values.
+        needs_materialize = any(p.device.type == "meta" for p in mod.parameters())
+        if needs_materialize:
+            _carry_quantizers_with_offload(hook)
+            hook.pre_forward(mod)
+        hook.offload = False
+        materialized.append((mod, hook, needs_materialize))
+
+    try:
+        yield
+    finally:
+        for mod, hook, was_materialized in materialized:
+            hook.offload = True
+            if writeback:
+                _writeback_params_to_weights_map(mod, hook)
+            if was_materialized:
+                hook.post_forward(mod, None)
+
+
+@contextmanager
+def init_quantized_weights(
+    quant_cfg: dict[str, Any], gpu_mem_percentage: float = 0.8, quant_gemm: bool = False
+):
+    """Context manager for initializing and loading HuggingFace models with quantized and compressed weights.
+
+    This context manager patches `from_pretrained` to automatically:
+    1. Initialize the model with an empty config
+    2. Apply quantization configuration
+    3. Compress the weights
+    4. Load and dispatch the model to appropriate devices
+
+    Args:
+        quant_cfg: The quantization config to apply to the model
+        gpu_mem_percentage: Percentage of GPU memory to use (0.0-1.0)
+        quant_gemm: Whether to enable quantized GEMM
+
+    Example:
+        ```python
+        from transformers import AutoModelForCausalLM
+        from modelopt.torch.quantization.plugins.huggingface import init_quantized_weights
+        import modelopt.torch as mtq
+
+        # Load quantized and compressed model in one step
+        with init_quantized_weights(mtq.NVFP4_DEFAULT_CFG):
+            model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-70b-hf")
+
+
+        # The model is already quantized, compressed, and loaded to appropriate devices
+
+        # calibrate model
+        mtq.calibrate(model, "max", forward_loop)
+        ```
+    """
+
+    def get_no_split_module_classes(model):
+        """Get no-split module classes for device mapping."""
+        no_split_classes = set()
+
+        # Get all named modules
+        for name, module in model.named_modules():
+            # Look for first layer patterns
+            if name.endswith((".layers.0", ".layer.0", ".h.0", ".blocks.0")):
+                no_split_classes.add(module.__class__.__name__)
+
+        return list(no_split_classes)
+
+    def get_model_device_map(model, gpu_mem_percentage):
+        """Create optimized device map for the quantized and compressed model."""
+        # Get compression ratio to adjust memory usage
+        max_memory = get_max_memory()
+        no_split_classes = get_no_split_module_classes(model)
+        if len(no_split_classes) == 0:
+            warnings.warn(
+                "No no-split module classes found for the model. Default device map might be incorrect."
+            )
+        max_memory = {k: v * gpu_mem_percentage for k, v in max_memory.items()}
+
+        def _get_special_dtype_map(model):
+            special_dtype_map = {}
+
+            def _get_byte_size(module):
+                weight_num_bit = module.weight_quantizer.num_bits
+                if isinstance(weight_num_bit, tuple):
+                    assert len(weight_num_bit) == 2, (
+                        "Weight num bit must be a tuple of two integers."
+                    )
+                    weight_num_bit = weight_num_bit[0] + weight_num_bit[1] + 1
+                if weight_num_bit == 8:
+                    return CustomDtype.FP8
+                elif weight_num_bit == 4:
+                    return CustomDtype.INT4
+                else:
+                    raise ValueError(f"Unsupported weight num bit: {weight_num_bit}")
+
+            for name, module in model.named_modules():
+                if (
+                    hasattr(module, "weight")
+                    and hasattr(module, "weight_quantizer")
+                    and not module.weight_quantizer.fake_quant
+                ):
+                    special_dtype_map[name + ".weight"] = _get_byte_size(module)
+            return special_dtype_map
+
+        special_dtype_map = _get_special_dtype_map(model)
+        inferred_device_map = infer_auto_device_map(
+            model,
+            max_memory=max_memory,
+            no_split_module_classes=no_split_classes,
+            special_dtypes=special_dtype_map,
+        )
+        return inferred_device_map
+
+    # Store original from_pretrained methods that we'll override
+    original_auto_causal_lm_from_pretrained = transformers.AutoModelForCausalLM.from_pretrained
+
+    # Create patched from_pretrained that applies quantization and compression
+    def patched_from_pretrained(cls, /, pretrained_model_name_or_path, *args, **kwargs):
+        """Patched from_pretrained that handles quantization, compression and device mapping."""
+        # This loader quantizes with quant_cfg and places the model itself.
+        if kwargs.pop("quantization_config", None) is not None:
+            raise ValueError(
+                "init_quantized_weights() quantizes with quant_cfg; drop quantization_config."
+            )
+        if kwargs.pop("device_map", None) is not None:
+            raise ValueError(
+                "init_quantized_weights() computes the device map; drop device_map and set "
+                "gpu_mem_percentage instead."
+            )
+        # As in load_pretrained(), the subfolder is part of the checkpoint path: the config and
+        # the weights are both read from it.
+        subfolder = kwargs.pop("subfolder", None)
+        if subfolder:
+            pretrained_model_name_or_path = os.path.join(pretrained_model_name_or_path, subfolder)
+        # Initialize with empty config first to avoid loading weights twice
+        config = kwargs.pop("config", None)
+        trust_remote_code = kwargs.pop("trust_remote_code", False)
+        legacy_dtype = kwargs.pop("torch_dtype", None)
+        if kwargs.get("dtype") is None and legacy_dtype is not None:
+            kwargs["dtype"] = legacy_dtype
+        # load_checkpoint_and_dispatch() gets only the kwargs it takes; the rest build the model.
+        dispatch_params = inspect.signature(load_checkpoint_and_dispatch).parameters
+        dispatch_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if k in dispatch_params}
+        if config is None:
+            # Get config from pretrained model
+            from transformers import AutoConfig
+
+            # As in from_pretrained(), the config load takes the Hub options (revision, token, ...)
+            # and any of the config's own attributes; the weights are still read from the path.
+            config, kwargs = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path,
+                trust_remote_code=trust_remote_code,
+                return_unused_kwargs=True,
+                **kwargs,
+            )
+
+        with init_empty_weights():
+            # config.dtype is None, not absent, when unset, so a getattr default never applies.
+            dtype = dispatch_kwargs.get("dtype") or getattr(config, "dtype", None) or torch.float16
+            # from_config() raises on any kwarg the model doesn't take.
+            model = cls.from_config(config, dtype=dtype, **kwargs)
+        # init_empty_weights re-wraps every registered parameter, so the tie made inside
+        # from_config is lost; without it the absent tied checkpoint key (e.g. lm_head) stays meta.
+        model.tie_weights()
+
+        mtq.quantize(model, quant_cfg)
+        mtq.compress(model, config=mtq.CompressConfig(quant_gemm=quant_gemm))
+        _device_map = get_model_device_map(model, gpu_mem_percentage)
+
+        return load_checkpoint_and_dispatch(
+            model,
+            checkpoint=pretrained_model_name_or_path,
+            device_map=_device_map,
+            *args,
+            **dispatch_kwargs,
+        )
+
+    # A sharded load_pretrained builds the model without from_pretrained, so it reads this mark.
+    patched_from_pretrained._modelopt_init_quantized_weights = True  # type: ignore[attr-defined]
+    try:
+        # Apply our patches
+        transformers.AutoModelForCausalLM.from_pretrained = classmethod(patched_from_pretrained)
+        yield
+    finally:
+        # Restore original methods
+        transformers.AutoModelForCausalLM.from_pretrained = original_auto_causal_lm_from_pretrained

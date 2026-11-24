@@ -1,0 +1,981 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+
+"""Distillation loss function(s)."""
+
+import copy
+import logging
+import re
+import warnings
+from abc import ABCMeta
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from types import MethodType
+from typing import TYPE_CHECKING
+
+import torch
+import torch.distributed.nn as dist_nn
+import torch.nn as nn
+import torch.nn.functional as F
+import yaml
+from megatron.core import parallel_state
+from megatron.core.models.gpt import GPTModel
+from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
+from megatron.core.transformer import MegatronModule, TransformerLayer
+from megatron.core.utils import get_model_config
+from torch import Tensor
+from torch.nn.modules.loss import _Loss
+
+import modelopt.torch.distill as mtd
+from modelopt.torch.distill.config import Criterion
+from modelopt.torch.quantization.nn import TensorQuantizer
+from modelopt.torch.utils import warn_rank_0
+
+if TYPE_CHECKING:
+    from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+    from megatron.core.transformer import TransformerConfig
+
+
+logger = logging.getLogger(__name__)
+
+
+# Former DistillationConfig fields that now raise if passed (see ``DistillationConfig.__new__``).
+_REMOVED_DISTILLATION_CONFIG_FIELDS = frozenset({"skip_lm_loss", "kd_loss_scale"})
+
+
+@dataclass
+class DistillationConfig:
+    """Knowledge-Distillation config.
+
+    Args:
+        intermediate_layer_pairs: List of tuples of intermediate layer names.
+        logit_layers: Tuple of logit layer names.
+        kd_loss_alpha: Weight of the distillation loss in the convex combination
+            ``(1 - alpha) * lm_loss + alpha * kd_loss``. Must be in [0, 1]. Default: ``1.0``. When ``1.0``,
+            the standard language model loss is skipped entirely (see :attr:`skip_lm_loss`).
+        logit_kl_temperature: Temperature for the logit KL-divergence loss.
+        logit_kl_topk: If not None, use TopLogitsKLLoss instead of LogitsKLLoss with this top-k value.
+        logit_kl_top_p: Optional nucleus (top-P) threshold applied on top of the teacher's Top-K.
+            Only the smallest prefix of the (sorted) Top-K whose cumulative teacher probability
+            reaches this value contributes to the loss. Requires ``logit_kl_topk``. Must be in (0, 1].
+        logit_kl_top_p_min_k: Minimum number of Top-K entries kept per token when top-P is active.
+        freeze_mtp: Whether to freeze the student's MTP-specific parameters and disable its auxiliary
+            MTP loss, which otherwise also trains the shared layers it reads from. ``True`` freezes
+            it and ``False`` keeps it training. ``None`` (default) freezes it only when
+            ``kd_loss_alpha == 1.0`` and the student is quantized except for its MTP head, since
+            there is then no quantization error for the MTP loss to recover.
+        skip_frozen_mtp: Skip the frozen MTP head (its layers and its extra output-layer pass) in the
+            student's and teacher's training forwards; evaluation still runs it and its weights are
+            kept. Needs the student's MTP head frozen (see ``freeze_mtp``), a GPTModel and no pipeline
+            parallelism. The gradients lose only what the MTP layers add through MoE auxiliary losses.
+    """
+
+    intermediate_layer_pairs: list[tuple[str, ...]] = field(default_factory=list)
+    logit_layers: tuple[str, str] = ("output_layer", "output_layer")
+    kd_loss_alpha: float = 1.0
+    logit_kl_temperature: float = 1.0
+    logit_kl_topk: int | None = None
+    logit_kl_top_p: float | None = None
+    logit_kl_top_p_min_k: int = 1
+    freeze_mtp: bool | None = None
+    criterion: Criterion | None = None
+    loss_balancer: mtd.DistillationLossBalancer | None = None
+    skip_frozen_mtp: bool = False
+
+    def __new__(cls, *args, **kwargs):
+        """Reject removed fields with a migration hint before the dataclass ``__init__`` runs.
+
+        Done here rather than in ``__init__`` so the check survives subclasses that re-apply
+        ``@dataclass`` (which regenerates ``__init__``).
+        """
+        removed = _REMOVED_DISTILLATION_CONFIG_FIELDS & kwargs.keys()
+        if removed:
+            raise ValueError(
+                f"DistillationConfig {sorted(removed)} have been removed. Use `kd_loss_alpha` "
+                "instead: the total loss is (1 - kd_loss_alpha) * lm_loss + kd_loss_alpha * "
+                "kd_loss, and the LM loss is skipped when kd_loss_alpha == 1.0 (the default, "
+                "equivalent to the old skip_lm_loss=True)."
+            )
+        return super().__new__(cls)
+
+    @property
+    def skip_lm_loss(self) -> bool:
+        """Whether the standard LM loss is skipped, i.e. ``kd_loss_alpha == 1.0``."""
+        return self.kd_loss_alpha == 1.0
+
+    def __post_init__(self):
+        assert len(self.logit_layers) == 2, f"{self.logit_layers=}"
+        assert all(len(pair) in (2, 3) for pair in self.intermediate_layer_pairs), (
+            f"{self.intermediate_layer_pairs=}"
+        )
+        assert 0 <= self.kd_loss_alpha <= 1, f"{self.kd_loss_alpha=}"
+        assert self.logit_kl_temperature > 0, f"{self.logit_kl_temperature=}"
+        if self.logit_kl_top_p is not None:
+            assert self.logit_kl_topk is not None, "logit_kl_top_p requires logit_kl_topk"
+            assert 0 < self.logit_kl_top_p <= 1, f"{self.logit_kl_top_p=}"
+        assert self.logit_kl_top_p_min_k >= 1, f"{self.logit_kl_top_p_min_k=}"
+        assert not (self.skip_frozen_mtp and self.freeze_mtp is False), (
+            "skip_frozen_mtp skips the MTP head, which freeze_mtp=False keeps training."
+        )
+
+    @staticmethod
+    def parse_intermediate_entry(entry: tuple[str, ...]) -> tuple[str, str, Callable]:
+        """Parse an intermediate entry into a student layer, teacher layer, and loss function."""
+        if len(entry) == 3:
+            student_layer, teacher_layer, loss_fn_name = entry
+            if loss_fn_name == "cosine":
+                loss_fn = HiddenStateCosineLoss
+            elif loss_fn_name == "mse":
+                loss_fn = MSELoss
+            else:
+                raise ValueError(f"Unknown intermediate loss function: {loss_fn_name}")
+        else:
+            student_layer, teacher_layer = entry
+            loss_fn = HiddenStateCosineLoss  # default to cosine loss
+        return student_layer, teacher_layer, loss_fn
+
+
+def setup_distillation_config(
+    config_or_path: str | DistillationConfig | None,
+    student_cfg: "TransformerConfig",
+    teacher_cfg: "TransformerConfig",
+) -> DistillationConfig:
+    """Setup and/or finalize the distillation config.
+
+    Either reads the distillation yaml config file from a path, fills in an
+    existing DistillationConfig, or creates a default one.
+
+    Args:
+        config_or_path: Path to user-defined distillation settings yaml file, or the incomplete config itself.
+            If `None`, uses default logits-only distillation mode for GPT models.
+        student_cfg: Model config for student model.
+        teacher_cfg: Model config for teacher model.
+
+    WARNING: Assumes intermediate hidden sizes are always that found in the model config's ``hidden_size`` attribute.
+    """
+    if config_or_path is None:
+        logger.warning("Distillation config not provided. Using default.")
+        cfg = DistillationConfig()
+    elif isinstance(config_or_path, DistillationConfig):
+        cfg = config_or_path
+    else:
+        with open(config_or_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        cfg = DistillationConfig(**cfg)
+
+    if cfg.criterion is None:
+        criterion = {}
+        if parallel_state.is_pipeline_last_stage():
+            # Use TopLogitsKLLoss if logit_kl_topk is specified, otherwise use LogitsKLLoss
+            if cfg.logit_kl_topk is not None:
+                criterion[tuple(cfg.logit_layers)] = TopLogitsKLLoss(
+                    student_cfg,
+                    temperature=cfg.logit_kl_temperature,
+                    top_k=cfg.logit_kl_topk,
+                    top_p=cfg.logit_kl_top_p,
+                    top_p_min_k=cfg.logit_kl_top_p_min_k,
+                )
+            else:
+                criterion[tuple(cfg.logit_layers)] = LogitsKLLoss(
+                    student_cfg, temperature=cfg.logit_kl_temperature
+                )
+            # NOTE: Projection layer shared among intermediate layer pairs.
+            projection_layer = ProjectionLayer(student_cfg, teacher_cfg)
+
+            for entry in cfg.intermediate_layer_pairs:
+                student_layer, teacher_layer, loss_fn = cfg.parse_intermediate_entry(entry)
+                if parallel_state.get_tensor_and_context_parallel_rank() == 0:
+                    logger.info(
+                        "Distillation: Adding intermediate loss between"
+                        f" `{student_layer}` of student (hidden size {student_cfg.hidden_size}) and"
+                        f" `{teacher_layer}` of teacher (hidden size {teacher_cfg.hidden_size})."
+                    )
+                student_layer = _adjust_layer_index_for_pp(student_layer, student_cfg)
+                teacher_layer = _adjust_layer_index_for_pp(teacher_layer, teacher_cfg)
+                criterion[(student_layer, teacher_layer)] = loss_fn(
+                    student_cfg, projection_layer=projection_layer
+                )
+        cfg.criterion = criterion
+
+    if cfg.loss_balancer is None:
+        cfg.loss_balancer = LogitsAndIntermediatesLossBalancer(
+            kd_loss_alpha=cfg.kd_loss_alpha,
+            skip_original_loss=cfg.skip_lm_loss,
+        )
+
+    return cfg
+
+
+def _adjust_layer_index_for_pp(submodule_name, model_cfg):
+    """Adjust any sequence-based layer indices found in a submodule name for Pipeline Parallelism."""
+    match = re.search(r"(?<=\.)\d+(?=\.|$)", submodule_name)
+    if not match:
+        return submodule_name
+
+    offset = TransformerLayer._get_layer_offset(model_cfg)
+    new_layer_idx = int(match.group(0)) - offset
+    if new_layer_idx < 0:
+        raise ValueError(f"Layer {submodule_name} does not fall on final PP rank.")
+
+    new_submodule_name = submodule_name.replace(f".{match.group(0)}", f".{new_layer_idx}")
+    if parallel_state.get_tensor_and_context_parallel_rank() == 0:
+        logger.info(
+            f'Distillation: Renamed layer "{submodule_name}" on final PP rank to "{new_submodule_name}"'
+        )
+    return new_submodule_name
+
+
+########################################################
+
+
+class BaseLoss(_Loss, metaclass=ABCMeta):
+    """Abstract base class for Megatron distillation losses."""
+
+    def __init__(
+        self, model_config: "TransformerConfig", projection_layer: nn.Module | None = None
+    ):
+        """Constructor.
+
+        Args:
+            model_config: MCore transformer config.
+            projection_layer: Module which projects student activations to teacher's hidden dim.
+        """
+        super().__init__()
+        self._config = model_config
+        self._projection = projection_layer
+
+    def pre_forward(self, predictions: Tensor, targets: Tensor) -> tuple[Tensor, Tensor]:
+        """Performs projection of student tensor to match teacher's size if necessary."""
+        if isinstance(predictions, tuple):
+            # `ColumnParallelLinear` returns bias too
+            predictions, targets = predictions[0], targets[0]
+
+        if self._projection is not None:
+            predictions = self._projection(predictions)
+        targets = targets.detach()
+
+        return predictions, targets
+
+    def post_forward(
+        self, loss: Tensor, tp_reduce: bool = False, is_sequence_parallel: bool = False
+    ) -> Tensor:
+        """Reshapes tensor from [s, b] to [b, s] for upcoming loss masking."""
+        loss = loss.transpose(0, 1).contiguous()
+        return (loss, tp_reduce, is_sequence_parallel)
+
+
+class MSELoss(BaseLoss):
+    """Calculates MSE loss between two tensors without reducing the sequence dim."""
+
+    def forward(self, predictions: Tensor, targets: Tensor) -> Tensor:
+        """Forward function.
+
+        Args:
+            predictions: Student model tensors (size [s, b, h])
+            targets: Teacher model tensors (size [s, b, h])
+
+        Returns:
+            MSE loss of tensors (size [b, s])
+        """
+        predictions, targets = self.pre_forward(predictions, targets)
+
+        loss = F.mse_loss(predictions, targets, reduction="none")
+        loss = loss.mean(dim=-1)
+
+        return self.post_forward(loss, is_sequence_parallel=self._config.sequence_parallel)
+
+
+class HiddenStateCosineLoss(BaseLoss):
+    """Calculates Cosine loss between two tensors without reducing the sequence dim.
+
+    The tensors are assumed to be intermediate activations, with full hidden dimension size.
+    We recommend only applying this loss to LayerNorm outputs, which have full hidden dim even when TP is used.
+    """
+
+    def __init__(
+        self, model_config: "TransformerConfig", projection_layer: nn.Module | None = None
+    ):
+        """Constructor.
+
+        Args:
+            model_config: MCore transformer config.
+            projection_layer: Module which projects student activations to teacher's hidden dim.
+        """
+        super().__init__(model_config, projection_layer=projection_layer)
+
+        if self._config.tensor_model_parallel_size > 1:
+            logger.warning(
+                "``HiddenStateCosineLoss`` only works with tensors with full hidden dim. Ensure the "
+                "tensor inputs meet this requirement. We recommend only applying this loss to LayerNorm outputs, "
+                "which have full hidden dim even when TP is used."
+            )
+
+    def forward(self, predictions: Tensor, targets: Tensor) -> Tensor:
+        """Forward function.
+
+        Args:
+            predictions: Student model tensors (size [s, b, h])
+            targets: Teacher model tensors (size [s, b, h])
+
+        Returns:
+            Cosine loss of tensors (size [b, s])
+        """
+        predictions, targets = self.pre_forward(predictions, targets)
+
+        loss = F.cosine_embedding_loss(
+            predictions.view(-1, predictions.size(-1)),
+            targets.view(-1, targets.size(-1)),
+            targets.new_ones(1),
+            reduction="none",
+        )
+        loss = loss.view(*predictions.shape[:2])
+
+        # NOTE: Tensor sequence length is still split among TP ranks.
+        return self.post_forward(loss, is_sequence_parallel=self._config.sequence_parallel)
+
+
+class LogitsKLLoss(BaseLoss):
+    """Calculates KL-Divergence loss between two logits tensors without reducing the sequence dim."""
+
+    def __init__(
+        self, model_config: "TransformerConfig", temperature: float = 1.0, reverse: bool = False
+    ):
+        """Constructor.
+
+        Args:
+            model_config: MCore transformer config.
+            temperature: Divide tensors by this value prior to calculating loss.
+            reverse: Whether to reverse the loss as KLD(teacher, student) instead of KLD(student, teacher)
+        """
+        super().__init__(model_config)
+        self._temperature = temperature
+        self._reverse = reverse
+
+    def forward(self, predictions: Tensor, targets: Tensor) -> Tensor:
+        """Forward function.
+
+        Args:
+            predictions: Student model tensors (size [s, b, h])
+            targets: Teacher model tensors (size [s, b, h])
+
+        Returns:
+            KLD loss of tensors (size [b, s])
+        """
+        predictions, targets = self.pre_forward(predictions, targets)
+
+        # Division by temp should happen prior to finding max for both student and teacher.
+        output_teacher = targets.float() / self._temperature
+        output_student = predictions.float() / self._temperature
+
+        # Log probabilities (log softmax), globally normalized across TP vocab shards.
+        p = output_student - self._tp_logsumexp(output_student)
+        q = output_teacher - self._tp_logsumexp(output_teacher)
+
+        # KL divergence
+        if self._reverse:
+            p, q = q, p
+        loss = torch.sum(F.kl_div(p, q, reduction="none", log_target=True), dim=-1)
+
+        return self.post_forward(loss, tp_reduce=True)
+
+    def _tp_logsumexp(self, logits: Tensor) -> Tensor:
+        """Log-sum-exp over the vocab dim across all TP shards (shape ``[..., 1]``).
+
+        ``logits`` are expected to be fp32 and already temperature-scaled.
+        """
+        if self._config.tensor_model_parallel_size == 1:
+            return torch.logsumexp(logits, dim=-1, keepdim=True)
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+
+        # Subtract maximum value along vocab dimension across all GPUs (for stability)
+        # Detached before the (non-autograd, in-place) collective: the max is only a stability shift.
+        logits_max = logits.amax(dim=-1, keepdim=True).detach()
+        torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+
+        # Compute global softmax denominator.
+        # We can't use standard all_reduce function here since the computation
+        # that follows it isn't identical across TP ranks.
+        denom = torch.exp(logits - logits_max).sum(dim=-1, keepdim=True)
+        denom = dist_nn.functional.all_reduce(denom, group=tp_group)
+
+        return logits_max + torch.log(denom)
+
+
+# fp32 elements per row chunk in the Top-K loss's full-vocab passes (1 GiB).
+_TOP_LOGITS_CHUNK_NUMEL = 1 << 28
+
+
+def _row_chunks(rows: Tensor) -> list[slice]:
+    step = max(1, _TOP_LOGITS_CHUNK_NUMEL // rows.size(-1))
+    return [slice(i, i + step) for i in range(0, rows.size(0), step)]
+
+
+def _scaled_logsumexp(
+    logits: Tensor, temperature: float, tp_group, top_k: int = 0
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """fp32 row max ``m`` and ``logsumexp(x - m)`` of ``x = logits / temperature``, by row chunks.
+
+    Both are over the TP-sharded vocab dim. Also returns the local Top-K values of ``x - m`` and their
+    indices (empty if ``top_k=0``). Working relative to ``m`` keeps the results exact for logits with
+    a large common offset.
+    """
+    rows = logits.detach().reshape(-1, logits.size(-1))
+    # Rounding is monotonic, so this is also the max of the scaled fp32 logits.
+    row_max = rows.amax(dim=-1, keepdim=True).float() / temperature
+    if tp_group is not None:
+        torch.distributed.all_reduce(row_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+    sum_exp = torch.empty_like(row_max)
+    top_vals = row_max.new_empty(rows.size(0), top_k)
+    top_idx = torch.empty(rows.size(0), top_k, dtype=torch.long, device=rows.device)
+    for c in _row_chunks(rows):
+        shifted = rows[c].to(torch.float32, copy=True).div_(temperature).sub_(row_max[c])
+        if top_k:
+            top_vals[c], top_idx[c] = torch.topk(shifted, top_k, dim=-1)
+        sum_exp[c] = shifted.exp_().sum(dim=-1, keepdim=True)
+    if tp_group is not None:
+        torch.distributed.all_reduce(sum_exp, group=tp_group)
+    # Explicit widths: a -1 cannot be inferred for empty batch or sequence dims.
+    return tuple(
+        t.view(*logits.shape[:-1], t.size(-1)) for t in (row_max, sum_exp.log(), top_vals, top_idx)
+    )
+
+
+class _ScaledLogSumExpAndGather(torch.autograd.Function):
+    """``logsumexp(x - m)`` and ``(x - m).gather(-1, index)`` of ``_scaled_logsumexp`` in fp32.
+
+    Saves only ``logits`` and writes their gradient chunk by chunk, instead of keeping fp32 copies
+    of the full logits alive for backward. ``m`` cancels out of the log-probs, so it gets no gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, index, temperature, tp_group):
+        row_max, lse, _, _ = _scaled_logsumexp(logits, temperature, tp_group)
+        ctx.save_for_backward(logits, index, row_max, lse)
+        ctx.temperature, ctx.tp_group = temperature, tp_group
+        return lse, logits.gather(-1, index).float() / temperature - row_max
+
+    @staticmethod
+    def backward(ctx, grad_lse, grad_vals):
+        logits, index, row_max, lse = ctx.saved_tensors
+        if ctx.tp_group is not None:
+            # As in the autograd all-reduce of the normalizer, every TP rank's loss reaches each shard.
+            grad_lse = grad_lse.clone()
+            torch.distributed.all_reduce(grad_lse, group=ctx.tp_group)
+        rows = logits.reshape(-1, logits.size(-1))
+        row_max, lse, grad_lse = row_max.reshape(-1, 1), lse.reshape(-1, 1), grad_lse.reshape(-1, 1)
+        index, grad_vals = index.reshape(-1, index.size(-1)), grad_vals.reshape(-1, index.size(-1))
+        grad = torch.empty_like(rows)
+        for c in _row_chunks(rows):
+            # softmax(x) * grad_lse, plus grad_vals scattered to the gathered entries, over T.
+            g = rows[c].to(torch.float32, copy=True).div_(ctx.temperature).sub_(row_max[c])
+            g.sub_(lse[c]).exp_().mul_(grad_lse[c]).scatter_add_(-1, index[c], grad_vals[c])
+            grad[c] = g.div_(ctx.temperature)
+        return grad.view(logits.shape), None, None, None
+
+
+class TopLogitsKLLoss(LogitsKLLoss):
+    """Calculates KL-Divergence loss restricted to the Teacher's Top-K (and optionally Top-P) entries.
+
+    Calculates using the global Top-K entries without gathering full logits.
+    NOTE: Will gather Top-K logits per rank, so mind the value of K for communication. The full-vocab
+    normalizers run over fp32 row chunks of the local logit shards rather than fp32 copies of them,
+    and add two TP all-reduces per distribution.
+
+    Both distributions are normalized over the *full* vocabulary (not re-normalized over the
+    Top-K), matching the offline cached-logits KD loss in Megatron-LM. A "ghost" token holding the
+    probability mass outside the kept entries, ``log(1 - sum(kept probs))``, is appended to both
+    student and teacher, so the KL is taken between two proper distributions over K + 1 buckets and
+    also penalizes mass the student places outside the teacher's kept entries.
+
+    Optionally, **Top-P (nucleus)** truncation keeps only the smallest prefix of the teacher-sorted
+    Top-K whose cumulative teacher mass reaches ``top_p`` (with a floor of ``top_p_min_k`` entries);
+    the truncated entries' mass moves into the ghost token.
+    """
+
+    def __init__(
+        self,
+        model_config: "TransformerConfig",
+        temperature: float = 1.0,
+        reverse: bool = False,
+        top_k: int = 1024,
+        *,
+        top_p: float | None = None,
+        top_p_min_k: int = 1,
+    ):
+        """Constructor.
+
+        Args:
+            model_config: MCore transformer config.
+            temperature: Divide tensors by this value prior to calculating loss.
+            reverse: Whether to reverse the loss as KLD(teacher, student) instead of KLD(student, teacher)
+            top_k: The number of top vocabulary entries to keep from the teacher's distribution.
+            top_p: Optional nucleus threshold in (0, 1] applied on top of the Top-K selection.
+            top_p_min_k: Minimum number of entries kept per token when ``top_p`` is active.
+        """
+        super().__init__(model_config, temperature, reverse)
+        assert top_k >= 1, f"{top_k=}"
+        assert top_p is None or 0 < top_p <= 1, f"{top_p=}"
+        assert top_p_min_k >= 1, f"{top_p_min_k=}"
+        self.top_k = top_k
+        self.top_p = top_p
+        self.top_p_min_k = top_p_min_k
+
+    def forward(self, predictions: Tensor, targets: Tensor) -> Tensor:
+        """Forward function.
+
+        Args:
+            predictions: Student model tensors (size [s, b, h])
+            targets: Teacher model tensors (size [s, b, h])
+
+        Returns:
+            Top-K KLD loss of tensors (size [b, s])
+        """
+        predictions, targets = self.pre_forward(predictions, targets)
+
+        tp_size = self._config.tensor_model_parallel_size
+        assert self.top_k <= targets.size(-1) * tp_size, (
+            f"top_k ({self.top_k}) is larger than total vocab size ({targets.size(-1) * tp_size})"
+        )
+
+        # Extract local Top-K
+        # We take K from each rank and then find the global Top-K of all those.
+        local_top_k = min(self.top_k, targets.size(-1))
+
+        # Full-vocab normalizers (inherent to the ghost-token formulation) and the local Top-K, both
+        # relative to each distribution's row max, which cancels out of the log-probs.
+        tp_group = parallel_state.get_tensor_model_parallel_group() if tp_size > 1 else None
+        _, teacher_lse, top_teacher_vals, top_idx = _scaled_logsumexp(
+            targets, self._temperature, tp_group, local_top_k
+        )
+        student_lse, top_student_vals = _ScaledLogSumExpAndGather.apply(
+            predictions, top_idx, self._temperature, tp_group
+        )
+
+        if tp_size > 1:
+            # Gather all candidates into shape [N_rows, local_k * tp_size]
+            # Use all_gather from torch.distributed.nn.functional to preserve gradients
+            all_teacher_vals = dist_nn.functional.all_gather(
+                top_teacher_vals.contiguous(), group=tp_group
+            )
+            all_student_vals = dist_nn.functional.all_gather(
+                top_student_vals.contiguous(), group=tp_group
+            )
+            all_teacher_vals = torch.cat(all_teacher_vals, dim=-1)
+            all_student_vals = torch.cat(all_student_vals, dim=-1)
+
+            # Pick the true Top-K based on Teacher values
+            global_top_vals, global_top_idx = torch.topk(all_teacher_vals, self.top_k, dim=-1)
+
+            final_teacher_logits = global_top_vals
+            final_student_logits = torch.gather(all_student_vals, dim=-1, index=global_top_idx)
+        else:
+            final_teacher_logits = top_teacher_vals
+            final_student_logits = top_student_vals
+
+        # Log-probs of the Top-K entries under the full-vocab distributions, using global
+        # (full-vocab) log-normalizers so the entries carry true probabilities.
+        # NOTE: ``torch.topk`` returns entries sorted descending by teacher value.
+        teacher_logp = final_teacher_logits - teacher_lse
+        student_logp = final_student_logits - student_lse
+
+        # Top-P (nucleus) mask over the sorted Top-K: keep entry i iff cumulative mass *before* it
+        # is < p. This always keeps the entry that crosses the threshold (and thus top-1).
+        if self.top_p is not None:
+            teacher_probs = teacher_logp.exp()
+            mask = (teacher_probs.cumsum(dim=-1) - teacher_probs) < self.top_p
+            min_keep = min(self.top_p_min_k, teacher_logp.size(-1))
+            mask |= torch.arange(teacher_logp.size(-1), device=mask.device) < min_keep
+        else:
+            mask = torch.ones_like(teacher_logp, dtype=torch.bool)
+
+        # Ghost token: residual probability mass outside the kept entries, for both distributions.
+        # Computed in log space as log(1 - exp(log_kept)) = log(-expm1(log_kept)), which stays
+        # accurate and differentiable when the kept mass is close to 1.
+        # The floor keeps log(kept_mass) strictly below 0 so expm1 stays negative. Deliberate side
+        # effects once kept mass exceeds 1 - eps: the ghost bucket is pinned at ~eps (so the loss can
+        # dip below 0 by O(eps)), and the clamp stops the ghost term's gradient. Both are negligible,
+        # and the latter is the correct limit when the kept entries hold all of the mass.
+        neg_tiny = -torch.finfo(student_logp.dtype).eps
+        student_log_kept = torch.logsumexp(
+            student_logp.masked_fill(~mask, float("-inf")), dim=-1, keepdim=True
+        ).clamp(max=neg_tiny)
+        teacher_log_kept = torch.logsumexp(
+            teacher_logp.masked_fill(~mask, float("-inf")), dim=-1, keepdim=True
+        ).clamp(max=neg_tiny)
+        student_residual = torch.log(-torch.expm1(student_log_kept))
+        teacher_residual = torch.log(-torch.expm1(teacher_log_kept))
+        student_logp = torch.cat([student_logp, student_residual], dim=-1)
+        teacher_logp = torch.cat([teacher_logp, teacher_residual], dim=-1)
+        mask = torch.cat([mask, mask.new_ones((*mask.shape[:-1], 1))], dim=-1)
+
+        # Sparse KL divergence: sum_i q_i * (log q_i - log p_i) over kept entries.
+        p, q = student_logp, teacher_logp
+        if self._reverse:
+            p, q = q, p
+        kl = q.exp() * (q - p)
+        loss = torch.sum(mask * kl, dim=-1)
+
+        if tp_size > 1:
+            # Autograd collectives sum gradients from identical losses on every TP rank.
+            # Average only backward, preserving reported loss and loss-balancer weights.
+            loss = loss.detach() + (loss - loss.detach()) / tp_size
+
+        # No need to reduce since all ranks compute same global Top-K
+        return self.post_forward(loss, tp_reduce=False)
+
+
+class TopKLogitsKLLoss(TopLogitsKLLoss):
+    """Deprecated alias of :class:`TopLogitsKLLoss`."""
+
+    def __init__(self, *args, **kwargs):
+        """Constructor. Emits a ``FutureWarning`` and forwards to :class:`TopLogitsKLLoss`."""
+        warnings.warn(
+            "TopKLogitsKLLoss is deprecated and will be removed in a future release; "
+            "use TopLogitsKLLoss instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
+
+
+class LogitsAndIntermediatesLossBalancer(mtd.DistillationLossBalancer):
+    """LossBalancer implementation for Logit and Intermediate losses.
+
+    Intermediate losses are dynamically rescaled to the magnitude of the logits loss, then the
+    total distillation loss is combined with the original LM loss as a fixed convex combination
+    ``(1 - alpha) * lm_loss + alpha * kd_loss`` (matching Megatron-LM's offline cached-logits KD).
+    """
+
+    def __init__(self, kd_loss_alpha: float = 1.0, skip_original_loss: bool = False):
+        """Constructor.
+
+        Args:
+            kd_loss_alpha: Weight of the distillation loss in ``(1 - alpha) * lm + alpha * kd``.
+                Must be in [0, 1]. (Not used when `skip_original_loss` is True.)
+            skip_original_loss: Used to signal whether the original loss should be used, regardless
+                of whether it was passed into ``mtd.DistillationModel.compute_kd_loss()`` or not.
+        """
+        super().__init__()
+        assert 0 <= kd_loss_alpha <= 1, f"{kd_loss_alpha=}"
+        self._kd_loss_alpha = kd_loss_alpha
+        self._skip_original_loss = skip_original_loss
+
+    def forward(self, loss_dict: dict[str, Tensor]) -> Tensor:
+        """Forward function.
+
+        Args:
+            loss_dict: All individual scalar losses, passed in during ``mtd.DistillationModel.compute_kd_loss()``
+
+        Returns:
+            Aggregate total scalar loss.
+        """
+        original_loss = loss_dict.pop(mtd.loss_balancers.STUDENT_LOSS_KEY)
+        for _key in loss_dict:
+            if "Logits" in _key:  # class name
+                logits_key = _key  # should only be one
+        logits_loss = loss_dict.pop(logits_key)
+        # Rescale intermediate losses to the logits-loss magnitude, without a host sync.
+        if loss_dict:
+            intermediate_loss = sum(loss_dict.values()) / len(loss_dict)
+            denom = intermediate_loss.detach()
+            dynamic_scale = torch.where(
+                denom > 0,
+                logits_loss.detach() / denom.clamp(min=torch.finfo(denom.dtype).tiny),
+                torch.zeros_like(denom),
+            )
+            intermediate_loss_scaled = intermediate_loss * dynamic_scale
+        else:
+            intermediate_loss = logits_loss.new_zeros(())
+            intermediate_loss_scaled = intermediate_loss
+
+        kd_loss = logits_loss + intermediate_loss_scaled
+        if self._skip_original_loss:
+            total_loss = kd_loss
+        else:
+            total_loss = (1 - self._kd_loss_alpha) * original_loss + self._kd_loss_alpha * kd_loss
+
+        out_dict = {
+            "kd_loss": total_loss,
+            "logits_loss": logits_loss,
+            "intermediate_loss": intermediate_loss,
+        }
+        return out_dict
+
+
+class ProjectionLayer(MegatronModule):
+    """Module to project student layer activations to teacher's size."""
+
+    def __init__(self, student_config: "TransformerConfig", teacher_config: "TransformerConfig"):
+        """Constructor.
+
+        Args:
+            student_config: Student's MCore transformer config.
+            teacher_config: Teacher's MCore transformer config.
+        """
+        super().__init__(config=student_config)
+        if student_config.hidden_size == teacher_config.hidden_size:
+            self._fit = nn.Identity()
+        else:
+            self._fit = nn.Linear(student_config.hidden_size, teacher_config.hidden_size)
+            self.apply(self._init_weights)
+            # Attribute below needed to reduce gradients during backward properly.
+            setattr(self._fit.weight, "sequence_parallel", self.config.sequence_parallel)
+            setattr(self._fit.bias, "sequence_parallel", self.config.sequence_parallel)
+
+    def forward(self, student_tensor: Tensor):
+        """Forward function.
+
+        Args:
+            student_tensor: Tensor to be fit to teacher size.
+        """
+        return self._fit(student_tensor)
+
+    def _init_weights(self, module):
+        """Initialize the weights."""
+        if isinstance(module, nn.Linear):
+            self.config.init_method(module.weight.data)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+
+########################################################
+
+
+def _has_quantized_backbone_with_unquantized_mtp(model: nn.Module) -> bool:
+    """Whether ``model`` has MTP submodules and enabled quantizers, none of them inside MTP."""
+    has_mtp = backbone_quantized = mtp_quantized = False
+    for name, module in model.named_modules():
+        is_mtp = "mtp" in name.split(".")
+        has_mtp |= is_mtp
+        if isinstance(module, TensorQuantizer) and module.is_enabled:
+            mtp_quantized |= is_mtp
+            backbone_quantized |= not is_mtp
+    return has_mtp and backbone_quantized and not mtp_quantized
+
+
+def _mtp_models_to_skip(
+    model: mtd.DistillationModel, distill_cfg: DistillationConfig, mtp_frozen: bool
+) -> list[GPTModel]:
+    """Return the student and teacher whose MTP head ``skip_frozen_mtp`` skips; raise where it can't."""
+    if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+        # The last stage's embedding copy is used only by MTP there: skipped, it gets no gradient.
+        raise ValueError("skip_frozen_mtp does not support pipeline parallelism.")
+    # The criterion holds every KD pair, however they were given; it is unset only without setup.
+    pairs = distill_cfg.criterion or [pair[:2] for pair in distill_cfg.intermediate_layer_pairs]
+    if any("mtp" in name.split(".") for pair in pairs for name in pair):
+        raise ValueError("skip_frozen_mtp skips the MTP heads, which a KD loss reads.")
+    models = []
+    for module in (model, model.teacher_model):
+        with model.hide_teacher_model(enable=module is model):
+            mtp = [m for name, m in module.named_modules() if "mtp" in name.split(".")]
+        if not mtp:
+            continue
+        if module is model and not mtp_frozen:
+            raise ValueError(
+                "skip_frozen_mtp needs the student's MTP head frozen (freeze_mtp=True)."
+            )
+        # Megatron resets a training router's micro-batch quantile-balancing bias when it saw no tokens.
+        if module is model and any(getattr(m, "qb_beta_accum", None) is not None for m in mtp):
+            raise ValueError(
+                "skip_frozen_mtp would reset the MTP routers' quantile-balancing bias (qb_beta)."
+            )
+        if not isinstance(module, GPTModel):
+            raise NotImplementedError(
+                f"skip_frozen_mtp supports GPTModel, not {type(module).__name__}."
+            )
+        if getattr(module.config, "cuda_graph_impl", "none") != "none" or getattr(
+            module.config, "overlap_moe_expert_parallel_comm", False
+        ):
+            raise ValueError(
+                "skip_frozen_mtp does not support CUDA graphs or overlap_moe_expert_parallel_comm."
+            )
+        models.append(module)
+    return models
+
+
+def adjust_distillation_model_for_mcore(
+    model: mtd.DistillationModel, distill_cfg: DistillationConfig
+):
+    """Extra modifications to ``mtd.DistillationModel`` required for Megatron-Core."""
+    # Skip `lm_loss` bypassing it when training if not needed for backprop.
+    # Uses a per-forward call counter so that MTP head calls (which always precede the
+    # main LM head call in _postprocess) still receive real CE loss even when
+    # skip_lm_loss=True — only the final main-head call is zeroed.
+    # ``freeze_mtp`` decides whether the MTP head trains. Unset, it is frozen only when the LM loss
+    # is skipped and the student is quantized except for its MTP head: there is then no
+    # quantization error to recover there, and its CE materialises an fp32 [seq, vocab] tensor.
+    skip_lm_loss = distill_cfg.skip_lm_loss
+    if distill_cfg.freeze_mtp is None:
+        with model.hide_teacher_model():
+            skip_mtp_loss = skip_lm_loss and _has_quantized_backbone_with_unquantized_mtp(model)
+    else:
+        skip_mtp_loss = distill_cfg.freeze_mtp
+    # Checked before anything is patched or frozen, so that a refusal leaves the model as it was.
+    skipped_mtp_models = (
+        _mtp_models_to_skip(model, distill_cfg, skip_mtp_loss)
+        if distill_cfg.skip_frozen_mtp
+        else []
+    )
+
+    # Hide teacher during `sharded_state_dict` method.
+    def _sharded_state_dict(self, *args, **kwargs) -> "ShardedStateDict":
+        with self.hide_teacher_model():
+            return type(self).sharded_state_dict(self, *args, **kwargs)
+
+    model.sharded_state_dict = MethodType(_sharded_state_dict, model)
+
+    if skip_mtp_loss:
+        # Freeze the untrained MTP head: DDP's overlapped grad reduce asserts on params with no grad.
+        num_frozen = 0
+        with model.hide_teacher_model():
+            for name, param in model.named_parameters():
+                if "mtp" in name.split("."):
+                    param.requires_grad_(False)
+                    num_frozen += 1
+        if num_frozen:
+            warn_rank_0(
+                f"MTP head is frozen ({num_frozen} params) and its loss is skipped"
+                + (" (freeze_mtp)." if distill_cfg.freeze_mtp else ": it is outside quantization.")
+            )
+        elif parallel_state.is_pipeline_last_stage():  # earlier stages never hold the MTP head
+            warn_rank_0("freeze_mtp is set but the model has no MTP head: nothing to freeze.")
+
+    def _compute_student_lm_loss(self, labels, logits) -> Tensor:
+        self._lm_loss_call_count += 1
+        mtp_num_layers = self.config.mtp_num_layers or 0
+        is_mtp_call = self._lm_loss_call_count <= mtp_num_layers
+        if self.training and (skip_mtp_loss if is_mtp_call else skip_lm_loss):
+            return torch.zeros_like(labels, dtype=logits.dtype)
+        return type(self).compute_language_model_loss(self, labels, logits)
+
+    model.compute_language_model_loss = MethodType(_compute_student_lm_loss, model)
+
+    # Skip `lm_loss` always for teacher.
+    def _compute_teacher_lm_loss(self, labels, logits) -> Tensor:
+        return torch.zeros_like(labels, dtype=logits.dtype)
+
+    model.teacher_model.compute_language_model_loss = MethodType(
+        _compute_teacher_lm_loss, model.teacher_model
+    )
+
+    def _postprocess_without_mtp(self, *args, **kwargs):
+        if not model.training:  # follow the DistillationModel: the teacher always runs in eval()
+            return type(self)._postprocess(self, *args, **kwargs)
+        # Hide `mtp_num_layers`, which runs the MTP loss, from this call only: the config is shared
+        # by all submodules, and Megatron-Bridge mirrors writes to the student's onto the teacher's.
+        config = self.config
+        self.config = copy.copy(config)
+        object.__setattr__(self.config, "mtp_num_layers", None)
+        try:
+            return type(self)._postprocess(self, *args, **{**kwargs, "mtp_in_postprocess": False})
+        finally:
+            self.config = config
+
+    for module in skipped_mtp_models:
+        module._postprocess = MethodType(_postprocess_without_mtp, module)
+    if distill_cfg.skip_frozen_mtp:
+        warn_rank_0(
+            "Training forwards skip the MTP head (skip_frozen_mtp); evaluation still runs it."
+            if skipped_mtp_models
+            else "skip_frozen_mtp is set but no model has an MTP head: nothing to skip."
+        )
+
+    # HACK: Pipeline-parallel Distillation requires splitting input tensor into student and teacher parts.
+    def _set_student_input_tensor_shape(self, shapes: list[tuple[int]]):
+        self._tensor_split_idx = shapes[0][-1]
+
+    def _set_input_tensor(self, input_tensors: list[Tensor]):
+        teacher_inputs = [
+            t[..., self._tensor_split_idx :] if t is not None else t for t in input_tensors
+        ]
+        student_inputs = [
+            t[..., : self._tensor_split_idx] if t is not None else t for t in input_tensors
+        ]
+        type(self).set_input_tensor(self.teacher_model, teacher_inputs)
+        type(self).set_input_tensor(self, student_inputs)
+
+    model.set_student_input_tensor_shape = MethodType(_set_student_input_tensor_shape, model)
+    model.set_input_tensor = MethodType(_set_input_tensor, model)
+
+    # HACK: Concatenate output tensors when PP>1 so they can be passed between ranks.
+    def _forward(self, *args, **kwargs):
+        with torch.no_grad():
+            self._teacher_model.eval()
+            teacher_output = self._teacher_model(*args, **kwargs)
+
+        self._lm_loss_call_count = 0  # reset loss-fn call counter for MTP tracking
+
+        with self.only_student_forward():
+            student_output = type(self).forward(self, *args, **kwargs)
+
+        if not parallel_state.is_pipeline_last_stage():
+            return torch.cat([student_output, teacher_output], dim=-1)
+        else:
+            return student_output
+
+    model.forward = MethodType(_forward, model)
+
+
+def get_tensor_shapes_adjust_fn_for_distillation(
+    model: torch.nn.Module | list[torch.nn.Module], **kwargs
+) -> Callable | None:
+    """Return the function to adjust tensor shapes for Distillation in Megatron-Core's forward pass.
+
+    Currently only used during non-interleaved pipelining for Distillation.
+    Concatenates sizes of student and teacher output tensors for inter-process communication.
+    """
+    if (
+        parallel_state.get_pipeline_model_parallel_world_size() == 1
+        or parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
+    ):
+        return None
+    # Unwrap
+    if isinstance(model, list):
+        model = model[0]
+    while hasattr(model, "module"):
+        model = model.module
+    if not isinstance(model, mtd.DistillationModel):
+        return None
+
+    def adjust_tensor_shapes(
+        recv_tensor_shapes: list[tuple[int, ...]], send_tensor_shapes: list[tuple[int, ...]]
+    ):
+        teacher_config = get_model_config(model.teacher_model)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+
+        teacher_recv_tensor_shapes = get_tensor_shapes(
+            config=teacher_config, tp_group=tp_group, cp_group=cp_group, **kwargs
+        )
+        teacher_send_tensor_shapes = get_tensor_shapes(
+            config=teacher_config, tp_group=tp_group, cp_group=cp_group, **kwargs
+        )
+        model.set_student_input_tensor_shape(recv_tensor_shapes)
+
+        for i, shape in enumerate(recv_tensor_shapes):
+            shape = list(shape)
+            shape[-1] += teacher_recv_tensor_shapes[0][-1]  # type: ignore[index]
+            recv_tensor_shapes[i] = tuple(shape)
+        for i, shape in enumerate(send_tensor_shapes):
+            shape = list(shape)
+            shape[-1] += teacher_send_tensor_shapes[0][-1]  # type: ignore[index]
+            send_tensor_shapes[i] = tuple(shape)
+
+        return recv_tensor_shapes, send_tensor_shapes
+
+    return adjust_tensor_shapes

@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from functools import partial
+
+import pytest
+import torch
+from _test_utils.torch.transformers_models import create_tiny_llama_dir
+from transformers import AutoModelForCausalLM
+
+import modelopt.torch.quantization as mtq
+
+
+class _Wrapper(torch.nn.Module):
+    """A module holding the HF model, as trainers and PEFT do."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids):
+        return self.model(input_ids)
+
+
+def _test_transformers_tp(model_path, wrapped, rank, size):
+    model_tp = AutoModelForCausalLM.from_pretrained(model_path, tp_plan="auto")
+    input_ids = torch.randint(0, model_tp.config.vocab_size, (10, 512), device=f"cuda:{rank}")
+    to_quantize = _Wrapper(model_tp) if wrapped else model_tp
+    mtq.quantize(to_quantize, mtq.NVFP4_AWQ_LITE_CFG, lambda model: model(input_ids))
+    # Every TP-sharded decoder linear must be quantized as a TP-aware layer, on every transformers
+    # TP layout (module-level plan attribute before 5.16, DTensor weights after).
+    decoder_linears = [m for m in model_tp.model.layers.modules() if isinstance(m, torch.nn.Linear)]
+    assert decoder_linears
+    assert all(
+        getattr(m, "_is_column_parallel", False) or getattr(m, "_is_row_parallel", False)
+        for m in decoder_linears
+    )
+    outputs_ref = model_tp(input_ids)  # Test that the model forward pass works
+
+    mtq.fold_weight(model_tp)
+    outputs_test = model_tp(input_ids)  # Test that the model forward pass works
+    assert torch.allclose(outputs_ref.logits, outputs_test.logits, atol=1e-4)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_transformers_tp(need_2_gpus, dist_workers, tmp_path, wrapped):
+    model_path = create_tiny_llama_dir(tmp_path)
+    dist_workers.run(partial(_test_transformers_tp, model_path, wrapped))

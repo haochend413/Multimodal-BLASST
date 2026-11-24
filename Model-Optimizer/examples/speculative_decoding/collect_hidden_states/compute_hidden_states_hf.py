@@ -1,0 +1,252 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Extract hidden states from an HF-compatible LLM."""
+
+import argparse
+import asyncio
+import os
+from pathlib import Path
+
+import torch
+from common import (
+    add_answer_only_loss_args,
+    add_aux_layers_args,
+    add_no_aux_hidden_states_args,
+    load_conversations,
+    load_tokenizer,
+    resolve_aux_layers,
+    tokenize_with_loss_mask,
+)
+from tqdm import tqdm as tqdm
+from transformers import AutoModel
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="""Collect hidden states from conversations
+        by running full conversations through a Hugging Face model."""
+    )
+
+    ## Model & Generation Parameters ##
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="Name of the served model.",
+    )
+
+    ## Client Parameters ##
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=3072,
+        help="""Maximum number of tokens in a conversation. Longer conversations will be skipped.
+        Defaults to 3072 tokens.""",
+    )
+
+    ## I/O Parameters ##
+    parser.add_argument(
+        "--input-data",
+        type=Path,
+        required=True,
+        help="""Path to the `jsonl` file or directory containing `jsonl` files.""",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="""Root directory in which to save the hidden states.
+        The data will be saved as a torch (`.pt`) dump file for each conversation.""",
+    )
+    parser.add_argument(
+        "--debug-max-num-conversations",
+        type=int,
+        default=None,
+        help="""For debugging purposes, limit the number of conversations processed.
+        Default is None, meaning no limit.""",
+    )
+    parser.add_argument(
+        "--dp-rank",
+        type=int,
+        default=0,
+        help="""Data parallel rank. TASK_ID on SLURM.""",
+    )
+    parser.add_argument(
+        "--dp-world-size",
+        type=int,
+        default=1,
+        help="""Data parallel world size. Number of tasks on SLURM.""",
+    )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help="Set trust_remote_code for Huggingface models and tokenizers",
+    )
+    add_aux_layers_args(parser)
+    add_answer_only_loss_args(parser)
+    add_no_aux_hidden_states_args(parser)
+
+    return parser.parse_args()
+
+
+def main(args: argparse.Namespace) -> None:
+    # Load conversations
+    dataset = load_conversations(args.input_data, args.dp_rank, args.dp_world_size)
+    print(
+        f"Sharded dataset to {len(dataset)} conversations for DP#{args.dp_rank}/{args.dp_world_size}"
+    )
+
+    # Remove already dumped conversations
+    def keep_conversation(entry):
+        conversation_id = entry.get("conversation_id", entry.get("uuid", None))
+        assert conversation_id is not None, "conversation_id is required"
+        output_file = args.output_dir / f"{conversation_id}.pt"
+        return not output_file.exists()
+
+    original_num = len(dataset)
+    dataset = dataset.filter(keep_conversation)
+    print(
+        "Removed",
+        original_num - len(dataset),
+        "conversations due to existing output files",
+    )
+
+    # For debugging
+    if args.debug_max_num_conversations is not None:
+        dataset = dataset.select(range(args.debug_max_num_conversations))
+
+    model = AutoModel.from_pretrained(
+        args.model, dtype="auto", device_map="auto", trust_remote_code=args.trust_remote_code
+    )
+    # Multimodal checkpoints (e.g. *ForConditionalGeneration) keep the language
+    # model's depth under config.text_config.
+    text_config = (
+        getattr(model.config, "text_config", None)
+        or getattr(model.config, "llm_config", None)
+        or model.config
+    )
+    num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+    if num_hidden_layers is None:
+        raise ValueError(f"config has no 'num_hidden_layers' attribute: {text_config}")
+    selected_layer_ids = resolve_aux_layers(args, num_hidden_layers)
+
+    tokenizer = load_tokenizer(args)
+
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    num_skipped_too_long = 0
+    num_invalid = 0
+    num_success = 0
+    pbar = tqdm(total=len(dataset), desc=f"DP#{args.dp_rank} Processing conversations")
+
+    async def dump_hidden_states(
+        idx: int,
+        conversation_id: int,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ):
+        nonlocal num_success
+
+        # Get hidden states
+        with torch.inference_mode():
+            outputs = model(input_ids=input_ids.to(model.device), output_hidden_states=True)
+            # outputs.hidden_states[0] is the embedding output; layer k output is at index k+1.
+            hidden_states = outputs.hidden_states
+            # Only build the aux planes when they will be stored: assembling them costs a
+            # concatenation and a device-to-host copy per conversation, which is pure waste
+            # on a dump that is about to drop them.
+            aux_hidden_states = (
+                None
+                if args.no_aux_hidden_states
+                else torch.cat(
+                    [hidden_states[lid + 1].squeeze(0).cpu() for lid in selected_layer_ids],
+                    dim=-1,
+                )
+            )
+            output_hidden_states = hidden_states[-1].squeeze(0).cpu()
+        # Write-then-rename: keep_conversation() skips any existing <id>.pt as finished work,
+        # so a partial file from an interrupted run would be skipped forever and then fail in
+        # torch.load at training time. os.replace is atomic within the same directory.
+        output_file = output_dir / f"{conversation_id}.pt"
+        tmp_file = output_file.with_suffix(".pt.tmp")
+        try:
+            with open(tmp_file, "wb") as f:
+                torch.save(
+                    {
+                        "input_ids": input_ids.squeeze(0).cpu(),
+                        "hidden_states": output_hidden_states,
+                        **(
+                            {}
+                            if args.no_aux_hidden_states
+                            else {"aux_hidden_states": aux_hidden_states}
+                        ),
+                        "loss_mask": loss_mask,
+                        "conversation_id": conversation_id,
+                    },
+                    f,
+                )
+            os.replace(tmp_file, output_file)
+        except BaseException:
+            tmp_file.unlink(missing_ok=True)
+            raise
+
+        num_success += 1
+        pbar.update(1)
+
+    async def submit_generates():
+        nonlocal num_skipped_too_long
+        nonlocal num_invalid
+        tasks = []
+        idx = 0
+        for entry in dataset:
+            conversation_id = entry.get("conversation_id", entry.get("uuid"))
+
+            conversations = entry.get("messages") or entry["conversations"]
+            if not conversations or not isinstance(conversations, list):
+                num_invalid += 1
+                continue
+
+            # Single apply_chat_template call produces both input_ids and loss_mask,
+            # guaranteeing they come from the same tokenization.
+            input_ids, loss_mask = tokenize_with_loss_mask(
+                tokenizer, conversations, args.answer_only_loss
+            )
+            num_input_tokens = input_ids.shape[1]
+            if num_input_tokens <= 10 or num_input_tokens > args.max_seq_len:
+                num_skipped_too_long += 1
+                continue
+
+            tasks.append(dump_hidden_states(idx, conversation_id, input_ids, loss_mask))
+            # Increment only for valid conversations to match dump file index
+            idx += 1
+        await asyncio.gather(*tasks)
+
+    asyncio.run(submit_generates())
+
+    if num_skipped_too_long > 0:
+        print(f"Skipped {num_skipped_too_long} conversations due to length constraints.")
+    if num_invalid > 0:
+        print(f"Skipped {num_invalid} invalid conversations without proper fields.")
+
+    if num_success == len(dataset):
+        print(f"Successfully processed all {num_success} conversations.")
+    else:
+        print(f"Successfully processed {num_success} out of {len(dataset)} conversations.")
+
+
+if __name__ == "__main__":
+    cli_args = parse_args()
+    main(cli_args)

@@ -1,0 +1,1067 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Support quantization for VLLM layers."""
+
+import contextvars
+import importlib
+import inspect
+import sys
+import warnings
+from collections.abc import Callable
+from contextlib import contextmanager
+from functools import partial
+from itertools import chain
+from types import ModuleType
+
+import torch
+import vllm.model_executor.layers.fused_moe.layer as vllm_fused_moe_layer
+import vllm.model_executor.layers.linear as vllm_linear
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_tp_group
+
+from ...utils.distributed import ParallelState
+from ..conversion import set_quantizer_by_cfg
+from ..nn import (
+    QuantLinearConvBase,
+    QuantModule,
+    QuantModuleRegistry,
+    SequentialQuantizer,
+    TensorQuantizer,
+)
+from .custom import CUSTOM_MODEL_PLUGINS
+
+_NVFP4_ATTENTION_QUANTIZER_CFG = {
+    "num_bits": (2, 1),
+    "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+}
+_VLLM_NVFP4_ATTENTION_QUANT_CFG = [
+    {"quantizer_name": "*_bmm_quantizer", "enable": False},
+    *(
+        {
+            "quantizer_name": f"*{name}_bmm_quantizer",
+            "cfg": _NVFP4_ATTENTION_QUANTIZER_CFG,
+            "enable": True,
+        }
+        for name in ("q", "k", "p", "v")
+    ),
+]
+_FP8_ATTENTION_QUANTIZER_CFG = {"num_bits": (4, 3)}  # per-tensor E4M3, static scale amax/448
+_BMM2_FORMAT_CFGS = {"nvfp4": _NVFP4_ATTENTION_QUANTIZER_CFG, "fp8": _FP8_ATTENTION_QUANTIZER_CFG}
+
+
+def build_vllm_attention_quant_cfg(
+    *,
+    q_format: str = "nvfp4",
+    k_format: str = "nvfp4",
+    p_format: str = "nvfp4",
+    v_format: str = "nvfp4",
+) -> list:
+    """Build the attention BMM quantizer config with per-operand formats.
+
+    Each of Q/K/P/V takes "nvfp4" (dynamic block-16, two-level scale) or
+    "fp8" (per-tensor E4M3, static scale amax/448).
+    """
+    formats = {"q": q_format, "k": k_format, "p": p_format, "v": v_format}
+    for name, fmt in formats.items():
+        if fmt not in _BMM2_FORMAT_CFGS:
+            raise ValueError(
+                f"{name}_format must be one of {sorted(_BMM2_FORMAT_CFGS)}, got {fmt!r}"
+            )
+    return [
+        {"quantizer_name": "*_bmm_quantizer", "enable": False},
+        *(
+            {
+                "quantizer_name": f"*{name}_bmm_quantizer",
+                "cfg": _BMM2_FORMAT_CFGS[fmt],
+                "enable": True,
+            }
+            for name, fmt in formats.items()
+        ),
+    ]
+
+
+def _import_attention_module():
+    """Import a vLLM module that exports the concrete ``Attention`` class."""
+    for module_name in (
+        "vllm.attention.layer",
+        "vllm.model_executor.layers.attention",
+        "vllm.attention",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if hasattr(module, "Attention"):
+            return module
+    raise ImportError("No supported vLLM Attention module was found")
+
+
+vllm_attention = _import_attention_module()
+
+# Try multiple import paths for vLLM compatibility across versions
+vllm_shared_fused_moe_layer = None
+for module_path in [
+    "vllm.model_executor.layers.fused_moe.shared_fused_moe",  # 0.11.0+
+    "vllm.model_executor.layers.shared_fused_moe.shared_fused_moe",  # 0.10.2
+]:
+    try:
+        vllm_shared_fused_moe_layer = importlib.import_module(module_path)
+        break
+    except ImportError:
+        continue
+
+
+def _is_module_cls(obj) -> bool:
+    """Whether obj is an nn.Module class we can register a dynamic module for."""
+    return isinstance(obj, type) and issubclass(obj, torch.nn.Module)
+
+
+def _import_unquantized_fused_moe_method() -> type | None:
+    """Return vLLM's unquantized fused-MoE method class across module layouts."""
+    for module_path in (
+        "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method",  # 0.24+
+        "vllm.model_executor.layers.fused_moe.layer",
+    ):
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        method_cls = getattr(module, "UnquantizedFusedMoEMethod", None)
+        if method_cls is not None:
+            return method_cls
+    return None
+
+
+UnquantizedFusedMoEMethod = _import_unquantized_fused_moe_method()
+
+try:
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+except ImportError:
+    RoutedExperts = None
+
+# vLLM >= 0.24 turned ``FusedMoE`` into a factory function and moved the expert weights onto a
+# ``RoutedExperts`` submodule; register whichever module class this release provides.
+# The forward_* check keeps a future rename surfacing here (skip + warn) rather than as an
+# AttributeError at the first expert forward, i.e. at serving time.
+_has_routed_experts_cls = (
+    UnquantizedFusedMoEMethod is not None
+    and _is_module_cls(RoutedExperts)
+    and all(hasattr(RoutedExperts, n) for n in ("forward_modular", "forward_monolithic"))
+)
+# The two layouts are mutually exclusive on every release. Prefer RoutedExperts if a future one
+# ships both: it owns the expert weights, and registering its parent too would convert both and
+# leave the parent's fakequant unable to tell w13 from w2.
+_has_fused_moe_cls = (
+    not _has_routed_experts_cls
+    and UnquantizedFusedMoEMethod is not None
+    and _is_module_cls(getattr(vllm_fused_moe_layer, "FusedMoE", None))
+)
+if vllm_shared_fused_moe_layer is not None and not (
+    UnquantizedFusedMoEMethod is not None
+    and _is_module_cls(getattr(vllm_shared_fused_moe_layer, "SharedFusedMoE", None))
+):
+    vllm_shared_fused_moe_layer = None
+
+if not (_has_fused_moe_cls or _has_routed_experts_cls):
+    # Without a registration target, mtq.quantize() silently leaves experts in full precision.
+    warnings.warn(
+        "This vLLM release exposes no supported fused-MoE module; MoE layers will NOT be "
+        "quantized. Linear and attention quantization are unaffected."
+    )
+
+try:
+    _has_attention_layers = importlib.util.find_spec("vllm.attention.layers") is not None
+except (ModuleNotFoundError, ValueError):
+    _has_attention_layers = False
+
+if _has_attention_layers:  # vllm < 0.15.0
+    from vllm.attention.layers.cross_attention import CrossAttention
+    from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
+else:
+    try:
+        from vllm.model_executor.layers.attention.cross_attention import CrossAttention
+    except ImportError:
+        CrossAttention = None
+    try:
+        from vllm.model_executor.layers.attention.encoder_only_attention import EncoderOnlyAttention
+    except ImportError:
+        EncoderOnlyAttention = None
+
+try:
+    VllmMLAAttention = vllm_attention.MLAAttention
+except (AttributeError, ImportError):
+    VllmMLAAttention = None
+
+_ATTENTION_TYPES = tuple(
+    t
+    for t in [vllm_attention.Attention, CrossAttention, EncoderOnlyAttention, VllmMLAAttention]
+    if t is not None
+)
+
+# vLLM may call one entry (e.g. ``dispatch_fused_moe_kernel``) which then calls another
+# (e.g. ``invoke_fused_moe_triton_kernel``). Patching every name would otherwise apply fakequant
+# twice; see ``_moe_fakequant_active`` in ``invoke_fused_moe_quantized``.
+_FUSED_MOE_KERNEL_CANDIDATES = (
+    "invoke_fused_moe_kernel",
+    "invoke_fused_moe_triton_kernel",
+    "dispatch_fused_moe_kernel",
+)
+# The launchers bind the kernels by name at import time, so patching only the defining module
+# would miss the call sites that vLLM >= 0.24 moved into ``experts.triton_moe``.
+_FUSED_MOE_KERNEL_MODULE_PATHS = (
+    "vllm.model_executor.layers.fused_moe.fused_moe",
+    "vllm.model_executor.layers.fused_moe.experts.triton_moe",
+)
+
+
+def _collect_fused_moe_kernel_targets() -> tuple[tuple[ModuleType, str], ...]:
+    """Return the ``(module, attribute)`` pairs holding fused-MoE kernel entry points."""
+    targets = []
+    for module_path in _FUSED_MOE_KERNEL_MODULE_PATHS:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        targets.extend(
+            (module, name) for name in _FUSED_MOE_KERNEL_CANDIDATES if hasattr(module, name)
+        )
+    return tuple(targets)
+
+
+_FUSED_MOE_KERNEL_TARGETS = _collect_fused_moe_kernel_targets()
+
+_moe_fakequant_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "moe_fakequant_active", default=False
+)
+# Set by the combine hook, so each MoE forward can check that vLLM called the hooked finalize.
+_moe_combine_quantized: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "moe_combine_quantized", default=False
+)
+
+
+def _iter_compile_targets(model):
+    """Yield every module in the model tree that exposes vLLM's compile marker."""
+    modules = getattr(model, "modules", None)
+    candidates = modules() if callable(modules) else (model,)
+    yield from (candidate for candidate in candidates if hasattr(candidate, "do_not_compile"))
+
+
+@contextmanager
+def disable_compilation(model):
+    """Temporarily disable every vLLM compile wrapper in a model tree.
+
+    Args:
+        model: The model whose compile wrappers should be disabled.
+    """
+    targets = tuple(_iter_compile_targets(model))
+    if not targets:
+        warnings.warn(
+            f"{type(model).__name__} has no modules exposing vLLM's 'do_not_compile' marker, "
+            "so ModelOpt cannot dynamically disable torch.compile during calibration. This "
+            "is harmless when vLLM is already running in eager mode (for example, with "
+            "--enforce-eager or CompilationMode.NONE). Otherwise, calibration may enter a "
+            "compiled path; rerun with --enforce-eager or add vLLM compile-wrapper support "
+            "for this model.",
+            stacklevel=2,
+        )
+        yield
+        return
+
+    states = []
+    try:
+        for target in targets:
+            had_do_not_compile = "do_not_compile" in vars(target)
+            previous_do_not_compile = target.do_not_compile
+            states.append((target, had_do_not_compile, previous_do_not_compile))
+            target.do_not_compile = True
+        yield
+    finally:
+        for target, had_do_not_compile, previous_do_not_compile in reversed(states):
+            if had_do_not_compile:
+                target.do_not_compile = previous_do_not_compile
+            else:
+                vars(target).pop("do_not_compile", None)
+
+
+# vLLM Attention stores ``device``/``dtype`` as plain attrs; ``dtype`` may be a string
+# (e.g. ``"float16"``, ``"auto"``). We resolve and stamp concrete torch types before
+# QuantModule replacement. Priority: explicit attrs → KV-cache → shallow tensor scan.
+# No model-wide fallback: a tensor from a different shard gives the wrong device under TP.
+
+
+def _vllm_attr_dtype_to_torch(dtype) -> torch.dtype | None:
+    """Resolve vLLM dtype attr to ``torch.dtype``; ``None`` for ``"auto"`` (caller falls through)."""
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str) and dtype != "auto":
+        resolved = getattr(torch, dtype, None)
+        if resolved is None:
+            raise ValueError(f"Unrecognized vLLM dtype string: {dtype!r}")
+        return resolved
+    return None
+
+
+def _get_device_dtype(module: torch.nn.Module) -> tuple:
+    """Return ``(device, dtype)`` for a vLLM Attention module, or ``(None, None)`` if unresolvable."""
+    # Explicit attrs set by vLLM at construction — primary path.
+    dev, dt = getattr(module, "device", None), getattr(module, "dtype", None)
+    if dev is not None and dt is not None:
+        dt_resolved = _vllm_attr_dtype_to_torch(dt)
+        if dt_resolved is not None:
+            return dev, dt_resolved
+
+    # The KV cache, once allocated, sits on the layer's device; kv_cache is a list of tensors (v0)
+    # or a single tensor (v1). Its dtype is the --kv-cache-dtype storage format, not the compute
+    # dtype, which comes from vLLM's ``dtype`` attr or, for MLAAttention (no such attr), from the
+    # ``params_dtype`` its linear children keep even when their weights are pre-quantized (FP8).
+    kv = getattr(module, "kv_cache", None)
+    if kv is not None:
+        t0 = kv[0] if isinstance(kv, list | tuple) and len(kv) > 0 else kv
+        if isinstance(t0, torch.Tensor) and t0.numel() > 0:
+            params_dtypes = (getattr(m, "params_dtype", None) for m in module.children())
+            compute_dtype = _vllm_attr_dtype_to_torch(dt) or next(
+                (d for d in params_dtypes if isinstance(d, torch.dtype)), None
+            )
+            if compute_dtype is not None:
+                return t0.device, compute_dtype
+
+    # Shallow scan: weights often live on child modules rather than the attention module itself.
+    for mod in (module, *module.children()):
+        for t in chain(mod.parameters(recurse=False), mod.buffers(recurse=False)):
+            return t.device, t.dtype
+
+    return None, None
+
+
+def vllm_replace_quant_module_hook(model: torch.nn.Module) -> None:
+    """Prepare vLLM attention and loaded Kimi MLP modules before conversion."""
+    # Inspect loaded Kimi modules so other models never import K3 during conversion.
+    kimi_module = sys.modules.get("vllm.models.kimi_k3.nvidia.model")
+    kimi_mlp_cls = getattr(kimi_module, "KimiMLP", None)
+    low_latency_module = sys.modules.get("vllm.models.kimi_k3.nvidia.low_latency_gemm")
+    kimi_method_cls = getattr(low_latency_module, "KimiK3LowLatencyLinearMethod", None)
+
+    for _n, m in model.named_modules():
+        if isinstance(m, _ATTENTION_TYPES):
+            m.device, m.dtype = _get_device_dtype(m)
+        if kimi_mlp_cls is not None and isinstance(m, kimi_mlp_cls):
+            _prepare_kimi_mlp_fake_quant(m, kimi_method_cls)
+
+
+CUSTOM_MODEL_PLUGINS.add(vllm_replace_quant_module_hook)
+
+
+def _set_vllm_attention_kv_default_amax(module, device: torch.device) -> None:
+    """Set a global-scale-one amax on uncalibrated block-16 NVFP4 K/V quantizers."""
+    for name in ("k_bmm_quantizer", "v_bmm_quantizer"):
+        quantizer = getattr(module, name, None)
+        if (
+            not isinstance(quantizer, TensorQuantizer)
+            or not quantizer.is_enabled
+            or not quantizer.is_nvfp4_dynamic
+            or (quantizer.block_sizes or {}).get(-1) != 16
+            or hasattr(quantizer, "_amax")
+        ):
+            continue
+        quantizer.amax = torch.tensor(6.0 * 448.0, device=device, dtype=torch.float32)
+
+
+def _set_vllm_attention_fp8_bmm2_default_amax(module, device: torch.device) -> None:
+    """Set fixed amax on uncalibrated per-tensor FP8 BMM2 quantizers (P=1.0, V=448)."""
+    for name, default in (
+        ("q_bmm_quantizer", 448.0),
+        ("k_bmm_quantizer", 448.0),
+        ("p_bmm_quantizer", 1.0),
+        ("v_bmm_quantizer", 448.0),
+    ):
+        quantizer = getattr(module, name, None)
+        if (
+            not isinstance(quantizer, TensorQuantizer)
+            or not quantizer.is_enabled
+            or getattr(quantizer, "num_bits", None) != (4, 3)
+            or getattr(quantizer, "block_sizes", None)
+            or hasattr(quantizer, "_amax")
+        ):
+            continue
+        quantizer.amax = torch.tensor(default, device=device, dtype=torch.float32)
+
+
+def configure_vllm_nvfp4_attention_quantizers(
+    module: torch.nn.Module,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    cfg: list | None = None,
+) -> torch.nn.Module:
+    """Configure one vLLM Attention module for fused NVFP4 fake quantization.
+
+    This attention-scoped entry point avoids recursively converting vLLM Linear and MoE
+    modules. It configures only quantizer state; the caller remains responsible for installing
+    the fused attention implementation and enabling its in-kernel Q/V carriers.
+
+    Args:
+        module: A vLLM ``Attention`` module to convert and configure in place.
+        device: Device on which the attention quantizer state should reside.
+        dtype: Model compute dtype associated with the attention module.
+
+    Returns:
+        The supplied module, converted in place to ``_QuantVLLMAttention``.
+    """
+    if not isinstance(module, vllm_attention.Attention):
+        raise TypeError(f"Expected vLLM Attention, got {type(module).__name__}")
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"Expected torch.dtype, got {type(dtype).__name__}")
+
+    device = torch.device(device)
+    module.device, module.dtype = device, dtype
+    if not isinstance(module, _QuantVLLMAttention):
+        module = QuantModuleRegistry.convert(module)
+    if not hasattr(module, "p_bmm_quantizer"):
+        module.p_bmm_quantizer = TensorQuantizer()
+
+    set_quantizer_by_cfg(module, _VLLM_NVFP4_ATTENTION_QUANT_CFG if cfg is None else cfg)
+    for name in ("q", "k", "p", "v"):
+        getattr(module, f"{name}_bmm_quantizer").to(device=device)
+    _set_vllm_attention_kv_default_amax(module, device)
+    _set_vllm_attention_fp8_bmm2_default_amax(module, device)
+    return module
+
+
+def _vllm_attention_modelopt_post_restore(self) -> None:
+    """Move Attention module to its correct device after ModelOpt state restore."""
+    device, dtype = _get_device_dtype(self)
+    if device is None or dtype is None:
+        raise RuntimeError(
+            "Could not determine device/dtype for vLLM Attention. "
+            "Ensure vllm_replace_quant_module_hook runs before replace_quant_module."
+        )
+    self.to(device=device)
+
+
+class FakeQuantMethod:
+    """A class that implements fake quantization methods for vLLM models.
+
+    This class provides functionality to apply quantization methods to model layers
+    in a way that's compatible with vLLM's architecture.
+    """
+
+    def __init__(self, quant_method):
+        """Initialize the FakeQuantMethod.
+
+        Args:
+            quant_method: The quantization method to be applied to the model layers.
+        """
+        self.quant_method = quant_method
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply the quantization method to a given layer.
+
+        Args:
+            layer (torch.nn.Module): The neural network layer to be quantized.
+            x (torch.Tensor): The input tensor to the layer.
+            bias (torch.Tensor | None, optional): The bias tensor to the layer. Defaults to None.
+
+        Returns:
+            torch.Tensor: The quantized output tensor.
+        """
+        if layer.input_quantizer.is_enabled:
+            x = layer.input_quantizer(x)
+        if layer.weight_quantizer.is_enabled:
+            original_weight = layer.weight
+            quantized_tensor = layer.weight_quantizer(layer.weight)
+            # parameterize the quantized weight
+            if isinstance(original_weight, torch.nn.Parameter) and not isinstance(
+                quantized_tensor, torch.nn.Parameter
+            ):
+                quantized_tensor = torch.nn.Parameter(
+                    quantized_tensor, requires_grad=original_weight.requires_grad
+                )
+            layer.weight = quantized_tensor
+            try:
+                output = self.quant_method.apply(layer, x, bias)
+            finally:
+                layer.weight = original_weight
+        else:
+            output = self.quant_method.apply(layer, x, bias)
+        output = layer.output_quantizer(output)
+        return output
+
+
+def create_parallel_state():
+    """Create a parallel state for vLLM."""
+    dp_group = get_dp_group().device_group
+    tp_group = get_tp_group().device_group
+    try:
+        # EP group is only created for MoE models; dense models don't have one.
+        ep_group = get_ep_group().device_group
+    except (AssertionError, RuntimeError):
+        ep_group = -1
+    return ParallelState(dp_group, tp_group, ep_group)
+
+
+def _kimi_mlp_bf16_linear_supports_fake_quant(module: torch.nn.Module) -> bool:
+    weight = getattr(module, "weight", None)
+    return (
+        isinstance(weight, torch.Tensor)
+        and weight.ndim == 2
+        and weight.dtype == torch.bfloat16
+        and weight.layout == torch.strided
+        and not weight.is_quantized
+    )
+
+
+def _supports_fake_quant_linear(module: torch.nn.Module) -> bool:
+    return type(module.quant_method) is vllm_linear.UnquantizedLinearMethod
+
+
+def _check_unsupported_quantizers_disabled(module: torch.nn.Module, names) -> None:
+    """Raise if a pass-through layer has any enabled quantizers."""
+    enabled = [name for name in names if getattr(module, name).is_enabled]
+    if enabled:
+        layer = (
+            getattr(module, "prefix", "")
+            or getattr(module, "layer_name", "")
+            or type(module).__name__
+        )
+        raise RuntimeError(
+            f"{layer} uses vLLM's {type(module.quant_method).__name__}, which does not"
+            f" support ModelOpt fake quantization on this layer ({', '.join(enabled)} enabled)."
+            " Use a recipe that disables these quantizers or add validated method support."
+        )
+
+
+class _VLLMParallelLinear(QuantModule):
+    _QUANTIZER_NAMES = ("input_quantizer", "weight_quantizer", "output_quantizer")
+    # The parallel kind tells max_calibrate which amax to sync across TP ranks. Subclasses set it;
+    # _setup turns it off on layers that are not TP shards.
+    _is_column_parallel = False
+    _is_row_parallel = False
+
+    def _setup(self):
+        self.input_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_input)
+        self.weight_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_weight)
+        self.output_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_output)
+        self.output_quantizer.disable()
+        # Method support is explicit; storage dtype alone does not establish compatibility.
+        kimi_mlp_fake_quant_supported = self.__dict__.pop("_kimi_mlp_fake_quant_supported", False)
+        self._fake_quant_supported = (
+            _supports_fake_quant_linear(self) or kimi_mlp_fake_quant_supported
+        )
+        self.fake_quant_method = FakeQuantMethod(self.quant_method)
+        parallel_state = create_parallel_state()
+        weight = getattr(self, "weight", None)
+        if (
+            getattr(self, "tp_size", 1) > 1
+            and isinstance(weight, torch.Tensor)
+            and weight.dim() == 2
+        ):
+            # A TP shard: max_calibrate syncs its amax across TP by quantizer axis. Drop vLLM's EP
+            # group, like Megatron's non-expert linears: it spans the TP ranks, so its blind max
+            # would mix the per-channel or per-block amax of the shards.
+            parallel_state = ParallelState(
+                parallel_state.data_parallel_group.group,
+                parallel_state.tensor_parallel_group.group,
+            )
+        else:
+            # Replicas (disable_tp, e.g. a data-parallel vision encoder that may not run on every
+            # rank) and non-2-D weights (KDA conv1d) are not TP shards: no TP sync.
+            self._is_row_parallel = self._is_column_parallel = False
+        self.parallel_state = parallel_state
+
+    def iter_weights_for_calibration(self):
+        if self._fake_quant_supported:
+            yield from super().iter_weights_for_calibration()
+
+    def fold_weight(self, keep_attrs: bool = False):
+        if self._fake_quant_supported:
+            super().fold_weight(keep_attrs)
+
+    def _sync_input_pre_quant_scale_to_weight(self) -> None:
+        """Align pre_quant_scale to weight (vLLM CUTLASS expects matching device/dtype)."""
+        pqs = getattr(self.input_quantizer, "_pre_quant_scale", None)
+        if pqs is None:
+            return
+        w = getattr(self, "weight", None)
+        if w is None or not isinstance(w, torch.Tensor) or w.is_meta:
+            return
+        if pqs.device != w.device or pqs.dtype != w.dtype:
+            self.input_quantizer._pre_quant_scale.data = pqs.data.to(device=w.device, dtype=w.dtype)
+
+    def modelopt_post_restore(self, prefix: str = "") -> None:
+        super().modelopt_post_restore(prefix=prefix)
+        self._sync_input_pre_quant_scale_to_weight()
+
+    def forward(self, input_):
+        if not self._fake_quant_supported:
+            _check_unsupported_quantizers_disabled(self, self._QUANTIZER_NAMES)
+            return super().forward(input_)
+        # This context manager will conflict with torch.compile
+        # with replace_function(self, "quant_method", self.fake_quant_method):
+        # Manually replace quant_method instead
+        original_quant_method = self.quant_method
+        self.quant_method = self.fake_quant_method
+        try:
+            return super().forward(input_)
+        finally:
+            self.quant_method = original_quant_method
+
+
+def _kimi_down_proj_has_enabled_quantizers(down_proj: torch.nn.Module) -> bool:
+    return any(
+        (quantizer := getattr(down_proj, name, None)) is not None and quantizer.is_enabled
+        for name in _VLLMParallelLinear._QUANTIZER_NAMES
+    )
+
+
+class _KimiGemmRsFakeQuantGuard:
+    """Keep vLLM 0.28 GEMM-RS when the down projection is not fake-quantized."""
+
+    def __init__(self, down_proj: vllm_linear.RowParallelLinear) -> None:
+        self.down_proj = down_proj
+
+    def __bool__(self) -> bool:
+        return not _kimi_down_proj_has_enabled_quantizers(self.down_proj)
+
+
+class _KimiGemmRsArFakeQuantGuard:
+    """Keep Kimi's fused collective GEMM for projections without enabled fake quantizers."""
+
+    def __init__(self, gemm_rs_ar, down_proj: _VLLMParallelLinear) -> None:
+        self.gemm_rs_ar = gemm_rs_ar
+        self.down_proj = down_proj
+
+    def should_run(self, x: torch.Tensor) -> bool:
+        return not _kimi_down_proj_has_enabled_quantizers(
+            self.down_proj
+        ) and self.gemm_rs_ar.should_run(x)
+
+    def __call__(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return self.gemm_rs_ar(x, weight)
+
+
+def _prepare_kimi_mlp_fake_quant(module: torch.nn.Module, kimi_method_cls: type | None) -> None:
+    """Mark supported Kimi MLP linears and bypass fused GEMM when quantized."""
+    for linear in (module.gate_up_proj, module.down_proj):
+        if (
+            kimi_method_cls is not None
+            and type(getattr(linear, "quant_method", None)) is kimi_method_cls
+            and _kimi_mlp_bf16_linear_supports_fake_quant(linear)
+        ):
+            linear._kimi_mlp_fake_quant_supported = True
+
+    down_proj = module.down_proj
+    if not isinstance(down_proj, (vllm_linear.RowParallelLinear, _VLLMParallelLinear)):
+        return
+    # vLLM 0.28 checks this flag before calling down_proj.forward.
+    if getattr(module, "run_gemm_rs", False) is True:
+        module.run_gemm_rs = _KimiGemmRsFakeQuantGuard(down_proj)
+    gemm_rs_ar = getattr(module, "gemm_rs_ar", None)
+    if gemm_rs_ar is not None and not isinstance(gemm_rs_ar, _KimiGemmRsArFakeQuantGuard):
+        # QuantModule conversion updates down_proj in place, preserving this reference.
+        module.gemm_rs_ar = _KimiGemmRsArFakeQuantGuard(gemm_rs_ar, down_proj)
+
+
+def post_restore_vllm_parallel_linears(model: torch.nn.Module) -> None:
+    """Re-run modelopt_post_restore on vLLM parallel linears after set_quantizer_state_dict.
+
+    restore_quantizer_state already calls modelopt_post_restore on all QuantModules, but vLLM
+    reload paths that load modelopt_state_weights via set_quantizer_state_dict do not.
+    """
+    for module in model.modules():
+        if isinstance(module, _VLLMParallelLinear):
+            module.modelopt_post_restore("")
+
+
+@QuantModuleRegistry.register({vllm_linear.RowParallelLinear: "vllm_RowParallelLinear"})
+class _QuantVLLMRowParallelLinear(_VLLMParallelLinear):
+    _is_row_parallel = True
+
+
+@QuantModuleRegistry.register({vllm_linear.ColumnParallelLinear: "vllm_ColumnParallelLinear"})
+class _QuantVLLMColumnParallelLinear(_VLLMParallelLinear):
+    _is_column_parallel = True
+
+
+# vLLM's merged and QKV layers use ColumnParallelLinear's forward, so the registry gives them the
+# class above, which is registered first. Subclassing it keeps them the same if that order changes.
+@QuantModuleRegistry.register(
+    {vllm_linear.MergedColumnParallelLinear: "vllm_MergedColumnParallelLinear"}
+)
+class _QuantVLLMMergedColumnParallelLinear(_QuantVLLMColumnParallelLinear):
+    pass
+
+
+@QuantModuleRegistry.register({vllm_linear.QKVParallelLinear: "vllm_QKVParallelLinear"})
+class _QuantVLLMQKVParallelLinear(_QuantVLLMColumnParallelLinear):
+    pass
+
+
+# ReplicatedLinear is for MoE router and should not be quantized
+
+
+class _QuantFusedMoEBase(QuantModule):
+    _QUANTIZER_NAMES = tuple(
+        f"{w}_{kind}_quantizer" for w in ("w13", "w2") for kind in ("input", "weight", "output")
+    )
+
+    def _setup(self):
+        self.w13_input_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_input)
+        self.w2_input_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_input)
+        self.w13_weight_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_weight)
+        self.w2_weight_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_weight)
+        self.w13_output_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_output)
+        self.w2_output_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_output)
+        self.w13_output_quantizer.disable()
+        self.w2_output_quantizer.disable()
+        # Experts vLLM runs with another method (e.g. a pre-quantized FP8 checkpoint) pass through.
+        self._prequantized = type(self.quant_method) is not UnquantizedFusedMoEMethod
+        self.parallel_state = create_parallel_state()
+
+    def iter_weights_for_calibration(self):
+        """Yield the fused MoE weights with their corresponding quantizers."""
+        if self._prequantized:
+            return
+        yield self.w13_weight, self.w13_weight_quantizer
+        yield self.w2_weight, self.w2_weight_quantizer
+
+    def invoke_fused_moe_quantized(
+        self,
+        A: torch.Tensor,  # noqa: N803
+        B: torch.Tensor,  # noqa: N803
+        C: torch.Tensor,  # noqa: N803
+        *args,
+        original_kernel: Callable,
+        **kwargs,
+    ):
+        # Nested module-level entry (e.g. dispatch -> triton): call the real kernel once, no second quant.
+        if _moe_fakequant_active.get():
+            return original_kernel(A, B, C, *args, **kwargs)
+        token = _moe_fakequant_active.set(True)
+        try:
+            return self._invoke_fused_moe_quantized_function(
+                A, B, C, *args, original_kernel=original_kernel, **kwargs
+            )
+        finally:
+            _moe_fakequant_active.reset(token)
+
+    def _invoke_fused_moe_quantized_function(
+        self,
+        A: torch.Tensor,  # noqa: N803
+        B: torch.Tensor,  # noqa: N803
+        C: torch.Tensor,  # noqa: N803
+        *args,
+        original_kernel: Callable,
+        **kwargs,
+    ):
+        if B is self.w13_weight:
+            # First layer of expert
+            A = self.w13_input_quantizer(A)  # noqa: N806
+            if self.w13_weight_quantizer.is_enabled:  # pragma: no cover
+                # Same pattern as FakeQuantMethod.apply: wrap as nn.Parameter if needed, swap
+                # w13_weight, call kernel, restore (tensor cannot stay assigned to nn.Parameter slot).
+                original_weight = self.w13_weight
+                quantized_tensor = self.w13_weight_quantizer(original_weight)
+                try:
+                    if isinstance(original_weight, torch.nn.Parameter) and not isinstance(
+                        quantized_tensor, torch.nn.Parameter
+                    ):
+                        quantized_tensor = torch.nn.Parameter(
+                            quantized_tensor, requires_grad=original_weight.requires_grad
+                        )
+                    self.w13_weight = quantized_tensor
+                    B = quantized_tensor  # noqa: N806
+                    original_kernel(A, B, C, *args, **kwargs)
+                finally:
+                    self.w13_weight = original_weight
+            else:
+                original_kernel(A, B, C, *args, **kwargs)
+            if self.w13_output_quantizer.is_enabled:
+                C[:] = self.w13_output_quantizer(C)
+        elif B is self.w2_weight:
+            A = self.w2_input_quantizer(A)  # noqa: N806
+            if self.w2_weight_quantizer.is_enabled:  # pragma: no cover
+                original_weight = self.w2_weight
+                quantized_tensor = self.w2_weight_quantizer(original_weight)
+                try:
+                    if isinstance(original_weight, torch.nn.Parameter) and not isinstance(
+                        quantized_tensor, torch.nn.Parameter
+                    ):
+                        quantized_tensor = torch.nn.Parameter(
+                            quantized_tensor, requires_grad=original_weight.requires_grad
+                        )
+                    self.w2_weight = quantized_tensor
+                    B = quantized_tensor  # noqa: N806
+                    original_kernel(A, B, C, *args, **kwargs)
+                finally:
+                    self.w2_weight = original_weight
+            else:
+                original_kernel(A, B, C, *args, **kwargs)
+            if self.w2_output_quantizer.is_enabled:
+                C[:] = self.w2_output_quantizer(C)
+        else:
+            raise ValueError("Cannot determine first or second layer of expert")
+
+    @contextmanager
+    def _fakequant_moe_kernels(self):
+        """Route vLLM's fused-MoE kernels through this module's quantizers.
+
+        They are module-level functions, so fakequant is installed by name for this forward.
+        Patching is process-wide: safe for the LIFO nesting vLLM does, but not thread-safe.
+        """
+        if self._prequantized:
+            _check_unsupported_quantizers_disabled(self, self._QUANTIZER_NAMES)
+        if self._prequantized or not any(
+            getattr(self, name).is_enabled for name in self._QUANTIZER_NAMES
+        ):
+            # Nothing to fake-quantize inside the kernels (e.g. a communication-only recipe).
+            yield
+            return
+        assert _FUSED_MOE_KERNEL_TARGETS, "No vLLM fused-MoE kernel entry point found to patch"
+        # Patch by hand rather than with ``replace_function``: that context manager conflicts
+        # with torch.compile (same reason ``_VLLMParallelLinear.forward`` swaps quant_method).
+        originals = [
+            (module, name, getattr(module, name)) for module, name in _FUSED_MOE_KERNEL_TARGETS
+        ]
+        try:
+            for module, name, original_kernel in originals:
+                setattr(
+                    module,
+                    name,
+                    partial(self.invoke_fused_moe_quantized, original_kernel=original_kernel),
+                )
+            yield
+        finally:
+            for module, name, original_kernel in originals:
+                setattr(module, name, original_kernel)
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        # This context manager will conflict with torch.compile
+        with self._fakequant_moe_kernels():
+            return super().forward(hidden_states, router_logits)
+
+    @torch.no_grad()
+    def fold_weight(self, keep_attrs: bool = False):
+        if self._prequantized:
+            return
+        # the MoE weights can be super large, it consumes too much memory, so we need to fold the weight one by one
+        for weight, quantizer in (
+            (self.w13_weight, self.w13_weight_quantizer),
+            (self.w2_weight, self.w2_weight_quantizer),
+        ):
+            self._fold_weight_quantizer(
+                quantizer, (weight[i] for i in range(weight.shape[0])), keep_attrs
+            )
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+if _has_fused_moe_cls:
+
+    @QuantModuleRegistry.register({vllm_fused_moe_layer.FusedMoE: "vllm_FusedMoE"})
+    class _QuantVLLMFusedMoE(_QuantFusedMoEBase):
+        pass
+
+
+if vllm_shared_fused_moe_layer is not None:
+
+    @QuantModuleRegistry.register(
+        {vllm_shared_fused_moe_layer.SharedFusedMoE: "vllm_SharedFusedMoE"}
+    )
+    class _QuantVLLMSharedFusedMoE(_QuantFusedMoEBase):
+        pass
+
+
+if _has_routed_experts_cls:
+
+    @QuantModuleRegistry.register({RoutedExperts: "vllm_RoutedExperts"})
+    class _QuantVLLMRoutedExperts(_QuantFusedMoEBase):
+        """Expert-weight owner of the vLLM >= 0.24 ``MoERunner`` pipeline.
+
+        ``MoERunner`` calls ``forward_modular``/``forward_monolithic`` instead of ``__call__``.
+        ``dispatch_quantizer`` and ``combine_quantizer`` fake-quantize the expert-parallel
+        communication: the routed tokens entering the MoE kernel's prepare step (dispatch) and
+        the expert output entering its finalize step (combine).
+        """
+
+        def _setup(self):
+            super()._setup()
+            # Not in _QUANTIZER_NAMES: they act on activations, so pre-quantized experts allow them.
+            self.dispatch_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_input)
+            self.combine_quantizer = TensorQuantizer(QuantLinearConvBase.default_quant_desc_input)
+            self.dispatch_quantizer.disable()
+            self.combine_quantizer.disable()
+
+        def forward(self, *args, **kwargs):
+            # Keep vLLM's own "call forward_modular/forward_monolithic instead" error rather
+            # than the inherited (hidden_states, router_logits) signature.
+            return RoutedExperts.forward(self, *args, **kwargs)
+
+        def forward_modular(self, x, *args, **kwargs):
+            with self._combine_hooked(), self._fakequant_moe_kernels():
+                return super().forward_modular(self.dispatch_quantizer(x), *args, **kwargs)
+
+        def forward_monolithic(self, x, *args, **kwargs):
+            with self._combine_hooked(), self._fakequant_moe_kernels():
+                return super().forward_monolithic(self.dispatch_quantizer(x), *args, **kwargs)
+
+        @contextmanager
+        def _combine_hooked(self):
+            """Hook the combine for this forward and raise if vLLM did not call the hooked step."""
+            self._hook_combine()
+            token = _moe_combine_quantized.set(False)
+            try:
+                yield
+                if self.combine_quantizer.is_enabled and not _moe_combine_quantized.get():
+                    # E.g. vLLM deferred finalize (UnfinalizedMoEOutput) without expert parallelism.
+                    raise RuntimeError(
+                        f"{self.layer_name}: vLLM's MoE kernel did not call the finalize step that"
+                        " combine_quantizer hooks; enable expert parallelism."
+                    )
+            finally:
+                _moe_combine_quantized.reset(token)
+
+        def _hook_combine(self) -> None:
+            """Route the expert output that the kernel's finalize sends through combine_quantizer."""
+            if not self.combine_quantizer.is_enabled:
+                return
+            if getattr(self.moe_config, "use_passthrough_all2all", False):
+                # E.g. --moe-backend flashinfer_moe_ep_*: finalize only sees the combined output.
+                raise RuntimeError(
+                    f"{self.layer_name}: the MoE backend combines inside its kernel, where"
+                    " combine_quantizer cannot reach; use another one."
+                )
+            moe_kernel = getattr(self.quant_method, "moe_kernel", None)
+            if moe_kernel is None:
+                raise RuntimeError(
+                    f"{self.layer_name}: combine_quantizer needs a vLLM modular MoE kernel, which"
+                    f" {type(self.quant_method).__name__} does not use."
+                )
+            # Every forward: a later quantize call may reconfigure combine_quantizer.
+            self._check_combine_scale(moe_kernel)
+            # vLLM builds one prepare/finalize object per layer and may rebuild it (elastic EP).
+            prepare_finalize = moe_kernel.prepare_finalize
+            if getattr(prepare_finalize, "_combine_quantizer_owner", None) is self:
+                return
+            # The kernel calls finalize or, for async backends, finalize_async; neither calls the other.
+            for name in ("finalize", "finalize_async"):
+                if not hasattr(prepare_finalize, name):
+                    continue
+                finalize = getattr(prepare_finalize, name)
+                parameters = list(inspect.signature(finalize).parameters)
+                if "fused_expert_output" not in parameters:
+                    raise RuntimeError(
+                        f"{self.layer_name}: {type(prepare_finalize).__name__}.{name} takes no"
+                        " fused_expert_output for combine_quantizer."
+                    )
+                index = parameters.index("fused_expert_output")
+                setattr(prepare_finalize, name, partial(self._quantize_combine, finalize, index))
+            prepare_finalize._combine_quantizer_owner = self
+
+        def _check_combine_scale(self, moe_kernel) -> None:
+            """Require a fixed global scale on payloads with rows that no token fills."""
+            prepare_finalize = moe_kernel.prepare_finalize
+            backend = type(prepare_finalize).__name__
+            if not (
+                prepare_finalize.activation_format.name == "BatchedExperts"  # DeepEP LL, NIXL
+                or backend == "FlashInferNVLinkOneSidedPrepareAndFinalize"
+                # DeepEP v2 with CUDA graphs sends worst-case rows, which these experts leave stale.
+                or (
+                    backend == "DeepEPV2PrepareAndFinalize"
+                    and getattr(prepare_finalize, "use_cudagraph", False)
+                    and type(getattr(moe_kernel, "fused_experts", None)).__name__
+                    == "HummingIndexedExperts"
+                )
+            ):
+                return
+            quantizer = self.combine_quantizer
+            members = quantizer if isinstance(quantizer, SequentialQuantizer) else (quantizer,)
+            # MX formats have no global scale; block scales stay within a row.
+            if not all(
+                q.is_mx_format or q._use_constant_amax or q._constant_amax is not None
+                for q in members
+                if q.is_enabled
+            ):
+                raise RuntimeError(
+                    f"{self.layer_name}: {backend} sends unused padding rows, which would enter"
+                    " combine_quantizer's global scale; set constant_amax."
+                )
+
+        def _quantize_combine(self, finalize, index, *args, **kwargs):
+            if self.combine_quantizer.is_enabled:
+                fused_output = args[index] if len(args) > index else kwargs["fused_expert_output"]
+                # In place: the payload can alias the output buffer or a communication workspace.
+                fused_output.copy_(self.combine_quantizer(fused_output))
+                _moe_combine_quantized.set(True)
+            return finalize(*args, **kwargs)
+
+
+@QuantModuleRegistry.register({vllm_attention.Attention: "vllm_Attention"})
+class _QuantVLLMAttention(QuantModule):
+    def _setup(self):
+        self.q_bmm_quantizer = TensorQuantizer()
+        self.k_bmm_quantizer = TensorQuantizer()
+        self.v_bmm_quantizer = TensorQuantizer()
+        self.parallel_state = create_parallel_state()
+
+    def forward(self, query, key, value, *args, **kwargs):
+        if not getattr(self, "_query_quant_in_kernel", False):
+            query = self.q_bmm_quantizer(query)
+        key = self.k_bmm_quantizer(key)
+        if not getattr(self, "_value_quant_in_kernel", False):
+            value = self.v_bmm_quantizer(value)
+        return super().forward(query, key, value, *args, **kwargs)
+
+    def modelopt_post_restore(self, prefix: str = "") -> None:
+        _vllm_attention_modelopt_post_restore(self)
+
+
+if CrossAttention is not None:
+
+    @QuantModuleRegistry.register({CrossAttention: "vllm_CrossAttention"})
+    class _QuantVLLMCrossAttention(_QuantVLLMAttention):
+        pass
+
+
+if EncoderOnlyAttention is not None:
+
+    @QuantModuleRegistry.register({EncoderOnlyAttention: "vllm_EncoderOnlyAttention"})
+    class _QuantVLLMEncoderOnlyAttention(_QuantVLLMAttention):
+        pass
+
+
+if VllmMLAAttention is not None:
+
+    @QuantModuleRegistry.register({VllmMLAAttention: "vllm_MLAAttention"})
+    class _QuantVLLMMLAAttention(QuantModule):
+        def _setup(self):
+            self.q_bmm_quantizer = TensorQuantizer()
+            self.kv_c_bmm_quantizer = TensorQuantizer()
+            self.k_pe_bmm_quantizer = TensorQuantizer()
+            self.parallel_state = create_parallel_state()
+
+        def forward(self, query, kv_c, k_pe, *args, **kwargs):
+            query = self.q_bmm_quantizer(query)
+            kv_c = self.kv_c_bmm_quantizer(kv_c)
+            k_pe = self.k_pe_bmm_quantizer(k_pe)
+            return super().forward(query, kv_c, k_pe, *args, **kwargs)
+
+        def modelopt_post_restore(self, prefix: str = "") -> None:
+            _vllm_attention_modelopt_post_restore(self)

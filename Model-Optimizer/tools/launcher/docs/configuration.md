@@ -1,0 +1,278 @@
+# Configuration
+
+## Environment Variables
+
+| Variable | Description | Required |
+|---|---|---|
+| `SLURM_HOST` | Slurm login node hostname | Yes (remote) |
+| `SLURM_ACCOUNT` | Slurm account for billing | Yes (remote) |
+| `SLURM_JOB_DIR` | Remote directory for job artifacts | Yes (remote) |
+| `SLURM_HF_LOCAL` | Path to HuggingFace model cache on the cluster | Yes (remote) |
+| `HF_TOKEN` | HuggingFace API token | No |
+| `NEMORUN_HOME` | NeMo Run home directory (default: cwd) | No |
+
+## YAML Config Format
+
+### Typed Task Config (recommended)
+
+Uses a typed task class with named, documented fields:
+
+```yaml
+job_name: Qwen3-8B_NVFP4_DEFAULT_CFG
+pipeline:
+  task_0:
+    _target_: common.megatron_lm.quantize.task.MegatronLMQuantizeTask
+    config:
+      model: Qwen/Qwen3-8B
+      quant_cfg: NVFP4_DEFAULT_CFG
+      tp: 4
+      calib_size: 32
+      hf_local: /hf-local/
+    slurm_config:
+      _factory_: "slurm_factory"
+      nodes: 1
+      ntasks_per_node: 4
+      gpus_per_node: 4
+```
+
+### Raw SandboxTask Config
+
+For full control or scripts without a typed task class:
+
+```yaml
+job_name: Qwen3-8B_NVFP4_DEFAULT_CFG
+pipeline:
+  task_0:
+    script: common/megatron_lm/quantize/quantize.sh
+    args:
+      - --calib-dataset-path-or-name /hf-local/abisee/cnn_dailymail
+      - --calib-size 32
+    environment:
+      - MLM_MODEL_CFG: Qwen/Qwen3-8B
+      - QUANT_CFG: NVFP4_DEFAULT_CFG
+      - TP: 4
+    slurm_config:
+      _factory_: "slurm_factory"
+      nodes: 1
+      ntasks_per_node: 4
+      gpus_per_node: 4
+```
+
+### Inline Command (no wrapper script)
+
+A task can carry an `inline` shell command instead of a `script:` path (no
+wrapper `.sh` needed) — good for one-liner jobs like Megatron-Bridge's
+`torchrun` scripts. `<<global_vars.X>>` is resolved; `args` must be omitted
+(combining `inline` with non-empty `args` raises a `ValueError`). The
+packaged repo is at `modules/Model-Optimizer/...` with the run dir as CWD.
+
+For the launcher (`torchrun` locally, `python`+`srun` on Slurm), reference
+`$LAUNCH_SCRIPT` (plain `$VAR`, **not** `${...}` which collides with the config
+loader) and set its local value in `environment`; on Slurm the launcher
+overrides it to `python`, so set `ntasks_per_node = gpus_per_node`.
+
+> **`inline` must be a single line** — the CLI layer rejects multi-line values.
+> Use a YAML **folded** scalar (`>-`), not a literal block (`|`) or `\`
+> continuations; chain commands with `&&`.
+
+```yaml
+job_name: Qwen3-8B_mbridge_prune
+pipeline:
+  global_vars:
+    output_dir: /cicd/megatron-bridge
+  task_0:
+    environment:
+      - LAUNCH_SCRIPT: torchrun --nproc_per_node 2
+    inline: >-
+      $LAUNCH_SCRIPT
+      modules/Model-Optimizer/examples/megatron_bridge/prune_minitron.py
+      --hf_model_name_or_path Qwen/Qwen3-8B
+      --pp_size 2
+      --prune_target_params 6e9
+      --output_hf_path <<global_vars.output_dir>>/Qwen3-8B-Pruned-6B
+    slurm_config:
+      _factory_: "slurm_factory"
+      container: nvcr.io/nvidia/nemo:26.10
+      modelopt_install_path: /opt/venv/lib/python3.12/site-packages/modelopt
+      nodes: 1
+      ntasks_per_node: 2
+      gpus_per_node: 2
+```
+
+### Installing extra pip reqs (`reqs` / `reqs_file`)
+
+A task may pip-install **in the container before the command**
+(`pip install [-r reqs_file] [reqs] && <command>`):
+
+- `reqs` — a raw `pip install` argument string. Write specifiers unquoted; the
+  launcher shell-quotes each token, so `<` `>` `=` are safe.
+- `reqs_file` — a `requirements.txt` path (relative to the run dir, i.e. under
+  `modules/Model-Optimizer/...`).
+
+```yaml
+  task_0:
+    reqs: "transformers<5"           # or: "transformers<5 fire" for several packages
+    inline: >-
+      python .../prune_minitron.py ...
+  task_2:
+    reqs_file: modules/Model-Optimizer/examples/llm_eval/requirements.txt
+    inline: >-
+      python .../lm_eval_hf.py ...
+```
+
+Both work with `inline` and `script` tasks and resolve `<<global_vars.X>>`.
+
+On Slurm the install runs once per node (on local rank 0 behind a filesystem
+barrier keyed on job/step/node IDs), so multi-node tasks are supported and
+concurrent pip on a node is avoided.
+
+### Multi-task Pipeline
+
+Tasks run sequentially — `task_1` starts only after `task_0` completes.
+Example (illustrative — export script may not exist yet):
+
+```yaml
+job_name: Qwen3-8B_quantize_export
+pipeline:
+  global_vars:
+    hf_model: /hf-local/Qwen/Qwen3-8B
+
+  task_0:
+    script: common/megatron_lm/quantize/quantize.sh
+    environment:
+      - HF_MODEL_CKPT: <<global_vars.hf_model>>
+    slurm_config:
+      _factory_: "slurm_factory"
+      nodes: 1
+
+  task_1:
+    script: common/megatron_lm/export/export.sh
+    environment:
+      - HF_MODEL_CKPT: <<global_vars.hf_model>>
+    slurm_config:
+      _factory_: "slurm_factory"
+      nodes: 1
+```
+
+The `<<global_vars.X>>` syntax shares values across tasks.
+
+## `--yaml` vs `pipeline=@`
+
+**`--yaml config.yaml`** (recommended) — maps top-level keys to function arguments.
+Contains `job_name` and `pipeline`:
+
+```bash
+uv run launch.py --yaml examples/Qwen/Qwen3-8B/megatron_lm_ptq.yaml --yes
+```
+
+**`pipeline=@config.yaml`** — bare `SandboxPipeline` without `job_name` wrapper:
+
+```bash
+uv run launch.py pipeline=@bare_pipeline.yaml job_name=my_job --yes
+```
+
+## CLI Overrides
+
+Any parameter can be overridden:
+
+```bash
+# Change nodes
+uv run launch.py --yaml config.yaml pipeline.task_0.slurm_config.nodes=2 --yes
+
+# Change container
+uv run launch.py --yaml config.yaml \
+    pipeline.task_0.slurm_config.container=nvcr.io/nvidia/tensorrt-llm/release:1.2.0 --yes
+
+# Change typed config field
+uv run launch.py --yaml config.yaml pipeline.task_0.config.tp=1 --yes
+```
+
+## Useful Flags
+
+| Flag | Description |
+|---|---|
+| `--yes` / `-y` | Skip confirmation prompt |
+| `-v` | Verbose output |
+| `--dryrun` | Print resolved config without running |
+| `--to-yaml output.yaml` | Dump resolved config to file |
+| `detach=true` | Submit and return immediately |
+
+## Model and Dataset Storage (`hf_local`)
+
+Pipeline YAMLs use `hf_local` as a path prefix for model weights and datasets. This should be a **self-managed directory that mirrors the HuggingFace Hub hierarchy**:
+
+```text
+/hf-local/
+├── Qwen/Qwen3-8B/
+├── meta-llama/Llama-3.1-8B/
+├── abisee/cnn_dailymail/
+└── cais/mmlu/
+```
+
+Using a dedicated folder is preferred over the HuggingFace cache (`~/.cache/huggingface`) to avoid cache corruption from concurrent jobs.
+
+```bash
+# Populate
+huggingface-cli download Qwen/Qwen3-8B --local-dir /hf-local/Qwen/Qwen3-8B
+
+# Override via CLI
+uv run launch.py --yaml config.yaml pipeline.task_0.config.hf_local=/mnt/models/ --yes
+
+# Download from Hub directly (no local cache)
+uv run launch.py --yaml config.yaml pipeline.task_0.config.hf_local="" --yes
+```
+
+For Slurm clusters, `SLURM_HF_LOCAL` sets the container mount path.
+
+## Required assets before submission
+
+`pipeline.assets` declares inputs relative to `/hf-local`. Empty/unset assets keep
+existing behavior. Local unversioned inputs are checked for existence. Remote or
+revision-pinned inputs require an explicit `asset_resolver` command; the launcher
+has no dependency on a particular storage service.
+
+```yaml
+pipeline:
+  assets: ["Org/Model@v1"]
+  asset_resolver: ["my-artifact-provider", "--profile", "my-team"]
+  asset_timeout: 900
+  # task_0, task_1, ... as usual
+```
+
+The command runs on the submitting machine with no shell. It reads a JSON object
+from stdin with `schema_version: 1`, `assets`, `host` (null for local Docker), and
+`hf_local` (the host source of the `/hf-local` mount). It must resolve/check all
+inputs, fetch missing inputs if authorized, and wait for completed materialization.
+Successful JSON stdout has this shape:
+
+```json
+{"schema_version":1,"status":"ready","assets":[{"name":"Org/Model","path":"/shared/hf-local/.snapshots/immutable-id","version":"v1"}]}
+```
+
+Return assets in declaration order. Paths must lie under the declared source root;
+use immutable snapshots when versions are supported. Resolved paths must not contain
+`:`, `,`, a newline, or a carriage return. Pinned references require a string
+`version`, and asset declarations must be unique. Diagnostics belong on stderr;
+never include credentials in the command, response or manifest. A nonzero exit,
+non-ready response, invalid manifest or timeout prevents the pipeline from creating
+an experiment. Transfers can continue independently after a timeout; providers must
+persist task receipts so rerunning resumes rather than duplicates them. Providers
+can return a `retry` argv list for an actionable recovery command.
+
+The launcher validates every active target before submission, adds read-only
+per-asset mounts at `/hf-local/<org>/<name>`, and records provider provenance in the
+experiment's `metadata.json`. Cross-cluster pipelines invoke the provider separately
+for each distinct host/cache root. Missing providers or mismatched mounts fail
+before job submission. Additional mounts must not overlap declared asset destinations,
+and Slurm arguments cannot override the container mounts. Dry-run configuration
+inspection does not transfer assets.
+
+## MLflow environment context
+
+The launcher forwards nonempty `MLFLOW_RUN_ID`, `MLFLOW_TRACKING_URI`, and
+`MLFLOW_EXPERIMENT_ID` values to both local and Slurm task environments. It also
+forwards `PENSIEVE_MLFLOW_RUN_ID`, `PENSIEVE_MLFLOW_TRACKING_URI`,
+`PENSIEVE_MLFLOW_EXPERIMENT_ID`, and `PENSIEVE_LAUNCH_ID` as independent lifecycle
+references. Task-level environment values override defaults. A lifecycle run
+is never implicitly selected as the workload's standard MLflow run. The owner
+of each run creates and finalizes it; propagation alone does not enable logging.

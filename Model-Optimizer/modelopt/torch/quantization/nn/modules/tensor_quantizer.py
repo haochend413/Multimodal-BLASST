@@ -1,0 +1,2156 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""TensorQuantizer Module."""
+
+import contextlib
+import math
+import warnings
+from collections.abc import Callable
+from typing import Any, Protocol, TypeGuard
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
+from torch.distributed.tensor import DTensor
+
+from modelopt.torch.utils import same_device_as, standardize_constructor_args
+from modelopt.torch.utils.distributed import DistributedProcessGroup
+
+from ... import calib, tensor_quant
+from ... import utils as quant_utils
+from ...config import QuantizerAttributeConfig, RotateConfig
+from ...qtensor import (
+    BaseQuantizedTensor,
+    FP8QTensor,
+    INT4QTensor,
+    INT8QTensor,
+    MXFP4QTensor,
+    MXFP8QTensor,
+    NF4QTensor,
+    NVFP4QTensor,
+    QTensorWrapper,
+)
+from ...tensor_quant import (
+    dynamic_block_quant,
+    fake_tensor_quant,
+    fp4_cast_ste,
+    int_cast_ste,
+    scaled_e4m3,
+    static_blockwise_fp4_fake_quant,
+)
+from ...utils import is_torch_export_mode
+from ...utils.numeric_utils import E4M3_MAX, fp8_max_for_normalization
+from ...utils.weight_cache import cached_fake_quantize
+from ..functional import normalized_hadamard_transform
+
+# torch.finfo(...).tiny gives the smallest normal E4M3 value; scale clamping needs
+# the smallest positive subnormal value representable by the 3-bit mantissa.
+_FP8_E4M3_MIN_POSITIVE = torch.finfo(torch.float8_e4m3fn).smallest_normal / (2**3)
+
+__all__ = [
+    "GroupedQuantizer",
+    "HardDisabledTensorQuantizer",
+    "NVFP4StaticQuantizer",
+    "SequentialQuantizer",
+    "StaticBlockScaleQuantizer",
+    "TensorQuantizer",
+    "TensorQuantizerCache",
+    "is_registered_quant_backend",
+    "register_quant_backend",
+    "unregister_quant_backend",
+]
+
+
+QuantBackendEntrypoint = Callable[[torch.Tensor, "TensorQuantizer"], torch.Tensor]
+
+_QUANT_FUNCTIONAL_BACKENDS: dict[str, QuantBackendEntrypoint] = {}
+
+
+def register_quant_backend(name: str, entrypoint: QuantBackendEntrypoint) -> None:
+    """Register a custom quantization backend.
+
+    Args:
+        name: The name of the backend.
+        entrypoint: The entrypoint of the backend. The entrypoint should be a callable that takes in
+            the inputs and the tensor quantizer as arguments and returns the quantized tensor.
+            See :class:`modelopt.torch.quantization.config.QuantizerAttributeConfig`
+            for details on choosing from the registered backends via the ``backend`` and
+            ``backend_extra_args`` fields.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("Backend name must be a non-empty string.")
+    if not callable(entrypoint):
+        raise TypeError("Entrypoint must be callable.")
+    if name in _QUANT_FUNCTIONAL_BACKENDS:
+        warnings.warn(f"Overwriting existing backend: {name}")
+    _QUANT_FUNCTIONAL_BACKENDS[name] = entrypoint
+
+
+def unregister_quant_backend(name: str) -> None:
+    """Unregister a custom quantization backend.
+
+    Args:
+        name: The name of the backend to unregister.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("Backend name must be a non-empty string.")
+    _QUANT_FUNCTIONAL_BACKENDS.pop(name, None)
+
+
+def is_registered_quant_backend(name: str) -> bool:
+    """Check if a custom quantization backend is registered.
+
+    Args:
+        name: The name of the backend to check.
+    """
+    return name in _QUANT_FUNCTIONAL_BACKENDS
+
+
+class TensorQuantizerCache(Protocol):
+    """A protocol for a cache interface for TensorQuantizer."""
+
+
+class TensorQuantizer(nn.Module):
+    """Tensor quantizer module.
+
+    This module manages quantization and calibration of input tensor. It can perform fake (simulated quantization)
+    or real quantization for various precisions and formats such as FP8 per-tensor, INT8 per-channel,
+    INT4 per-block etc.
+
+    If quantization is enabled, it calls the appropriate quantization functional and
+    returns the quantized tensor. The quantized tensor data type will be same as the input tensor data type for
+    fake quantization. During calibration mode, the module collects the statistics using its calibrator.
+
+    The quantization parameters are as described in
+    :class:`QuantizerAttributeConfig <modelopt.torch.quantization.config.QuantizerAttributeConfig>`. They can be set
+    at initialization using ``quant_attribute_cfg`` or later by calling :meth:`set_from_attribute_config`.
+
+    Args:
+        quant_attribute_cfg: An instance of
+            :class:`QuantizerAttributeConfig <modelopt.torch.quantization.config.QuantizerAttributeConfig>` or None.
+            If None, default values are used.
+        if_quant: A boolean. If True, quantization is enabled in the forward path.
+        if_calib: A boolean. If True, calibration is enabled in the forward path.
+        amax: None or an array like object such as list, tuple, numpy array, scalar
+            which can be used to construct amax tensor.
+    """
+
+    _skip_properties_for_save_restore = {
+        # Buffer/parameter layouts are serialized separately from quantizer properties.
+        "_pytorch_state_metadata",
+        "_calibrator",
+        "_bias_calibrator",
+        "_original_shape",
+        "_block_reshape_size",
+        "_padding",
+        # Not saved: ranks restore one shared state, so they agree on the layout without it.
+        "_consumed_block_sizes",
+        # Extra flags added by huggingface
+        "_is_hf_initialized",
+        # Extra flags added by accelerate
+        "_hf_hook",
+        "_old_forward",
+        "forward",
+        # Extra flags added by deepspeed
+        "ds_external_parameters",
+        "all_parameters",
+        "_external_params",
+        "_original_parameters",
+        "post_bwd_fn",
+        "ds_grads_remaining",
+        "ds_id",
+        "pre_bwd_fn",
+        # quantizer cache for custom backends, like luts
+        "_quantizer_cache",
+        # Runtime-only set of storage attributes tied to shared state. The tied
+        # aliases are rebuilt from calibration config and tensor state during restore.
+        "_shared_quant_tied_attrs",
+    }
+
+    def __setattr__(self, name, value):
+        if name in self.__dict__.get("_shared_quant_tied_attrs", set()):
+            raise RuntimeError(
+                f"{name} is tied shared quant state; update it via the owning shared-state "
+                "object or in place (e.g. .copy_), not by reassignment on a member."
+            )
+        return super().__setattr__(name, value)
+
+    def __init__(
+        self,
+        quant_attribute_cfg=None,
+        if_quant=True,
+        if_calib=False,
+        amax=None,
+    ):
+        """Initialize quantizer and set up required variables."""
+        super().__init__()
+        quant_attribute_cfg = (
+            quant_attribute_cfg if quant_attribute_cfg is not None else QuantizerAttributeConfig()
+        )
+        if amax is not None:
+            self.amax = amax
+
+        self._use_constant_amax = False
+        self._constant_amax = None
+        self.set_from_attribute_config(quant_attribute_cfg)
+
+        self._if_quant = if_quant
+        self._if_calib = if_calib
+        self._enable_pre_quant_scale = True
+        self._dequantize = False
+        self._input_dtype = None
+
+        # Lazy initialize the bias calibrator for KV cache quantization
+        self._bias_calibrator = None
+
+        # Optional quantizer cache for caching quantizer related encoding or tensors.
+        self._quantizer_cache = None
+
+    def set_from_attribute_config(self, attribute_cfg: QuantizerAttributeConfig | dict[str, Any]):
+        """Set quantizer attributes from attribute_cfg.
+
+        The attributes are defined in
+        :class:`QuantizerAttributeConfig <modelopt.torch.quantization.config.QuantizerAttributeConfig>`.
+        """
+
+        def _calibrator_setter(val):
+            if val in ["max", "histogram"]:
+                calib_cls = calib.MaxCalibrator if val == "max" else calib.HistogramCalibrator
+                args, kwargs = (self._num_bits, self._axis, self._unsigned), {}
+            else:
+                calib_cls, args, kwargs = standardize_constructor_args(val)
+            return calib_cls(*args, **kwargs)
+
+        def _axis_setter(val):
+            if getattr(self, "_calibrator", None) is not None:
+                self._calibrator._axis = val
+            if val is not None:
+                # axis and block_sizes are mutually exclusive; clear block_sizes when axis is set,
+                # including any the forward consumed and the config restored, so every rank ends
+                # in this layout
+                setattr(self, "_block_sizes", None)
+            return val
+
+        def _block_sizes_setter(val):
+            if val is not None:
+                # block_sizes and axis are mutually exclusive; clear axis when block_sizes is set
+                setattr(self, "_axis", None)
+                if getattr(self, "_calibrator", None) is not None:
+                    self._calibrator._axis = None
+            return val
+
+        def _constant_amax_setter(val):
+            if val is not None:
+                # Pin amax to the constant on the _amax buffer so it is used by both the
+                # fake-quant forward pass and export; calibration is skipped in model_calib.
+                self.amax = float(val)
+            return val
+
+        # Some attributes need custom handling.
+        # By default, attributes from config are mapped to a name ``f"_{attribute}"``
+        _custom_setters: dict[str, tuple[str, Callable]] = {
+            "enable": ("_disabled", lambda val: val is False),
+            "type": ("_dynamic", lambda val: val == "dynamic"),
+            "calibrator": ("_calibrator", _calibrator_setter),
+            "axis": ("_axis", _axis_setter),
+            "block_sizes": ("_block_sizes", _block_sizes_setter),
+            "backend": ("backend", lambda val: val),
+            "backend_extra_args": ("backend_extra_args", lambda val: val or {}),
+            "use_constant_amax": ("_use_constant_amax", lambda val: val),
+            "constant_amax": ("_constant_amax", _constant_amax_setter),
+        }
+
+        consumed = getattr(self, "_consumed_block_sizes", None)
+        if consumed is not None and {"axis", "block_sizes"} & set(attribute_cfg.keys()):
+            # A new layout starts from the configured one the forward rewrote, which a rank that
+            # never ran the forward still holds, so every rank ends in the same layout.
+            self._axis, self._block_sizes, self._consumed_block_sizes = None, consumed, None
+            if getattr(self, "_calibrator", None) is not None:
+                self._calibrator._axis = None
+
+        for attribute, val in attribute_cfg.items():
+            assert attribute in QuantizerAttributeConfig.model_fields, (
+                f"{attribute} is not a valid `TensorQuantizer` attribute"
+            )
+            _tq_attribute_name, _setter = _custom_setters.get(
+                attribute, (f"_{attribute}", lambda v: v)
+            )
+            setattr(self, _tq_attribute_name, _setter(val))
+
+        if isinstance(attribute_cfg, dict) and attribute_cfg == {"enable": False}:
+            self.disable_rotate()
+
+        if self.is_mx_format:
+            self._pass_through_bwd = True
+
+    @staticmethod
+    def attribute_config_from_modelopt_state(state: dict[str, Any]) -> dict[str, Any]:
+        """Return the :class:`QuantizerAttributeConfig` fields of a properties-only quantizer state.
+
+        Inverts :meth:`set_from_attribute_config` for the state saved by
+        ``get_modelopt_state(properties_only=True)``; keys that are not config fields are ignored.
+        """
+        inverse_getters: dict[str, tuple[str, Callable]] = {
+            "_disabled": ("enable", lambda val: not val),
+            "_dynamic": ("type", lambda val: "dynamic" if val else "static"),
+        }
+        attribute_cfg = {}
+        for key, val in state.items():
+            attribute, getter = inverse_getters.get(key, (key.removeprefix("_"), lambda v: v))
+            if attribute in QuantizerAttributeConfig.model_fields:
+                attribute_cfg[attribute] = getter(val)
+        return attribute_cfg
+
+    def dequantize(self, inputs: BaseQuantizedTensor | QTensorWrapper):
+        """De-quantize a real quantized tensor to a given dtype."""
+        qtensor = inputs.get_qtensor() if isinstance(inputs, QTensorWrapper) else inputs
+        assert isinstance(qtensor, BaseQuantizedTensor), "Expected input as real quantized tensors."
+        kwarg = {
+            "scale": self._scale,
+            "block_sizes": self.block_sizes,
+            "double_scale": getattr(self, "_double_scale", None),
+            "scale_zeros": getattr(self, "_scale_zeros", None),
+        }
+        return qtensor.dequantize(**kwarg)
+
+    @property
+    def num_bits(self):
+        """Return num_bits for quantization."""
+        return self._num_bits
+
+    @num_bits.setter
+    def num_bits(self, value):
+        self._num_bits = value
+        self._calibrator._num_bits = value
+
+    @property
+    def maxbound(self):
+        """Return maxbound for quantization."""
+        if self._num_bits == (4, 3):
+            return 448.0
+        if self._num_bits == (2, 1) and self._block_sizes.get("scale_bits") == (4, 3):
+            return 6.0
+        return (1 << (self._num_bits - 1 + int(self._unsigned))) - 1
+
+    @property
+    def unsigned(self):
+        """Return True if unsigned quantization is used."""
+        return self._unsigned
+
+    @unsigned.setter
+    def unsigned(self, value):
+        self._unsigned = value
+        self._calibrator._unsigned = value
+
+    @property
+    def pre_quant_scale(self):
+        """Return pre_quant_scale used for smoothquant."""
+        if not hasattr(self, "_pre_quant_scale") or not self._enable_pre_quant_scale:
+            return None
+        return self._pre_quant_scale
+
+    @pre_quant_scale.setter
+    def pre_quant_scale(self, value):
+        assert value is not None, "pre_quant_scale cannot be set to None."
+        assert self._enable_pre_quant_scale, (
+            "pre_quant_scale cannot be set when forward_with_pre_quant_scale is False."
+        )
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value)
+        if not hasattr(self, "_pre_quant_scale"):
+            self.register_buffer("_pre_quant_scale", value.clone().detach())
+        else:
+            if self._pre_quant_scale.shape != value.shape:
+                raise RuntimeError("Changing shape when setting pre_quant_scale is not allowed.")
+            self._pre_quant_scale.data.copy_(
+                value.clone().detach().to(self._pre_quant_scale.device)
+            )
+
+    @property
+    def amax(self):
+        """Return amax for quantization."""
+        if not hasattr(self, "_amax") or self.is_mx_format:
+            return None
+        assert not self._dynamic, "Dynamic quantization does not have fixed amax"
+        return self._amax
+
+    @amax.setter
+    def amax(self, value):
+        assert value is not None, "amax cannot be set to None."
+
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value)
+
+        self._amax_setter_helper(value)
+
+    def _amax_setter_helper(self, value):
+        if not hasattr(self, "_amax"):
+            self.register_buffer("_amax", value.clone().detach())
+        else:
+            if self._amax.shape != value.shape:
+                raise RuntimeError("Changing shape when setting amax is not allowed.")
+            self._amax.data.copy_(value.clone().detach().to(self._amax.device))
+
+    def reset_amax(self):
+        """Reset amax to None."""
+        if hasattr(self, "_amax"):
+            delattr(self, "_amax")
+        self._calibrator.reset()
+        self.reset_bias()
+
+    def reset_bias(self):
+        """Reset bias to None."""
+        if hasattr(self, "_bias_value"):
+            delattr(self, "_bias_value")
+        if self._bias_calibrator is not None:
+            self._bias_calibrator.reset()
+
+    @property
+    def step_size(self):
+        """Return step size for integer quantization."""
+        if not hasattr(self, "_amax"):
+            warnings.warn("step_size is undefined under dynamic amax mode!")
+            return None
+        assert isinstance(self._num_bits, int), (
+            "Step size is not defined for non-integer quantization."
+        )
+        return self._amax / (2.0 ** (self._num_bits - 1 + int(self._unsigned)) - 1.0)
+
+    @property
+    def axis(self):
+        """Return axis for quantization."""
+        return self._axis
+
+    @axis.setter
+    def axis(self, value):
+        self._axis = value
+        self._calibrator._axis = value
+
+    @property
+    def block_sizes(self):
+        """Return block_sizes for quantization."""
+        return self._block_sizes
+
+    @block_sizes.setter
+    def block_sizes(self, value):
+        self._axis = None
+        self._block_sizes = value
+        self._consumed_block_sizes = None
+
+    @property
+    def bias(self):
+        """Return bias for quantization."""
+        if not hasattr(self, "_bias"):
+            return None
+        return self._bias
+
+    @property
+    def bias_axis(self):
+        """Return bias_axis for quantization."""
+        if not hasattr(self, "_bias_axis"):
+            return None
+        return self._bias_axis
+
+    @bias_axis.setter
+    def bias_axis(self, value):
+        assert value is not None, "bias_axis cannot be set to None."
+        assert isinstance(value, (tuple, list)), "bias_axis must be a tuple or a list."
+        self._bias_axis = value
+
+    @property
+    def bias_method(self):
+        """Return bias_method for quantization."""
+        if self._bias is None:
+            return None
+        return self._bias.get("method", "mean")
+
+    @property
+    def bias_type(self):
+        """Return bias_type for quantization."""
+        if self._bias is None:
+            return None
+        return self._bias.get("type", "static")
+
+    @bias_type.setter
+    def bias_type(self, value):
+        assert value in [
+            "static",
+            "dynamic",
+        ], "bias_type must be either 'static' or 'dynamic'."
+        self._bias["type"] = value
+
+    @property
+    def bias_value(self):
+        """Return bias for quantization."""
+        if not hasattr(self, "_bias_value"):
+            return None
+        return self._bias_value
+
+    @bias_value.setter
+    def bias_value(self, value):
+        assert value is not None, "bias cannot be set to None."
+
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value)
+
+        if not hasattr(self, "_bias_value"):
+            self.register_buffer("_bias_value", value.clone().detach())
+        else:
+            if self._bias_value.shape != value.shape:
+                raise RuntimeError("Changing shape when setting bias is not allowed.")
+            self._bias_value.data.copy_(value.clone().detach().to(self._bias_value.device))
+
+    @property
+    def bias_calibrator(self):
+        """Return bias_calibrator for quantization."""
+        # Get reduce_axis from bias config
+        # Bias calibration supports per-channel and per-token quantization
+        if self._bias_calibrator is None and self.bias is not None:
+            self.bias_axis = tuple(k for k in self.bias if isinstance(k, int))
+            if self._bias is not None:
+                self._bias_calibrator = calib.BiasCalibrator(
+                    method=self.bias_method,
+                    axis=self.bias_axis,
+                )
+
+        return self._bias_calibrator
+
+    @property
+    def fake_quant(self):
+        """Return True if fake quantization is used."""
+        return self._fake_quant
+
+    @property
+    def narrow_range(self):
+        """Return True if symmetric integer range for signed quantization is used."""
+        return self._narrow_range
+
+    @narrow_range.setter
+    def narrow_range(self, value):
+        self._narrow_range = value
+
+    @property
+    def is_enabled(self):
+        """Return true if the modules is not disabled."""
+        return not self._disabled
+
+    def disable(self):
+        """Bypass the module.
+
+        Neither of calibration, clipping and quantization will be performed if the module is disabled.
+        """
+        self._disabled = True
+
+    def enable(self):
+        """Enable the module."""
+        self._disabled = False
+
+    @property
+    def trt_high_precision_dtype(self):
+        """Return True if FP16 AMAX is used when exporting the model."""
+        return self._trt_high_precision_dtype
+
+    @trt_high_precision_dtype.setter
+    def trt_high_precision_dtype(self, value):
+        self._trt_high_precision_dtype = value
+
+    @property
+    def is_mx_format(self):
+        """Check if is MX formats."""
+        return (
+            self.block_sizes is not None
+            and self.block_sizes.get("type", None) == "dynamic"
+            and self.block_sizes.get("scale_bits", None) == (8, 0)
+        )
+
+    @property
+    def is_fp8(self):
+        """Check if is per-tensor FP8 E4M3 (no block scales, no per-channel axis)."""
+        return self._num_bits == (4, 3) and self._block_sizes is None and self._axis is None
+
+    @property
+    def is_nvfp4_dynamic(self):
+        """Check if is dynamic NVFP4: E2M1 with E4M3 per-block scales computed dynamically.
+
+        Mirror of ``is_nvfp4_static`` for the dynamic-scale layout; like it, this does
+        not constrain the block size. Consumers that require a specific block size
+        (e.g. the block-16 Triton kernels) check ``block_sizes[-1]`` downstream.
+        """
+        return (
+            self._block_sizes is not None
+            and self._block_sizes.get("type", None) == "dynamic"
+            and self._num_bits == (2, 1)
+            and self._block_sizes.get("scale_bits", None) == (4, 3)
+        )
+
+    @property
+    def is_nvfp4_static(self):
+        """True for E2M1 weights + E4M3 per-block scales in static layout (format-only check)."""
+        return (
+            self.is_static_block_quant
+            and self._num_bits == (2, 1)
+            and self._block_sizes is not None
+            and self._block_sizes.get("scale_bits") == (4, 3)
+        )
+
+    def is_mxfp(self, bits):
+        """Check if is MXFP4/MXFP6/MXFP8."""
+        if bits == 4:
+            return (
+                self.is_mx_format
+                and self.num_bits == (2, 1)
+                and self.block_sizes.get(-1, None) == 32
+            )
+        elif bits == 6:
+            return (
+                self.is_mx_format
+                and self.num_bits == (3, 2)
+                and self.block_sizes.get(-1, None) == 32
+            )
+        elif bits == 8:
+            return (
+                self.is_mx_format
+                and self.num_bits == (4, 3)
+                and self.block_sizes.get(-1, None) == 32
+            )
+        else:
+            raise NotImplementedError()
+
+    @property
+    def is_static_block_quant(self):
+        """Check if is static block quantization."""
+        return (
+            self.block_sizes is not None
+            and self.block_sizes.get("type", None) != "dynamic"
+            and self._fake_quant
+        )
+
+    @property
+    def rotate_is_enabled(self):
+        """Check if rotate is enabled in quant config."""
+        if isinstance(self._rotate, RotateConfig):
+            return self._rotate.enable
+        if isinstance(self._rotate, dict):  # backward compat: old checkpoints stored a dict
+            return self._rotate.get("enable", False)
+        return self._rotate  # bool
+
+    @property
+    def rotate_is_fp32(self):
+        """Check if rotation needs to be computed in float32."""
+        if isinstance(self._rotate, RotateConfig):
+            return self._rotate.rotate_fp32 if self._rotate.enable else False
+        if isinstance(self._rotate, dict) and self.rotate_is_enabled:
+            return self._rotate.get("rotate_fp32", False)
+        return False
+
+    @property
+    def rotate_block_size(self):
+        """Block size for block-granular RHT, or None for full/auto."""
+        if isinstance(self._rotate, RotateConfig):
+            return self._rotate.block_size if self._rotate.enable else None
+        if isinstance(self._rotate, dict) and self.rotate_is_enabled:
+            return self._rotate.get("block_size", None)
+        return None
+
+    @property
+    def rotate_back_is_enabled(self):
+        """Check if inverse rotation should be applied after quantization."""
+        if isinstance(self._rotate, RotateConfig):
+            return self._rotate.enable and self._rotate.mode == "rotate_back"
+        if isinstance(self._rotate, dict) and self.rotate_is_enabled:
+            return self._rotate.get("mode", "rotate") == "rotate_back"
+        return False
+
+    def disable_rotate(self):
+        """Disable rotation while preserving the ``_rotate`` field's type.
+
+        Idempotent. Used after folding a weight quantizer so the baked-in rotation is not
+        re-applied on subsequent forwards.
+        """
+        if isinstance(self._rotate, RotateConfig):
+            self._rotate = self._rotate.model_copy(update={"enable": False})
+        elif isinstance(self._rotate, dict):  # backward compat: old checkpoints stored a dict
+            self._rotate = dict(self._rotate, enable=False)
+        else:
+            self._rotate = False
+
+    def _rotate_inputs(self, inputs):
+        return normalized_hadamard_transform(
+            inputs,
+            rotate_fp32=self.rotate_is_fp32,
+            block_size=self.rotate_block_size,
+        )
+
+    def disable_calib(self):
+        """Disable calibration."""
+        self._if_calib = False
+
+    def enable_calib(self):
+        """Enable calibration."""
+        if self._calibrator is None:
+            raise ValueError("Calibrator was not created, cannot enable calibration.")
+
+        # Dynamic quantization does not need calibration.
+        if self._dynamic:
+            return
+        self._if_calib = True
+
+    def disable_quant(self):
+        """Disable quantization."""
+        self._if_quant = False
+
+    def enable_quant(self):
+        """Enable quantization."""
+        self._if_quant = True
+
+    def load_calib_amax(self, *args, **kwargs):
+        """Load amax from calibrator.
+
+        Updates the amax buffer with value computed by the calibrator, creating it if necessary.
+        ``*args`` and ``**kwargs`` are directly passed to ``compute_amax``, except ``"strict"`` in
+        ``kwargs``. Refer to ``compute_amax`` for more details.
+        """
+        assert not self._dynamic, "Dynamic quantization does not need calibration."
+
+        strict = kwargs.pop("strict", True)
+        if getattr(self, "_calibrator", None) is None:
+            raise RuntimeError("Calibrator not created.")
+        calib_amax = self._calibrator.compute_amax(*args, **kwargs)
+        if calib_amax is None:
+            err_msg = (
+                "Calibrator returned None. This usually happens when calibrator hasn't seen any"
+                " tensor."
+            )
+            if not strict:
+                warnings.warn(err_msg)
+                warnings.warn("Set amax to NaN!")
+                calib_amax = torch.tensor(math.nan)
+            else:
+                raise RuntimeError(
+                    err_msg
+                    + " Passing 'strict=False' to `load_calib_amax()` will ignore the error."
+                )
+        self.amax = calib_amax
+
+    def load_calib_bias(self, *args, **kwargs):
+        """Load affine bias for quantization."""
+        assert not self._dynamic, "Dynamic quantization does not need calibration."
+        calib_bias = self.bias_calibrator.compute_bias(*args, **kwargs)
+        if calib_bias is None:
+            raise RuntimeError(
+                "Calibrator returned None. This usually happens when calibrator hasn't seen any tensor."
+            )
+
+        if not hasattr(self, "_bias_value"):
+            self.register_buffer("_bias_value", calib_bias.clone().detach())
+        else:
+            self._bias_value.data.copy_(calib_bias.clone().detach())
+
+    def _get_amax(self, inputs):
+        """Get amax from buffer or compute it dynamically."""
+        if self._use_constant_amax:
+            # torch.full fills on the device; torch.tensor would copy from the host on every call,
+            # which CUDA graph capture rejects.
+            return torch.full((), torch.finfo(torch.float8_e4m3fn).max, device=inputs.device)
+        if hasattr(self, "_amax"):
+            amax = self._amax
+            # A constant_amax buffer is registered at config time (on CPU) and may not have
+            # followed a later `model.to(device)`; align it with the input device on the fly.
+            if amax.device != inputs.device:
+                amax = amax.to(inputs.device)
+        else:
+            reduce_axis = quant_utils.convert_quantization_axis_to_reduce_axis(inputs, self._axis)
+            amax = quant_utils.reduce_amax(inputs, axis=reduce_axis, keepdims=True).detach()
+
+        if is_torch_export_mode() or torch.compiler.is_exporting():
+            return amax.detach()
+        return amax.data
+
+    def validate_attr(
+        self, attr_value=None, attr_name="amax", raise_error=False, warn_error=False, name=""
+    ):
+        """Validate attribute."""
+        attr_value = attr_value if attr_value is not None else getattr(self, attr_name, None)
+        if attr_value is None or (isinstance(attr_value, torch.Tensor) and attr_value.is_meta):
+            return True
+        is_valid = (
+            torch.all(attr_value >= 0)
+            and not torch.any(torch.isinf(attr_value))
+            and not torch.any(torch.isnan(attr_value))
+        )
+        if is_valid:
+            return True
+        name = f"{name}." if name else ""
+        msg = f"{name}{attr_name} contains invalid values: {attr_value}"
+        if warn_error:
+            warnings.warn(msg)
+        if raise_error:
+            raise ValueError(msg)
+        return False
+
+    def _get_bias(self, inputs):
+        """Get bias from buffer or compute it dynamically."""
+        if self.bias_calibrator is None:
+            return None
+
+        if self.bias_type == "static":
+            bias = self._bias_value
+        elif self.bias_type == "dynamic":
+            bias = self.bias_calibrator.compute_dynamic_bias(inputs)
+        else:
+            raise ValueError(f"Unsupported bias type: {self.bias_type}")
+        return bias
+
+    def _is_real_quantize_support(self):
+        """Check if real quantization is supported for this quant config."""
+        return (
+            (self._num_bits == 4 and self._block_sizes)
+            or (self._num_bits == (2, 1) and self._block_sizes)
+            or self._num_bits in ((4, 3), 8)  # Int8
+        )
+
+    def _real_quantize(self, inputs):
+        assert self._is_real_quantize_support(), "Real quantization not supported for this format."
+
+        buffer_to_register = {}
+        # Check MX formats first (before FP8) since MXFP8 also has num_bits=(4,3)
+        if (
+            self._block_sizes
+            and self._block_sizes.get("scale_bits") == (8, 0)
+            and self._block_sizes.get("type") == "dynamic"
+        ):
+            # MX quantization (MXFP4/MXFP8)
+            if self._num_bits == (2, 1):
+                # MXFP4
+                outputs, scales = MXFP4QTensor.quantize(inputs, self._block_sizes[-1])
+                buffer_to_register["_scale"] = scales
+            elif self._num_bits == (4, 3):
+                # MXFP8
+                assert self._block_sizes[-1] == MXFP8QTensor.BLOCK_SIZE, (
+                    f"MXFP8 requires block size {MXFP8QTensor.BLOCK_SIZE}, "
+                    f"got {self._block_sizes[-1]}"
+                )
+                outputs, scales = MXFP8QTensor.quantize(inputs)
+                buffer_to_register["_scale"] = scales
+            else:
+                raise ValueError(
+                    f"Unsupported MX format: num_bits={self._num_bits}. "
+                    f"Expected (2, 1) for MXFP4 or (4, 3) for MXFP8."
+                )
+        elif self._num_bits == (4, 3):
+            # FP8 quantization (non-MX)
+            # For per-tensor/per-channel quantization, we might need amax which is synced across all ranks
+            # For blockwise quantization, amax will be recomputed in the kernel
+            use_amax = self.amax is not None and not (self._block_sizes and self.amax.numel() == 1)
+            outputs, _scale = FP8QTensor.quantize(
+                inputs,
+                axis=self._axis,
+                block_sizes=self._block_sizes,
+                scales=self.amax / 448.0 if use_amax else None,
+            )
+            buffer_to_register["_scale"] = _scale
+        elif self._num_bits == 8:
+            outputs, _scale = INT8QTensor.quantize(
+                inputs, axis=self._axis, block_sizes=self._block_sizes
+            )
+            buffer_to_register["_scale"] = _scale
+        elif self._block_sizes.get("scale_bits", 0) == 8 and self._block_sizes.get(
+            "scale_block_sizes", None
+        ):
+            # NF4 double quantization
+            # Return real quantized tensor class and store scales inside the TensorQuantizer
+            outputs, scales = NF4QTensor.quantize(
+                inputs, self._block_sizes[-1], self._block_sizes["scale_block_sizes"][-1]
+            )
+
+            _scale, _double_scale, _scale_zeros = NF4QTensor.double_quantization(
+                scales,
+                self._block_sizes["scale_block_sizes"][-1],
+                self._block_sizes["scale_bits"],
+            )
+            buffer_to_register["_scale"] = _scale
+            buffer_to_register["_double_scale"] = _double_scale
+            buffer_to_register["_scale_zeros"] = _scale_zeros
+        elif self._block_sizes.get("scale_bits") == (4, 3):
+            # NVFP4 default quantization
+            # Return real quantized tensor and store scales inside TensorQuantizer
+            if self._block_sizes.get("four_over_six", False):
+                raise NotImplementedError(
+                    "NVFP4 Four-Over-Six (4/6) is not supported via mtq.compress: the per-block "
+                    "M=4/M=6 choice baked into the quantizer amax by MSE calibration is not "
+                    "preserved by real quantization. Use mtq.quantize + export for 4/6 instead."
+                )
+            outputs, _weights_scaling_factor, _weights_scaling_factor_2 = NVFP4QTensor.quantize(
+                inputs,
+                self._block_sizes[-1],
+                weights_scaling_factor_2=(
+                    NVFP4QTensor.get_weights_scaling_factor_2_from_quantizer(self)
+                    if self.amax is not None
+                    else None
+                ),
+                try_tensorrt=True,
+            )
+            buffer_to_register["_scale"] = _weights_scaling_factor
+            buffer_to_register["_double_scale"] = _weights_scaling_factor_2
+        else:
+            outputs, _scale = INT4QTensor.quantize(inputs, self._block_sizes[-1])
+            buffer_to_register["_scale"] = _scale
+        for k, v in buffer_to_register.items():
+            self._set_buffer(k, v)
+
+        # We assume _real_quantize is called when compress the model weights, and we set
+        # self._dequantize to True so that future forward call will only do dequantize.
+        self._dequantize = True
+        return outputs
+
+    def _fake_quantize(self, inputs):
+        """Fake quantization."""
+        if self.backend is not None:
+            if self.backend not in _QUANT_FUNCTIONAL_BACKENDS:
+                raise KeyError(f"Quant backend '{self.backend}' is not registered.")
+            entrypoint = _QUANT_FUNCTIONAL_BACKENDS[self.backend]
+            return entrypoint(inputs, self)
+
+        amax = None
+        if not self.is_mx_format:
+            amax = self._get_amax(inputs)
+
+        if self.block_sizes is not None and self.block_sizes.get("type", "static") == "dynamic":
+            # Dynamic block quantization
+            block_size = self.block_sizes.get(-1, None) or self.block_sizes.get(
+                inputs.dim() - 1, None
+            )
+            if block_size is None:
+                raise ValueError("block size for dynamic quantization not found.")
+
+            outputs = dynamic_block_quant(
+                inputs,
+                block_size,
+                amax,
+                self._get_bias(inputs),
+                self._num_bits,
+                self.block_sizes.get("scale_bits", None),
+                getattr(self, "_trt_high_precision_dtype", None),
+                getattr(self, "_onnx_quantizer_type", None),
+                self._pass_through_bwd,
+            )
+        elif isinstance(self._num_bits, tuple):
+            # Float-point quantization, e.g., FP8
+            E, M = self._num_bits  # noqa: N806
+
+            outputs = scaled_e4m3(
+                inputs,
+                amax,
+                self._get_bias(inputs),
+                E,
+                M,
+                self._trt_high_precision_dtype,
+                self._pass_through_bwd,
+            )
+
+        else:
+            # Integer quantization, e.g., INT8
+            outputs = fake_tensor_quant(
+                inputs,
+                amax,
+                self._get_bias(inputs),
+                self._num_bits,
+                self._unsigned,
+                self._narrow_range,
+                self._trt_high_precision_dtype,
+                self._pass_through_bwd,
+                self.block_sizes.get(-1) if self.block_sizes else None,
+                self.axis[0] if isinstance(self.axis, tuple) else self.axis,
+            )
+        return outputs
+
+    def _check_onnx_readiness(self, inputs):
+        """Check if quantizer is ready for ONNX export."""
+        if not self.block_sizes or self.block_sizes.get("scale_bits", None) != (8, 0):
+            assert hasattr(self, "_amax"), (
+                "Quantizer has not been calibrated. ONNX export requires the quantizer to be"
+                " calibrated. Calibrate and load amax before exporting to ONNX."
+            )
+
+        if self._if_calib:
+            warnings.warn(
+                "Quantizer is in calibration mode. "
+                "Please complete calibration before exporting to ONNX for correct results."
+            )
+
+        amax = self._get_amax(inputs)
+
+        # We only support scalar amax for E4M3 ONNX export
+        if isinstance(self.num_bits, tuple):
+            assert amax.numel() == 1, (
+                "E4M3 supports ONNX export only for per-tensor quantization."
+                " Per-tensor quantization requires scalar amax. "
+                f"Received non-scalar amax of shape: {amax.shape}"
+            )
+
+    def _setup_for_blockquant(self, inputs: torch.Tensor):
+        # Get reshape sizes and paddings for block-quantization
+        def get_axis_quant_params(ax):
+            ax = ax if ax in self.block_sizes else ax - inputs.dim()
+            bsize = self.block_sizes.get(ax, None)
+            padding, ax_slice = None, None
+            if bsize is not None and inputs.shape[ax] % bsize != 0:
+                padding = (bsize - (inputs.shape[ax] % bsize), 0)
+                ax_slice = slice(inputs.shape[ax])
+            return bsize, padding, ax_slice
+
+        def set_quant_params(axis, block_reshape_size, padding, slices, amax_shape=None):
+            self._axis = tuple(axis)
+            if hasattr(self, "_calibrator"):
+                self._calibrator._axis = self._axis
+            self._original_shape = inputs.shape
+            self._block_reshape_size = torch.Size(block_reshape_size)
+            if padding is not None:
+                self._padding = tuple(padding)
+                self._original_shape = F.pad(inputs, self._padding, "constant", 0).shape
+            if slices is not None:
+                self._slices = slices
+            if amax_shape:
+                self._amax_shape_for_export = amax_shape
+
+        # Reshape size have already been set
+        if hasattr(self, "_block_reshape_size"):
+            return
+
+        reshape_size, quantize_axis, paddings, slices = [], [], [], []
+
+        # special handling for block-quantization along the last axis:
+        # flatten the input for faster execution
+        if (self.block_sizes.get(inputs.dim() - 1, None) or self.block_sizes.get(-1, None)) and len(
+            QuantizerAttributeConfig._get_block_quant_axes_and_sizes(self.block_sizes)
+        ) == 1:
+            bsize, padding, ax_slice = get_axis_quant_params(inputs.dim() - 1)
+            slices = None if ax_slice is None else (*(slice(None),) * (inputs.dim() - 1), ax_slice)
+            padding = padding if not padding else tuple(reversed(padding))
+            amax_shape_for_export = (*(inputs.shape[:-1]), -1)
+            set_quant_params((0,), (-1, bsize), padding, slices, amax_shape_for_export)
+            return
+
+        for ax in range(inputs.dim()):
+            bsize, padding, ax_slice = get_axis_quant_params(ax)
+            paddings.append(padding)
+            slices.append(ax_slice)
+            if bsize is not None:
+                reshape_size.extend([math.ceil(inputs.shape[ax] / bsize), bsize])
+                quantize_axis.extend([True, False])
+            else:
+                reshape_size.append(inputs.shape[ax])
+                quantize_axis.append(True)
+
+        quant_axis = [i for i in range(len(quantize_axis)) if quantize_axis[i]]
+
+        slices = None if all(s is None for s in slices) else [s or slice(None) for s in slices]
+
+        if all(p is None for p in paddings):
+            paddings = None
+        else:
+            new_paddings = []
+            for padding in paddings:
+                if not (new_paddings or padding):
+                    continue
+                new_paddings.extend(padding or (0, 0))
+            paddings = tuple(reversed(new_paddings))
+
+        set_quant_params(quant_axis, reshape_size, paddings, slices)
+
+    def _process_for_blockquant(self, inputs: torch.Tensor):
+        if hasattr(self, "_padding"):
+            inputs = F.pad(inputs, self._padding, "constant", 0)
+
+        if inputs.shape != self._original_shape:
+            raise ValueError(
+                f"Input shape has changed from {self._original_shape} to {inputs.shape}."
+                " Block-quantization requires a fixed input shape."
+            )
+        inputs = inputs.reshape(self._block_reshape_size)
+        return inputs
+
+    def _reset_to_original_shape(self, outputs: torch.Tensor):
+        outputs = outputs.reshape(self._original_shape)
+        if hasattr(self, "_slices"):
+            outputs = outputs[self._slices]
+        return outputs
+
+    def _block_sizes_to_axis(self, x: torch.Tensor):
+        """Convert block_sizes to axis in per-channel/tensor quantization.
+
+        For example, for input tensor with shape (B, T, H),
+        {"block_sizes": {-1: None, -3: None}} equals to {axis: (-2)}, amax shape: (1, T, 1),
+        {"block_sizes": {-1: None, -2: None, -3: None}} equals to {axis: None}, amax shape: (1, T, 1)
+        """
+        block_sizes = self._block_sizes
+        if block_sizes is None:
+            return
+
+        def _check_per_channel_block_sizes(block_sizes):
+            # Check per-channel/block quant
+            return all(v is None for k, v in block_sizes.items() if isinstance(k, int))
+
+        if _check_per_channel_block_sizes(block_sizes):
+            # Convert block_sizes to axis
+            assert self.axis is None, "Axis and block_sizes are both set."
+            axis = tuple(k if k >= 0 else k + x.dim() for k in block_sizes if isinstance(k, int))
+            self.axis = tuple(i for i in range(x.dim()) if i not in axis) or None
+
+            # remove block_sizes, keeping them for the tensor-parallel amax sync and for a later
+            # configuration, so that both treat this quantizer as on a rank that never ran this
+            # forward and still holds them: the axis can read per-tensor (block sizes spanning
+            # every dimension)
+            self._block_sizes = None
+            self._consumed_block_sizes = block_sizes
+
+    def _sanitize_export_amax(self, amax: torch.Tensor) -> torch.Tensor:
+        """Replace zero/NaN amax entries with ``maxbound`` so exported scales stay positive.
+
+        A zero amax means calibration never activated the layer; downstream exporters divide by
+        the exported amax, so a zero would fail export or produce inf at inference. Kept
+        branch-free because export flows may pass a meta ``amax``; only the warning reads values.
+        """
+        sanitized = torch.nan_to_num(
+            torch.where(amax == 0, torch.full_like(amax, self.maxbound), amax),
+            nan=self.maxbound,
+        )
+
+        if not amax.is_meta:
+            num_invalid = int((torch.isnan(amax) | (amax == 0)).sum())
+            if num_invalid:
+                warnings.warn(
+                    f"{num_invalid}/{amax.numel()} amax entries of this "
+                    f"{type(self).__name__} are zero or NaN at export time, which means "
+                    "calibration never activated the corresponding layer or expert (or saw NaN "
+                    "activations). Substituting maxbound so the exported scaling factor stays "
+                    "positive. Consider increasing the calibration size if the layer is expected "
+                    "to be active.",
+                    stacklevel=3,
+                )
+        return sanitized
+
+    def export_amax(self) -> torch.Tensor | None:
+        """Export correctly formatted/shaped amax."""
+        if self.block_sizes is not None and self.block_sizes.get("type", None) == "dynamic":
+            # Dynamic block quantizers keep a per-tensor amax (the NVFP4 second-level scale) that
+            # needs no reshaping, but it still has to be positive for the exporters.
+            return None if self.amax is None else self._sanitize_export_amax(self.amax)
+
+        if self.amax is None:
+            return None
+
+        if not hasattr(self, "_amax_shape_for_export"):
+            amax = self.amax
+        else:
+            amax = self.amax.reshape(self._amax_shape_for_export)
+        amax = self._sanitize_export_amax(amax)
+        clamp_min, clamp_max = torch.finfo(amax.dtype).tiny, torch.finfo(amax.dtype).max
+        amax = amax.clamp(min=clamp_min, max=clamp_max)
+
+        self.validate_attr(attr_name="_amax", attr_value=amax)
+
+        if self.block_sizes is None:
+            # tensorrt_llm assumes the scaling_factor dim >= 1 for per-tensor.
+            if self.axis is None:
+                amax = amax.unsqueeze(0)
+
+            # If single-axis quantization, squeeze amax
+            elif isinstance(self.axis, int) or (
+                isinstance(self.axis, (list, tuple)) and len(self.axis) == 1
+            ):
+                amax = amax.squeeze()
+
+        return amax
+
+    def forward(self, inputs):
+        """Apply tensor_quant function to inputs.
+
+        Args:
+            inputs: A Tensor of type float32/float16/bfloat16.
+
+        Returns:
+            outputs: A Tensor of type output_dtype
+        """
+        if isinstance(inputs, DTensor):
+            # TensorQuantizer only handles regular non-DTensor inputs
+            device_mesh, placements = inputs.device_mesh, inputs.placements
+            outputs = self.forward(inputs.to_local())
+            return DTensor.from_local(outputs, device_mesh, placements)
+
+        if isinstance(inputs, (BaseQuantizedTensor, QTensorWrapper)):
+            assert self._dequantize, "No dequantization stats in the tensor quantizer."
+            return self.dequantize(inputs)
+
+        # Early return if nothing is collected during the forward (e.g. MoE)
+        if inputs.numel() == 0:
+            return inputs
+        # The weight cache keys on this tensor, not on the fresh ones (scaled, padded) made from it below.
+        cache_source = inputs
+
+        # Activation scaling for smoothquant
+        if self.pre_quant_scale is not None:
+            inputs = inputs * self.pre_quant_scale
+
+        if self.rotate_back_is_enabled and self._if_quant and not self.fake_quant:
+            raise ValueError("rotate_back mode is only supported with fake_quant=True.")
+
+        # Rotating the input
+        if self.rotate_is_enabled:
+            inputs = self._rotate_inputs(inputs)
+
+        if self._disabled:
+            # if quantizer is disabled, we still need to track the input dtype for saving the model
+            # TODO: This is a temporary solution and needs to be removed once megatron supports
+            # non-homogeneous layers
+            self._input_dtype = inputs.dtype if hasattr(inputs, "dtype") else None
+            # Even when quantization is disabled, honor rotate_back so a rotate/rotate_back
+            # pair stays a no-op roundtrip instead of leaving the tensor rotated.
+            if self.rotate_back_is_enabled:
+                inputs = self._rotate_inputs(inputs)
+            return inputs
+
+        if (
+            not is_torch_export_mode()
+            and not torch.compiler.is_compiling()
+            and torch.onnx.is_in_onnx_export()
+        ):
+            self._check_onnx_readiness(inputs)
+
+        if self.block_sizes is not None and self._fake_quant:
+            # To support the new block_sizes representation for per-channel quantization,
+            # convert the dim dict in block_sizes to axis.
+            # The axis attribute is still preserved for backward compatibility.
+            self._block_sizes_to_axis(inputs)
+
+        if self.is_static_block_quant:
+            # Tensor reshaping is required for static block quantization
+            # Tensor shapes are handled separately by the quantization kernels for dynamic block quantization
+            self._setup_for_blockquant(inputs)
+            inputs = self._process_for_blockquant(inputs)
+
+        outputs = inputs
+
+        block_size = None
+        if self._if_calib and not self._dynamic:
+            if self._calibrator is None:
+                raise RuntimeError("Calibrator was not created.")
+            # Shape is only known when it sees the first tensor
+            if self.block_sizes is not None and self.block_sizes.get("type", None) == "dynamic":
+                block_size = self.block_sizes.get(-1, None) or self.block_sizes.get(
+                    inputs.dim() - 1, None
+                )
+                assert block_size is not None, "block size for dynamic quantization not found."
+
+            self.collect(inputs)
+
+        if self._if_quant:
+            # Check if the input tensor is contiguous
+            # Non-contiguous tensors will generate incorrect FP4 quantization results
+            if hasattr(inputs, "is_contiguous") and not inputs.is_contiguous():
+                inputs = inputs.contiguous()
+            if self.fake_quant:
+                with same_device_as(inputs):
+                    outputs = cached_fake_quantize(self, inputs, cache_source)
+            elif not self._dequantize:
+                outputs = self._real_quantize(inputs)
+            else:
+                raise ValueError(
+                    "self._dequantize is True and self.fake_quant is False. "
+                    "This case should have been handled."
+                )
+
+        if self.is_static_block_quant:
+            outputs = self._reset_to_original_shape(outputs)
+
+        if self.rotate_back_is_enabled and isinstance(outputs, torch.Tensor):
+            outputs = self._rotate_inputs(outputs)
+
+        return outputs
+
+    def _short_amax(self, fmt=".2e"):
+        """Short description of amax.
+
+        Returns:
+            'dynamic': if _amax is not registered
+            'amax': if _amax is per-tensor
+            '[min, max](size)': if _amax is per-channel
+        """
+        if self.is_mx_format:
+            return "None"
+        if self._use_constant_amax:
+            return f"{torch.finfo(torch.float8_e4m3fn).max:{fmt}}(const)"
+        if not hasattr(self, "_amax"):
+            return "dynamic"
+        if self._amax is None:
+            return "None"
+        if self._amax.is_meta:
+            return "meta"
+        return self._short_tensor(self._amax, fmt)
+
+    def _short_tensor(self, tensor: torch.Tensor, fmt=".2e"):
+        """Short description of tensor."""
+        if tensor.numel() == 1:
+            return f"{tensor.item():{fmt}}"
+        return f"[{tensor.min().item():{fmt}}, {tensor.max().item():{fmt}}]({tensor.numel()})"
+
+    def _rotation_extra_repr(self):
+        s = " rotated" if self.rotate_is_enabled else ""
+        s += " (rotate_back)" if self.rotate_back_is_enabled else ""
+        s += " (fp32)" if self.rotate_is_fp32 else ""
+        if self.rotate_block_size is not None:
+            s += f" (block={self.rotate_block_size})"
+        return s
+
+    def extra_repr(self):
+        """Set the extra information about this module."""
+        if self._disabled:
+            s = "disabled"
+            s += (
+                f" pre_quant_scale={self._short_tensor(self.pre_quant_scale)}"
+                if self.pre_quant_scale is not None
+                else ""
+            )
+            s += self._rotation_extra_repr()
+            return s
+        s = f"{'unsigned ' if self._unsigned else ''}{self._num_bits} bit"
+        s += " narrow" if (self._narrow_range) else ""
+        s += " fake" if (self._fake_quant) else ""
+        if self.block_sizes is not None:
+            s += f" block_sizes={self._block_sizes},"
+        else:
+            s += f" axis={self._axis}" if self._axis is not None else " per-tensor"
+        s += f" amax={self._short_amax()}"
+        s += (
+            f" pre_quant_scale={self._short_tensor(self.pre_quant_scale)}"
+            if self.pre_quant_scale is not None
+            else ""
+        )
+        s += self._rotation_extra_repr()
+        s += (
+            f" calibrator={self._calibrator.__class__.__name__}"
+            if (self._calibrator is not None)
+            else ""
+        )
+        if self._bias:
+            s += f" bias={self._bias}"
+
+        s += " quant" if (self._if_quant) else ""
+        s += " calib" if (self._if_calib) else ""
+        s += (
+            f" backend={self.backend}, extra_args={self.backend_extra_args}"
+            if self.backend is not None
+            else ""
+        )
+        return s
+
+    def _get_properties_for_modelopt_state(self):
+        return (
+            self.__dict__.keys()
+            - nn.Module().__dict__.keys()
+            - self._skip_properties_for_save_restore
+        )
+
+    def _get_pytorch_state_metadata(self):
+        """Get Pytorch state metadata.
+
+        Current we only store the shape of the state_dict values.
+        """
+        metadata = {"params": {}, "buffers": {}}
+        for k, v in self._parameters.items():
+            metadata["params"][k] = {"shape": v.shape, "dtype": v.dtype}
+        for k, v in self._buffers.items():
+            if k in self._non_persistent_buffers_set:
+                continue
+            metadata["buffers"][k] = {"shape": v.shape, "dtype": v.dtype}
+        return metadata
+
+    def _del_pytorch_state(self):
+        # Lets delete the parameters and buffers
+        self._parameters.clear()
+        self._buffers.clear()
+        self._non_persistent_buffers_set.clear()
+
+    def _reset_pytorch_state_from_metadata(self, metadata: dict[str, Any]):
+        # Lets delete existing parameters and buffers and create fresh ones
+        self._del_pytorch_state()
+        for k, v in metadata.get("params", {}).items():
+            dtype = v.get("dtype", None)
+            self.register_parameter(k, nn.Parameter(torch.empty(v["shape"], dtype=dtype)))
+        for k, v in metadata.get("buffers", {}).items():
+            dtype = v.get("dtype", None)
+            self.register_buffer(k, torch.empty(v["shape"], dtype=dtype))
+
+    def get_modelopt_state(self, properties_only: bool = False) -> dict[str, Any]:
+        """Get meta state to be saved in checkpoint.
+
+        If `properties_only` is True, only the quantizer properties such as `num_bits`, `axis` etc are included.
+        For restoring the quantizer fully including the parameters and buffers, use `properties_only=False`.
+        """
+        modelopt_state = {}
+        for k in self._get_properties_for_modelopt_state():
+            modelopt_state[k] = getattr(self, k)
+
+        if properties_only:
+            return modelopt_state
+
+        modelopt_state["_pytorch_state_metadata"] = self._get_pytorch_state_metadata()
+
+        return modelopt_state
+
+    def set_from_modelopt_state(self, modelopt_state, properties_only: bool = False):
+        """Set meta state from checkpoint.
+
+        If `properties_only` is True, only the quantizer properties such as `num_bits`, `axis` etc are included.
+        For restoring the quantizer fully including the parameters and buffers, use `properties_only=False`.
+        """
+        # Set all properties except the skip properties; this is done for backward compatibility
+        for key in modelopt_state.keys() - self._skip_properties_for_save_restore:
+            setattr(self, key, modelopt_state[key])
+
+        # Set the calibrator properties
+        # TODO: This might not be sufficient for the custom calibrators - however there is no use-case for it yet
+        for key in ["_num_bits", "_axis", "_unsigned"]:
+            setattr(self._calibrator, key, getattr(self, key))
+
+        if not properties_only:
+            self._reset_pytorch_state_from_metadata(
+                modelopt_state.get("_pytorch_state_metadata", {})
+            )
+
+    def sync_amax_across_distributed_group(
+        self, parallel_group: DistributedProcessGroup, state_device: torch.device | None = None
+    ):
+        """Synchronize amax across all ranks in ``parallel_group`` with a MAX all-reduce every rank joins.
+
+        With data-parallel calibration a module can be activated on some ranks but not others (a
+        sparsely-routed MoE expert, or any module a rank's calib batch never exercises), so ``_amax``
+        ends up present on only a SUBSET of the group's ranks. Every rank must still join the
+        collective or the participant set mismatches and NCCL deadlocks.
+
+        The ranks agree on whether anyone calibrated the quantizer from a presence flag, never from
+        the amax value: a calibrated amax can legitimately be zero (an all-zero weight). A quantizer
+        that no rank calibrated keeps no amax, so downstream ``amax is None`` handling still applies.
+        A calibrated amax keeps its own dtype and device, exactly as an in-place reduce leaves it. A rank
+        that never calibrated it adopts the group's amax where it keeps its quantizer state: on a tensor
+        it holds itself, else on ``state_device``, which a caller passes as the device it keeps the
+        module's quantizer state on, else on the collective's device. A one-value amax travels in
+        float32, so a float64 one comes back rounded to float32 precision.
+        """
+        if not parallel_group.is_initialized():
+            return
+        group = parallel_group.group
+        # A fully dynamic quantizer stores no amax on any rank, and a one-rank group reduces to the
+        # local value: both settled by the config, so every rank returns alike.
+        if self._dynamic or dist.get_world_size(group) == 1:
+            return
+        amax = getattr(self, "_amax", None)
+        device = _collective_device(group)
+        # Every rank joins this all-reduce, and its result alone picks what follows, so every rank
+        # issues the same collectives. It carries what only the ranks holding an amax know: whether
+        # any rank calibrated the quantizer, and the size, shape and dtype of each rank's amax. The layout
+        # attributes cannot tell: the forward rewrites ``axis`` and ``block_sizes``, so a rank that
+        # never ran it reads a different layout. One value -- per-tensor, or a dynamic block
+        # quantizer's global scale (NVFP4) -- rides along, so a rank that never calibrated the
+        # quantizer still ends up with it. float32 throughout: NCCL hangs rather than raising when
+        # ranks pair mismatched dtypes, which a group split between calibrated and uncalibrated ranks
+        # otherwise would (Kimi-K3, NVFP4, EP64: 8 ranks held an expert input amax and 56 did not).
+        numel, shape_key, dtype_code = 0, 0, 0  # a rank without an amax holds no elements
+        if amax is not None:
+            numel = amax.numel()
+            # Tells apart shapes of one size, such as (8, 1) and (1, 8). A tuple of ints hashes alike
+            # in every process (a str would not), and the key stays exact in float32, as a numel
+            # above 2**24 may not.
+            shape_key = hash(tuple(amax.shape)) % (1 << 24)
+            dtype_code = _AMAX_DTYPES.index(amax.dtype) + 1 if amax.dtype in _AMAX_DTYPES else 0
+        # MAX turns each [x, -x] pair into x's largest and negated smallest value across the ranks.
+        packed = torch.tensor(
+            [0.0, numel, -numel, shape_key, -shape_key, dtype_code, -dtype_code],
+            dtype=torch.float32,
+            device=device,
+        )
+        if amax is not None and numel == 1:
+            packed[0] = amax.detach().reshape(()).to(device=device, dtype=torch.float32)
+        _all_reduce_amax(packed, group)
+        # One host sync for the flags; the value stays on the device.
+        flags = packed[1:].tolist()
+        max_numel, neg_min_numel, max_shape, neg_min_shape, max_code, neg_min_code = flags
+        if max_numel == 0:
+            return  # no rank calibrated it
+        if max_numel > 1:
+            # A tensor amax (per-channel, static per-block) has a shape only the ranks holding one
+            # know, so the ranks reduce it only when every rank holds one of the same shape and of
+            # the same listed dtype (an unlisted one codes as 0, like a rank without an amax), and
+            # all raise together otherwise.
+            same_shape = -neg_min_numel == max_numel and -neg_min_shape == max_shape
+            if not same_shape or -neg_min_code != max_code or max_code == 0:
+                raise RuntimeError(
+                    f"Cannot amax-sync unevenly-calibrated non-per-tensor quantizer {type(self).__name__}: "
+                    "some ranks hold no amax for it, or one of another shape or dtype, or of a dtype "
+                    "outside the listed ones, and a per-channel / per-block amax is reduced only when "
+                    "every rank holds one alike. Ensure every rank calibrates it (e.g. increase "
+                    "--calib-size)."
+                )
+            assert amax is not None  # every rank holds one
+            reduced = amax.to(device=device)  # the backend's device; a no-op when already there
+            _all_reduce_amax(reduced, group)
+            if reduced is not amax:
+                amax.copy_(reduced)
+            return
+        if amax is not None:
+            amax.copy_(packed[0])
+        else:
+            dtype = _AMAX_DTYPES[int(max_code) - 1] if max_code > 0 else torch.float32
+            held = [
+                t for t in (*self._buffers.values(), *self._parameters.values()) if t is not None
+            ]
+            target = held[0].device if held else (state_device or packed.device)
+            self._set_buffer("_amax", packed[0].to(device=target, dtype=dtype).clone())
+
+    @contextlib.contextmanager
+    def disable_pre_quant_scale(self):
+        """Context manager to turn off pre_quant_scale inside this quantizer."""
+        was_enabled = self._enable_pre_quant_scale
+        self._enable_pre_quant_scale = False
+        try:
+            yield
+        finally:
+            self._enable_pre_quant_scale = was_enabled
+
+    def collect(self, inputs) -> None:
+        """Collect calibration data."""
+        if not self._if_calib or self._dynamic:
+            return
+
+        # Collect bias data if bias calibration is enabled
+        if self.bias_calibrator is not None and self.bias_type == "static":
+            self.bias_calibrator.collect(inputs)
+            inputs = inputs - self.bias_calibrator.compute_bias()
+
+        self._calibrator.collect(inputs)
+
+    def _set_buffer(self, key, value):
+        if hasattr(self, key):
+            setattr(self, key, value)
+        else:
+            self.register_buffer(key, value)
+
+    def _apply(self, fn, recurse=True):
+        """Apply module transforms without rounding a pinned GGML payload's importance.
+
+        A pinned payload is re-encoded under the importance its search was weighted with, and only
+        that exact importance encodes the weight the payload came from to the payload again. Casting
+        a model, as ``model.bfloat16()`` or Megatron's ``Float16Module`` do, moves it but keeps it
+        float32.
+        """
+        # Imported here: ggml/__init__ imports its backend, which imports this module.
+        from ...ggml.common import PINNED_IMPORTANCE_PREFIX
+
+        importance = {
+            key: value
+            for key, value in self._buffers.items()
+            if key.startswith(PINNED_IMPORTANCE_PREFIX) and value is not None
+        }
+        module = super()._apply(fn, recurse=recurse)
+        for key, value in importance.items():
+            if self._buffers[key].dtype != value.dtype:
+                self._buffers[key] = value.to(self._buffers[key].device)
+        return module
+
+
+class HardDisabledTensorQuantizer(TensorQuantizer):
+    """TensorQuantizer slot that is structurally never enabled.
+
+    Used where a quantizer attribute must exist for introspection / wildcard-config absorption
+    but the surrounding ``QuantModule`` will never actually invoke it — e.g. ``nn.Embedding``,
+    whose input is integer indices and cannot be fake-quantized.
+
+    Wildcard configs (e.g. the default ``QuantizeConfig`` ``"*"`` rule or
+    ``NVFP4_DEFAULT_CFG``'s ``*input_quantizer``) are accepted silently, then the quantizer
+    is force-disabled — wildcards mean "enable this kind of quantizer in general," not
+    "enable this specific structurally-disabled slot." Direct, explicit attempts (calling
+    ``enable`` / ``enable_quant`` / ``enable_calib``) raise loudly so a misconfigured recipe
+    doesn't silently mislead the user.
+    """
+
+    _DISABLED_ERR = (
+        "This TensorQuantizer is hard-disabled by its parent QuantModule (e.g. the "
+        "input_quantizer slot on a quantized nn.Embedding, whose input is integer indices) "
+        "and cannot be enabled."
+    )
+
+    def enable(self):
+        """Disallowed for hard-disabled quantizers."""
+        raise RuntimeError(self._DISABLED_ERR)
+
+    def enable_quant(self):
+        """Disallowed for hard-disabled quantizers."""
+        raise RuntimeError(self._DISABLED_ERR)
+
+    def enable_calib(self):
+        """Disallowed for hard-disabled quantizers."""
+        raise RuntimeError(self._DISABLED_ERR)
+
+    def set_from_attribute_config(self, attribute_cfg):
+        """Apply the config like any quantizer, then force-disable.
+
+        This absorbs wildcard configs from stock recipes without raising. Other attributes
+        (``num_bits``, ``axis``, etc.) take on the config values for introspection, but
+        ``_disabled`` is forced back to ``True`` so forward is always a no-op.
+        """
+        super().set_from_attribute_config(attribute_cfg)
+        self._disabled = True
+
+
+def _clamp_scale(scale: torch.Tensor, min_value: float | torch.Tensor = 1e-8) -> torch.Tensor:
+    """Clamp per-block scale to guard against small/zero values."""
+    return torch.where(scale <= min_value, min_value, scale)
+
+
+def _amax_to_scale(
+    amax: torch.Tensor, max_bound: float, min_value: float | torch.Tensor = 1e-8
+) -> torch.Tensor:
+    """Convert amax to per-block scale, guarding against small/zero values."""
+    return _clamp_scale(amax.float() / max_bound, min_value)
+
+
+def _to_local(t: torch.Tensor) -> torch.Tensor:
+    """Convert DTensor to local tensor (no-op for regular tensors).
+
+    Under FSDP2, learnable parameters are DTensors but the quantizer forward
+    operates on local tensors (see TensorQuantizer.forward DTensor handling).
+    to_local() preserves autograd so gradients flow back to the DTensor parameter.
+    """
+    if isinstance(t, DTensor):
+        return t.to_local()
+    return t
+
+
+# The dtypes a calibrated amax can have, so a rank that never calibrated a quantizer adopts the same one.
+_AMAX_DTYPES = (torch.float32, torch.bfloat16, torch.float16, torch.float64)
+
+
+def _all_reduce_amax(tensor: torch.Tensor, group) -> None:
+    """MAX all-reduce ``tensor`` in place, naming the likely cause of a failure."""
+    try:
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=group)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Failed to synchronize amax across the calibration group: {e}. Common causes: a CUDA OOM "
+            "when NCCL lazily allocates communication buffers under calibration memory pressure (free "
+            "cached activations with gc.collect()/torch.cuda.empty_cache() before the sync, or reduce "
+            "the calibration sequence length / batch size), or an amax on a device the group's "
+            "backend does not serve."
+        ) from e
+
+
+def _collective_device(group) -> torch.device:
+    """The device every rank of ``group`` hands its collectives: CUDA when NCCL serves it, else CPU.
+
+    Derived from the group's backends, which all ranks share, rather than from a local tensor: a rank
+    that never calibrated a quantizer has no amax to ask, and ranks that disagree on the device type
+    reach different backends and hang. Read from the group's configuration, not its name:
+    ``init_process_group()`` without a backend names the group ``undefined`` but configures NCCL for
+    CUDA (``cuda:nccl``, next to ``cpu:gloo`` in some torch builds). A gloo-only group has no CUDA
+    backend at all.
+    """
+    if torch.cuda.is_available() and "nccl" in dist.get_backend_config(group):
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+class StaticBlockScaleQuantizer(TensorQuantizer):
+    """TensorQuantizer for static block quantization with two-level scaling.
+
+    Supports both FP4 (E2M1) and INT block quantization formats with configurable
+    block_size and optional FP8 scale quantization.
+    Uses _global_amax and inherited _amax for per-block amax values.
+    Preserves static amax states in fp32.
+    """
+
+    _lsq: bool = False
+    _learnable_amax: list = []
+    _tied_amax: bool = False
+    # FP4 default; overwritten on promotion with the format-specific bound, including INT.
+    _quant_max_bound: float = 6.0
+    _quantize_scales: bool = True
+    _quantize_pre_scale: bool = True
+
+    def _preserve_amax_in_fp32(self):
+        amax = getattr(self, "_amax", None)
+        if amax is not None and not isinstance(amax, nn.Parameter):
+            self._amax = amax.to(dtype=torch.float32)
+        global_amax = getattr(self, "_global_amax", None)
+        if (
+            global_amax is not None
+            and not isinstance(global_amax, nn.Parameter)
+            and global_amax.dtype != torch.float32
+        ):
+            if "_global_amax" in self.__dict__.get("_shared_quant_tied_attrs", set()):
+                global_amax.data = global_amax.to(dtype=torch.float32)
+            else:
+                self._global_amax = global_amax.to(dtype=torch.float32)
+
+    def _amax_setter_helper(self, value):
+        super()._amax_setter_helper(value)
+        self._preserve_amax_in_fp32()
+
+    @classmethod
+    def from_tensor_quantizer(
+        cls, tq: TensorQuantizer, global_amax: torch.Tensor | None = None
+    ) -> "StaticBlockScaleQuantizer":
+        """Convert a TensorQuantizer to StaticBlockScaleQuantizer in-place.
+
+        Args:
+            tq: The TensorQuantizer to convert.
+            global_amax: Optional global amax value to set on the quantizer.
+        """
+
+        def _preserve_and_set_global_amax(tq):
+            tq._preserve_amax_in_fp32()
+            if global_amax is not None:
+                tq.global_amax = global_amax
+
+        if isinstance(tq, cls):
+            _preserve_and_set_global_amax(tq)
+            return tq
+        is_nvfp4_static = getattr(tq, "is_nvfp4_static", False)
+        tq.__class__ = cls
+        tq._is_static_block_scale_quantizer = True
+        if is_nvfp4_static:
+            tq._is_nvfp4_static_quantizer = True
+        tq._quant_max_bound = float(tq.maxbound)
+        _preserve_and_set_global_amax(tq)
+        return tq
+
+    @property
+    def amax_pre(self):
+        """Pre (quantization) amax. Returns _amax_post when tied."""
+        if self._tied_amax:
+            return self._amax_post
+        return self._amax_pre
+
+    @property
+    def amax_post(self):
+        """Post (dequantization) amax."""
+        return self._amax_post
+
+    @property
+    def amax(self):
+        """Return amax, derived from learnable amax parameters if in LSQ mode."""
+        if self._lsq and not self._tied_amax:
+            raise RuntimeError(
+                "LSQ with untied amaxes has separate pre and post parameters. "
+                "Access them via amax_pre / amax_post."
+            )
+        if self._lsq:
+            return self._amax_post
+        if not hasattr(self, "_amax"):
+            return None
+        return self._amax
+
+    @amax.setter
+    def amax(self, value):
+        assert value is not None, "amax cannot be set to None."
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value)
+        self._amax_setter_helper(value)
+
+    @property
+    def global_amax(self):
+        """Return global_amax for quantization."""
+        if not hasattr(self, "_global_amax"):
+            return None
+        return self._global_amax
+
+    @global_amax.setter
+    def global_amax(self, value):
+        if value is None:
+            if hasattr(self, "_global_amax"):
+                self._global_amax = None
+            return
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value)
+
+        global_amax = getattr(self, "_global_amax", None)
+        if global_amax is None:
+            self.register_buffer("_global_amax", value.clone().detach())
+            global_amax = self._global_amax
+        else:
+            global_amax.data.copy_(value.clone().detach().to(global_amax.device))
+        self._preserve_amax_in_fp32()
+
+    @property
+    def has_quantized_block_scale(self):
+        """True when per-block scales are FP8 (E4M3) quantized (format-only check)."""
+        return self._block_sizes is not None and self._block_sizes.get("scale_bits") == (4, 3)
+
+    def _apply(self, fn, recurse=True):
+        """Apply module transforms without rounding static scale state."""
+        amax = getattr(self, "_amax", None)
+        global_amax = getattr(self, "_global_amax", None)
+
+        module = super()._apply(fn, recurse=recurse)
+        self._preserve_amax_in_fp32()
+        if amax is not None and amax.device.type != "meta":
+            self.amax = amax
+        if global_amax is not None and global_amax.device.type != "meta":
+            self.global_amax = global_amax
+        return module
+
+    def _short_amax(self, fmt=".4f"):
+        """Short description of amax, accounting for LSQ mode."""
+        if not self._lsq:
+            return super()._short_amax(fmt)
+        learn = self._learnable_amax
+        learn_str = "frozen" if not learn else f"learn=[{','.join(learn)}]"
+        if self._tied_amax:
+            return f"LSQ(tied={self._short_tensor(self._amax_post.data, fmt)}, {learn_str})"
+        return (
+            f"LSQ(pre={self._short_tensor(self._amax_pre.data, fmt)}, "
+            f"post={self._short_tensor(self._amax_post.data, fmt)}, {learn_str})"
+        )
+
+    def enable_lsq(
+        self,
+        quantize_scales: bool | None = None,
+        learnable_amax: list | str = ("post",),
+        tied_amax: bool = False,
+        quantize_pre_scale: bool = True,
+        dtype: torch.dtype | None = None,
+    ):
+        """LSQ mode with configurable learnable/frozen amax tensors.
+
+        The per-block amax params are initialized from the calibrated ``_amax``. The
+        per-tensor scale is derived from ``global_amax`` at runtime so shared-group
+        updates are always reflected.
+
+        Args:
+            quantize_scales: Whether to FP8-quantize per-block scales (NVFP4). When None,
+                defaults to ``has_quantized_block_scale``.
+            learnable_amax: Which amax params are learnable: 'pre', 'post',
+                ['pre', 'post'], or [].
+            tied_amax: If True, pre and post share a single tensor.
+            quantize_pre_scale: Whether to FP8-quantize the LSQ pre scale.
+            dtype: Optional dtype for the amax params. Kept at weight dtype for FSDP2
+                mixed-precision support (see TODO below).
+        """
+        assert hasattr(self, "_amax"), "enable_lsq requires a calibrated _amax."
+        if quantize_scales is None:
+            quantize_scales = self.has_quantized_block_scale
+        if quantize_scales:
+            assert self.global_amax is not None, (
+                "enable_lsq(quantize_scales=True) requires global_amax to be set."
+            )
+
+        # TODO: Support fp32 learnable amax values once a stable PyTorch release
+        # includes FSDP2 mixed-precision parameter dtype support.
+        amax = self._amax.float()
+        if dtype is not None:
+            amax = amax.to(dtype)
+        delattr(self, "_amax")
+        learn = {learnable_amax} if isinstance(learnable_amax, str) else set(learnable_amax)
+
+        if "post" in learn:
+            self._amax_post = nn.Parameter(amax.clone(), requires_grad=True)
+        else:
+            self.register_buffer("_amax_post", amax.clone())
+
+        if not tied_amax:
+            if "pre" in learn:
+                self._amax_pre = nn.Parameter(amax.clone(), requires_grad=True)
+            else:
+                self.register_buffer("_amax_pre", amax.clone())
+
+        self._quantize_scales = quantize_scales
+        self._quantize_pre_scale = quantize_pre_scale
+        self._lsq = True
+        self._learnable_amax = sorted(learn)
+        self._tied_amax = tied_amax
+
+    def _cast_ste(self, inputs):
+        """Cast inputs to quantized representable values (no scaling)."""
+        if isinstance(self._num_bits, tuple):
+            return fp4_cast_ste(inputs)
+        return int_cast_ste(inputs, self._num_bits, self._unsigned, self._narrow_range)
+
+    def _block_scale_from_amax(self, amax: torch.Tensor, quantize: bool) -> torch.Tensor:
+        """Compute the per-block scale from a per-block amax, optionally FP8-quantizing it."""
+        if quantize:
+            per_tensor_scale = _amax_to_scale(self.global_amax, self._quant_max_bound)
+            # scaled_e4m3 maps per_tensor_scale to E4M3_MAX (448); apply the inverse
+            # mapping to express the minimum encoded FP8 scale in physical scale units.
+            min_value = (_FP8_E4M3_MIN_POSITIVE / E4M3_MAX) * per_tensor_scale.view(-1)
+            scale = _amax_to_scale(amax, self._quant_max_bound, min_value=min_value)
+            return scaled_e4m3(scale, per_tensor_scale, None, 4, 3)
+        return _amax_to_scale(amax, self._quant_max_bound, min_value=1e-8)
+
+    def _fake_quantize(self, inputs):
+        """Fake quantization using two-level scaling with _amax and _global_amax."""
+        if self._lsq:
+            scale_post = self._block_scale_from_amax(
+                _to_local(self.amax_post), self._quantize_scales
+            )
+            scale_pre = self._block_scale_from_amax(
+                _to_local(self.amax_pre), self._quantize_scales and self._quantize_pre_scale
+            )
+            quant_input = inputs.float() / scale_pre.float().view(-1, 1)
+            w_cast = self._cast_ste(quant_input)
+            return (w_cast * scale_post.view(-1, 1).to(w_cast.dtype)).to(inputs.dtype)
+
+        if self.amax is not None and self.is_nvfp4_static:
+            return static_blockwise_fp4_fake_quant(
+                inputs,
+                self.amax,
+                self.global_amax,
+                True,
+                fp8_max_for_normalization(self),
+                inputs.dtype,
+                self._pass_through_bwd,
+            )
+        return super()._fake_quantize(inputs)
+
+
+NVFP4StaticQuantizer = StaticBlockScaleQuantizer
+
+
+class _QuantizerContainerBase:
+    """Shared delegation helpers for quantizer containers."""
+
+    _delegated_properties = ["fake_quant", "is_enabled", "amax"]
+    _delegated_methods = [
+        "reset_amax",
+        "disable",
+        "disable_rotate",
+        "enable",
+        "load_calib_amax",
+        "load_calib_bias",
+    ]
+
+    def __getitem__(self, idx) -> Any:
+        return super().__getitem__(idx)  # type: ignore[misc]
+
+    def __iter__(self):
+        return super().__iter__()  # type: ignore[misc]
+
+    def __getattr__(self, name):
+        """Delegate configured properties and methods to contained quantizers."""
+        if name in self._delegated_properties:
+            return getattr(self[0], name)
+
+        if name in self._delegated_methods:
+
+            def method_wrapper(*args, **kwargs):
+                outputs = [getattr(quantizer, name)(*args, **kwargs) for quantizer in self]
+                return self._format_delegated_method_outputs(outputs)
+
+            return method_wrapper
+
+        return super().__getattr__(name)  # type: ignore[misc]
+
+    def __setattr__(self, name, value) -> None:
+        if name in self._delegated_properties:
+            for quantizer in self:
+                setattr(quantizer, name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def _format_delegated_method_outputs(self, outputs: list[Any]) -> Any:
+        """Preserve each container's existing delegated-method return convention."""
+        raise NotImplementedError
+
+    def _validate_broadcast_attribute_config(self, attributes) -> None:
+        """Validate a single config before broadcasting it to all members."""
+
+    def set_from_attribute_config(
+        self, attributes: list[QuantizerAttributeConfig] | list[dict[str, Any]]
+    ) -> None:
+        """Set the attributes of contained quantizers from one or more configs."""
+        if not isinstance(attributes, (list, tuple)):
+            self._validate_broadcast_attribute_config(attributes)
+            attributes = [attributes] * len(self)
+
+        for attribute, quantizer in zip(attributes, self):
+            quantizer.set_from_attribute_config(attribute)
+
+
+class SequentialQuantizer(_QuantizerContainerBase, nn.Sequential):
+    """A sequential container for  :class:`TensorQuantizer` modules.
+
+    This modules is used to quantize a tensor in multiple formats sequentially. It takes as input
+    :class:`TensorQuantizer` modules and containerize them similar to :class:`torch.nn.Sequential`.
+
+    We delegate certain properties and methods to all contained quantizers.
+    In the case of conflicts, the first quantizer's property or method takes priority.
+
+    `SequentialQuantizer` is useful in cases like INT4 weights, FP8 activations where weight quantization is not the
+    same as the gemm quantization. It allows for applying multiple quantization formats to the same tensor in sequence.
+
+    Use `SequentialQuantizer` methods in lower level implementations for better code organization and readability.
+
+    Args:
+        quantizers (TensorQuantizer): :class:`TensorQuantizer` modules to be added to the container.
+
+    """
+
+    def __init__(self, *quantizers: TensorQuantizer):
+        """Initialize SequentialQuantizer module."""
+        super().__init__(*quantizers)
+        assert all(isinstance(q, TensorQuantizer) for q in self), (
+            "All quantizers must be a TensorQuantizer."
+        )
+
+    def _format_delegated_method_outputs(self, outputs: list[Any]) -> Any:
+        return outputs[-1]
+
+    def _validate_broadcast_attribute_config(self, attributes) -> None:
+        assert isinstance(attributes, (dict, QuantizerAttributeConfig)), (
+            "attributes must be a list or a dict."
+        )
+
+    def get_modelopt_state(self) -> dict[str, Any]:
+        """Get meta state to be saved in checkpoint."""
+        return {"num_quantizers": len(self), "is_sequential_quantizer": True}
+
+    @staticmethod
+    @contextlib.contextmanager
+    def convert_to_single_quantizer(model, indx: int = 0):
+        """Replace instances of :class:`SequentialQuantizer` in the model with single `TensorQuantizer` quantizer.
+
+        The quantizer indexed by ``indx`` from the sequential quantizer is used to replace it.
+        This method is useful for individually calibrating the quantizers in a sequential quantizer.
+        """
+        original_sequential_quantizers: dict[nn.Module, list] = {}
+        for name, module in list(model.named_modules()):
+            if isinstance(module, SequentialQuantizer):
+                assert len(module) > indx
+                parent_module = model.get_submodule(name.rpartition(".")[0])
+                if parent_module not in original_sequential_quantizers:
+                    original_sequential_quantizers[parent_module] = []
+                original_sequential_quantizers[parent_module].append(
+                    (name.rpartition(".")[-1], module)
+                )
+                setattr(parent_module, name.rpartition(".")[-1], module[indx])
+
+        yield
+
+        for (
+            parent_module,
+            sequential_quantizers_list,
+        ) in original_sequential_quantizers.items():
+            for name, sequential_quantizer in sequential_quantizers_list:
+                setattr(parent_module, name, sequential_quantizer)
+
+
+class GroupedQuantizer(_QuantizerContainerBase, nn.ModuleList):
+    """A container for per-group :class:`TensorQuantizer` modules.
+
+    Used when a single linear holds several independently-quantized weights — e.g. the
+    fused experts of a TEGroupedLinear, where each of the ``num_gemms`` weights needs its
+    own ``amax``. Unlike :class:`SequentialQuantizer` (an ``nn.Sequential`` that *chains*
+    quantizers over one tensor), the contained quantizers act on *different* tensors, so
+    there is no inherent forward path: index in with ``grouped[i](weight_i)``.
+
+    Property reads (``amax``, ``is_enabled``) delegate to the first quantizer — all members
+    share one config, so the first is representative for "is this calibrated/enabled"
+    checks; the real per-group values live on the members and are used via indexing.
+    Lifecycle/config methods broadcast to every member.
+    """
+
+    def __init__(self, *quantizers: "TensorQuantizer | SequentialQuantizer"):
+        """Initialize GroupedQuantizer module."""
+        super().__init__(quantizers)
+        assert all(isinstance(q, (TensorQuantizer, SequentialQuantizer)) for q in self), (
+            "All quantizers must be a TensorQuantizer or SequentialQuantizer."
+        )
+
+    def forward(self, inputs):
+        """Apply the representative quantizer for single-weight compatibility paths."""
+        return self[0](inputs)
+
+    def _format_delegated_method_outputs(self, outputs: list[Any]) -> list[Any]:
+        return outputs
+
+
+def _is_plain_fake_quant(q: nn.Module) -> TypeGuard[TensorQuantizer]:
+    """Whether ``q(x)`` only fake-quantizes ``x`` with its calibrated amax, in any format.
+
+    Each group rules out something ``TensorQuantizer.forward`` can do that a stacked kernel does not.
+    """
+    return (
+        # Subclasses (e.g. static NVFP4, sequential) quantize differently.
+        type(q) is TensorQuantizer
+        # Fake-quantizing with its calibrated amax, not calibrating.
+        and q.is_enabled
+        and q._if_quant
+        and q._fake_quant
+        and not q._if_calib
+        and not q._use_constant_amax
+        # Nothing applied around the quantization itself.
+        and q.backend is None
+        and q.pre_quant_scale is None
+        and q.bias is None
+        and not q.rotate_is_enabled
+        and not q.rotate_back_is_enabled
+        # Hooks expect the quantizer itself to run, forward and backward.
+        and not (
+            q._forward_hooks or q._forward_pre_hooks or q._backward_hooks or q._backward_pre_hooks
+        )
+    )
+
+
+def _try_stacked_fake_quant(weight: torch.Tensor, quantizers: nn.ModuleList) -> torch.Tensor | None:
+    """Fake-quantize a stacked weight, ``quantizers[i]`` on ``weight[i]``, in one kernel launch.
+
+    Returns what calling each quantizer on its own slice would, stacked, or ``None`` when no
+    stacked kernel reproduces them exactly; the caller then quantizes slice by slice. The checks
+    every format needs come first. Dynamic block-16 NVFP4 is the only format with a stacked kernel
+    so far; another format adds its own branch after it.
+    """
+    # One local CUDA tensor with a slice per quantizer.
+    if (
+        not quantizers
+        or not weight.is_cuda
+        or isinstance(weight, DTensor)
+        or weight.shape[0] != len(quantizers)
+    ):
+        return None
+    plain = [q for q in quantizers if _is_plain_fake_quant(q)]
+    if len(plain) != len(quantizers):
+        return None
+    # One autograd function quantizes every slice, so they must share its backward.
+    pass_through_bwd = plain[0]._pass_through_bwd
+    if any(q._pass_through_bwd != pass_through_bwd for q in plain):
+        return None
+
+    if tensor_quant._nvfp4_triton_kernel_enabled() and all(
+        q.is_nvfp4_dynamic and q.block_sizes.get(-1) == 16 for q in plain
+    ):
+        amaxes = []
+        for q in plain:
+            amax = getattr(q, "_amax", None)
+            if amax is None or amax.numel() != 1:  # the kernel takes one per-tensor amax per slice
+                return None
+            # A clipped backward compares weight and amax: in one dtype, type promotion cannot
+            # change it.
+            if not pass_through_bwd and amax.dtype != weight.dtype:
+                return None
+            amaxes.append(amax.reshape(1))
+        return tensor_quant.stacked_nvfp4_fake_quant(
+            weight, torch.cat(amaxes).to(weight.device), pass_through_bwd
+        )
+    return None

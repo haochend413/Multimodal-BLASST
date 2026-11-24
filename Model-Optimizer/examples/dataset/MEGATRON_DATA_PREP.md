@@ -1,0 +1,505 @@
+# Tokenizing for Megatron Frameworks
+
+| **Section** | **Description** | **Link** |
+| :---: | :---: | :---: |
+| From JSONL files | Tokenize local JSONL files | \[[Link](#from-jsonl-files)\] |
+| From Hugging Face Hub | Stream or download HF datasets and tokenize | \[[Link](#from-hugging-face-hub)\] |
+| Token-budgeted data blends | Prepare weighted subsets for fast experiments | \[[Link](#prepare-token-budgeted-data-blends)\] |
+| Chat JSONL blends | Weighted chat data for assistant-only loss | \[[Link](#chat-jsonl-blends-for-assistant-only-loss)\] |
+| `reasoning_content` for Post-Training v3 | Control how chain-of-thought traces are handled | \[[Link](#reasoning_content-for-post-training-v3-datasets)\] |
+| Nemotron Pre/Post-Training Datasets | Ready-to-run commands for all Nemotron datasets | \[[Link](#ready-to-run-tokenization-commands)\] |
+
+The distillation and pre-training scripts in Megatron-Bridge or Megatron-LM expect data pre-tokenized in Megatron's binary indexed format (`.bin` / `.idx`).
+Use the `megatron_preprocess_data` utility to tokenize any JSONL or Hugging Face dataset.
+The tokenization scripts below print the list of output prefixes (e.g. `tokenized_qwen3/data1_text`) that you can use for the `data_paths` argument (with relative weights on different files) in Megatron training scripts.
+
+**Important Notes:**
+
+- For Pretraining / raw-text data (`text` key) — use `--append_eod` so Megatron can tell where documents end when concatenating them into long sequences.
+- For Post-training chat data (`messages` key) — omit `--append_eod`; the chat template already appends EOS at the end of each conversation.
+- Set `--max_sequence_length 256_000` to avoid rare OOM errors if some text is very long.
+
+## From JSONL files
+
+```bash
+python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+    --jsonl_paths /path/to/data1.jsonl /path/to/data2.jsonl ... \
+    --json_keys text \
+    --tokenizer Qwen/Qwen3-0.6B \
+    --output_dir tokenized_qwen3 \
+    --workers 32 \
+    --append_eod
+```
+
+```bash
+python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+    --jsonl_paths /path/to/sft_data.jsonl \
+    --json_keys messages \
+    --tokenizer Qwen/Qwen3-0.6B \
+    --output_dir tokenized_qwen3 \
+    --workers 32
+```
+
+Instead of `--jsonl_paths`, pass `--input_dir /path/to/dir` to tokenize all JSONL files in a directory (`.jsonl` and `.jsonl.gz` are both supported).
+
+## From Hugging Face Hub
+
+To tokenize a dataset directly from Hugging Face Hub:
+
+```bash
+python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+    --hf_dataset nvidia/Nemotron-Pretraining-SFT-v1 \
+    --hf_name Nemotron-SFT-Code \
+    --hf_split train \
+    --hf_max_samples_per_split 10_000_000 \
+    --json_keys text \
+    --tokenizer Qwen/Qwen3-0.6B \
+    --output_dir tokenized_qwen3 \
+    --workers 32 \
+    --append_eod
+```
+
+Omit `--hf_name` to process all subsets, `--hf_split` for all splits, or `--hf_max_samples_per_split` for all samples.
+To quickly test, use [nvidia/Nemotron-Pretraining-Dataset-sample](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Dataset-sample).
+
+For very large datasets (tens of millions of documents), or datasets with complex nested message schemas (e.g. `tool_calls`, `function_call` fields) that cause Arrow type-cast errors in non-streaming mode, add `--hf_streaming` to avoid downloading the full dataset — only the rows actually consumed are fetched. Optionally pair with `--hf_max_samples_per_split <num_samples>` to cap the row count; without it streaming still works but re-downloads on every run with no disk cache.
+
+> **Performance note:** Non-streaming mode downloads all Parquet shards once and caches them as Arrow files on disk.
+> Re-runs read from cache and are much faster.
+> Streaming re-downloads on every run with no cache, so it is slower for full-dataset processing.
+
+## Prepare token-budgeted data blends
+
+For iterative research, prepare smaller weighted datasets before scaling to a full distillation run.
+Use [`prepare_megatron_data_blend`](../../modelopt/torch/utils/plugins/prepare_megatron_data_blend.py) to
+prepare a weighted blend with a shared token budget. The utility supports Hugging Face configurations and splits
+as well as specific JSONL files stored in a Hugging Face dataset repository.
+
+Define the tokenizer, output directory, and source weights in YAML. Set the optional `target_tokens` field to
+prepare a weighted subset, or omit it to prepare every source in full. This example scales the
+[Nemotron 3 Nano distillation blend](../megatron_bridge/tutorials/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/README.md#1-data-preparation)
+down to one billion tokens while preserving its source weights:
+
+> [!IMPORTANT]
+> When `target_tokens` is set, JSONL records specified with `files` are consumed from the beginning
+> of each file rather than selected randomly. Pre-shuffle JSONL files to obtain a random subset.
+> Hugging Face dataset splits are shuffled deterministically; streaming datasets use an
+> approximate buffer shuffle.
+
+```yaml
+# Nemotron 3 models share this tokenizer, so the tokenized blend can be reused across the family.
+tokenizer: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+output_dir: /path/to/nemotron_3_distillation_blend_1b
+# Optional; omit this field to prepare every source in full.
+target_tokens: 1_000_000_000
+sources:
+  - hf_dataset: nvidia/Nemotron-Pretraining-SFT-v1
+    config: Nemotron-SFT-Code
+    split: train
+    max_samples: 10_000_000
+    content_field: text
+    weight: 5
+  - hf_dataset: nvidia/Nemotron-Pretraining-SFT-v1
+    config: Nemotron-SFT-General
+    split: train
+    max_samples: 10_000_000
+    content_field: text
+    weight: 20
+  - hf_dataset: nvidia/Nemotron-Pretraining-SFT-v1
+    config: Nemotron-SFT-MATH
+    split: train
+    max_samples: 10_000_000
+    content_field: text
+    weight: 5
+  - hf_dataset: nvidia/Nemotron-Math-v2
+    split: high_part00
+    content_field: messages
+    weight: 10
+  - hf_dataset: nvidia/Nemotron-SFT-Math-v3
+    files:
+      - data/train.jsonl
+    content_field: messages
+    weight: 17
+  - hf_dataset: nvidia/Nemotron-SFT-Competitive-Programming-v2
+    files:
+      - data/competitive_programming_python_00.jsonl
+    content_field: messages
+    weight: 15
+  - hf_dataset: nvidia/Nemotron-SFT-Competitive-Programming-v2
+    files:
+      - data/competitive_programming_cpp_00.jsonl
+    content_field: messages
+    weight: 5
+  - hf_dataset: nvidia/Nemotron-Post-Training-Dataset-v1
+    config: default
+    split: stem
+    max_samples: 5_000_000
+    content_field: messages
+    weight: 8
+  - hf_dataset: nvidia/Nemotron-Science-v1
+    files:
+      - data/MCQ.jsonl
+    content_field: messages
+    weight: 3
+  - hf_dataset: nvidia/Nemotron-Science-v1
+    files:
+      - data/RQA.jsonl
+    content_field: messages
+    weight: 2
+  - hf_dataset: nvidia/Nemotron-SFT-Instruction-Following-Chat-v2
+    files:
+      - data/reasoning_on.jsonl
+    content_field: messages
+    weight: 3
+  - hf_dataset: nvidia/Nemotron-SFT-Instruction-Following-Chat-v2
+    files:
+      - data/reasoning_off.jsonl
+    content_field: messages
+    weight: 2
+  - hf_dataset: nvidia/Nemotron-Agentic-v1
+    files:
+      - data/tool_calling.jsonl
+    content_field: messages
+    weight: 5
+```
+
+With ModelOpt installed, run:
+
+```bash
+python -m modelopt.torch.utils.plugins.prepare_megatron_data_blend --config blend.yaml
+```
+
+The output contains tokenized Megatron `.bin`/`.idx` files, `data_blend.txt` with the weighted paths for training,
+and `config.yaml` recording how the blend was generated. The final token count can slightly exceed the target
+because the final document from each source is kept whole.
+
+### Chat JSONL blends for assistant-only loss
+
+Tokenized `.bin`/`.idx` data carries no loss mask, so `--data_paths` training computes the loss on every token.
+To compute it on assistant tokens only, set `output_format: chat_jsonl`. The same sources are then written,
+untokenized, as `train.jsonl` and `validation.jsonl` with one `{"messages": [...]}` conversation per line, for
+Megatron-Bridge's chat path (`examples/megatron_bridge/distill.py --sft --sft_hf_dataset <dir>/train.jsonl
+--sft_hf_validation <dir>/validation.jsonl --sft_loss_mode assistant`), which applies the model's chat template
+when it loads the data. Run it in an environment with Megatron-Bridge, whose text-only chat filter selects the rows.
+
+```yaml
+output_dir: /path/to/chat_blend
+output_format: chat_jsonl
+target_samples: 36_800  # Total conversations; required, since the selected rows are mixed in memory.
+shuffle: false          # Optional; take the first rows of each split in order (default: buffer shuffle).
+seed: 1234              # Optional; seeds the shuffle, the cross-source mix and the validation hold-out.
+reasoning_content: native  # Optional; native (default), inline or strip.
+sources:
+  - hf_dataset: nvidia/Nemotron-Pretraining-SFT-v1
+    config: Nemotron-SFT-General
+    split: train
+    content_field: text
+    weight: 20
+  - hf_dataset: nvidia/Nemotron-SFT-Math-v3
+    config: default
+    split: train
+    content_field: messages
+    weight: 17
+```
+
+Each source contributes `round(target_samples * weight / sum(weights))` conversations that contain only text
+and have an assistant turn; a source that rounds to zero is skipped. `content_field` must be `messages` or `text`:
+
+- A `text` row becomes one assistant turn, or is split into turns if it uses the `<extra_id_1>User` /
+  `<extra_id_1>Assistant` / `System` chat markers. A row with a marker for any other role (such as a SteerLM
+  label line) or with an empty turn other than `System` is dropped.
+- `messages` and a row's `tools` are prepared as in the tokenizing mode (JSON-string `tool_calls` arguments
+  become dicts), and a top-level `system` prompt is kept for Megatron-Bridge to prepend. The one difference is
+  that `reasoning_content` stays on the message by default (`native`), because the chat template is applied
+  later, at training time. Use `inline` if your model's chat template ignores `reasoning_content`, so the
+  reasoning is kept as a `<think>` block in `content` (see [below](#reasoning_content-for-post-training-v3-datasets)),
+  or `strip` to drop it.
+
+`files` may be `.jsonl` or `.jsonl.gz`; malformed records in them are skipped with a warning. The conversations are
+mixed and `min(1000, n // 20)` of them are held out for validation. A source that fails to load, has no usable
+rows, or runs out of them stops the run. Each source's selection is cached under `<output_dir>/parts`, keyed by
+the settings that choose its rows, so an interrupted run resumes and a changed configuration selects afresh.
+Nothing prunes `parts`; delete it once `train.jsonl` is written to reclaim the space.
+
+To feed `distill.py --sft_in_batch_packing`, also count tokens the way Megatron-Bridge trains them:
+
+```yaml
+tokenizer: Qwen/Qwen3.6-35B-A3B  # The student's tokenizer.
+max_length: 32768       # distill.py --seq_length; longer conversations are truncated.
+loss_mode: assistant    # Optional; as distill.py --sft_loss_mode.
+pack_max_tokens: 33280  # Optional; order each split as pairs of at most this many tokens.
+num_workers: 48         # Optional; tokenizer processes (default: all CPUs).
+```
+
+With `tokenizer` and `max_length`, a conversation with no trained token left after truncation is
+dropped, since Megatron-Bridge fails on it during training. `pack_max_tokens` pairs long
+conversations with short ones and writes each split pair by pair, so `--mbs 2` packs every pair
+into one micro-batch; a conversation that fits with no other is dropped. With `--cp_size` > 1,
+Megatron-Bridge pads each conversation to a multiple of `2 * cp_size`, so a pair can exceed the cap
+by under `2 * cp_size` tokens per conversation. Tokenizing runs on the CPU: ~0.4 s per
+conversation per process for GLM-5.3-Flash on Nemotron-Cascade-2 (4.4K tokens on average).
+
+## `reasoning_content` for Post-Training v3 Datasets
+
+v3 datasets include a `reasoning_content` field in assistant messages (chain-of-thought separate from
+the final answer). Use `--reasoning_content` to control how it is handled:
+
+| Value | Behaviour |
+| --- | --- |
+| `strip` (default) | Field is discarded before `apply_chat_template`. Safe for any tokenizer. |
+| `inline` | Wrapped as `<think>…</think>` and prepended to `content`. Preserves reasoning in a tokenizer-agnostic way. |
+| `native` | Passed unchanged. Requires the tokenizer's chat template to handle the field (e.g. Qwen3). |
+
+```bash
+python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+    --hf_dataset nvidia/Nemotron-Math-v2 \
+    --hf_split high_part00 \
+    --json_keys messages \
+    --tokenizer nvidia/NVIDIA-Nemotron-Nano-9B-v2 \
+    --output_dir tokenized_nemotron_v2 \
+    --workers 32 \
+    --reasoning_content inline
+```
+
+---
+
+## Ready-to-run tokenization commands
+
+Tokenization commands for all Nemotron Pre-Training and Post-Training datasets used in Megatron-Bridge distillation experiments.
+
+Two parameters vary by model — set them before running the commands below:
+
+```bash
+TOKENIZER=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 # HuggingFace tokenizer (or local path)
+OUTPUT_DIR=tokenized_nemotron_3                      # Output directory for tokenized files
+```
+
+> [!TIP]
+> Token count for a `.bin` file = file size in bytes ÷ 4. This is also printed by the tokenization script on completion.
+
+> [!NOTE]
+> Tokenizing each of the datasets below will take anywhere between 10 minutes to few hours. You can tokenize all in parallel to speed up the process.
+>
+> You may tokenize more datasets or skip some datasets depending on your needs.
+
+### Nemotron Pretraining dataset
+
+**[nvidia/Nemotron-Pretraining-SFT-v1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-SFT-v1)** — raw text; omitting `--hf_name` tokenizes all 3 subsets (Code, General, MATH) in one command, producing a separate output file per subset named after each:
+
+```bash
+python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+  --hf_dataset nvidia/Nemotron-Pretraining-SFT-v1 \
+  --hf_split train \
+  --hf_streaming \
+  --hf_max_samples_per_split 10_000_000 \
+  --json_keys text \
+  --tokenizer ${TOKENIZER} \
+  --output_dir ${OUTPUT_DIR} \
+  --workers 96 \
+  --max_sequence_length 256_000 \
+  --append_eod \
+  --strip_newlines
+```
+
+---
+
+### Nemotron Post-training v1 dataset
+
+**[nvidia/Nemotron-Post-Training-Dataset-v1](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v1)** — STEM subset, capped at 5M samples. v1 data does not contain reasoning traces:
+
+```bash
+python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+  --hf_dataset nvidia/Nemotron-Post-Training-Dataset-v1 \
+  --hf_name default \
+  --hf_split stem \
+  --hf_streaming \
+  --hf_max_samples_per_split 5_000_000 \
+  --json_keys messages \
+  --tokenizer ${TOKENIZER} \
+  --output_dir ${OUTPUT_DIR} \
+  --workers 96 \
+  --max_sequence_length 256_000
+```
+
+---
+
+### Nemotron Post-training v3 collection
+
+Datasets below are from the [Nemotron Post-Training v3 collection](https://huggingface.co/collections/nvidia/nemotron-post-training-v3). All use `--reasoning_content inline` to preserve `<think>…</think>` traces. The collection contains many more datasets — if you care about benchmarks not covered here (e.g. multilingual, agentic/tool use, SWE, safety), pick the relevant datasets from the collection and tokenize them the same way.
+
+**[nvidia/Nemotron-Math-v2](https://huggingface.co/datasets/nvidia/Nemotron-Math-v2)** — tokenize `high_part00` and `high_part01` separately. `--hf_streaming` is required because the messages contain extra fields (e.g. `tool_calls`) that cause Arrow type-cast errors in non-streaming mode when using tokenizers with complex chat templates (such as Nemotron v3):
+
+```bash
+for SPLIT in high_part00 high_part01; do
+  python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+    --hf_dataset nvidia/Nemotron-Math-v2 \
+    --hf_split ${SPLIT} \
+    --hf_streaming \
+    --json_keys messages \
+    --tokenizer ${TOKENIZER} \
+    --output_dir ${OUTPUT_DIR} \
+    --workers 96 \
+    --max_sequence_length 256_000 \
+    --reasoning_content inline
+done
+```
+
+**[nvidia/Nemotron-SFT-Math-v3](https://huggingface.co/datasets/nvidia/Nemotron-SFT-Math-v3)** — stored as raw JSONL on HuggingFace, download before tokenizing (more reliable than streaming for this dataset due to complex nested `tool_calls` fields):
+
+```bash
+hf download nvidia/Nemotron-SFT-Math-v3 \
+    --repo-type dataset \
+    --local-dir datasets/Nemotron-SFT-Math-v3/
+python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+    --jsonl_paths datasets/Nemotron-SFT-Math-v3/data/train.jsonl \
+    --json_keys messages \
+    --tokenizer ${TOKENIZER} \
+    --output_dir ${OUTPUT_DIR} \
+    --workers 96 \
+    --max_sequence_length 256_000 \
+    --reasoning_content inline
+
+# Rename to avoid generic file name
+mv ${OUTPUT_DIR}/train_messages.bin ${OUTPUT_DIR}/nvidia--Nemotron-SFT-Math-v3_default_train_messages.bin
+mv ${OUTPUT_DIR}/train_messages.idx ${OUTPUT_DIR}/nvidia--Nemotron-SFT-Math-v3_default_train_messages.idx
+```
+
+**[nvidia/Nemotron-SFT-Competitive-Programming-v2](https://huggingface.co/datasets/nvidia/Nemotron-SFT-Competitive-Programming-v2)** — stored as raw JSONL on HuggingFace, download before tokenizing:
+
+```bash
+hf download nvidia/Nemotron-SFT-Competitive-Programming-v2 \
+    --repo-type dataset \
+    --local-dir datasets/Nemotron-SFT-Competitive-Programming-v2/
+for FILE in competitive_programming_python_00 competitive_programming_cpp_00; do
+  python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+    --jsonl_paths datasets/Nemotron-SFT-Competitive-Programming-v2/data/${FILE}.jsonl \
+    --json_keys messages \
+    --tokenizer ${TOKENIZER} \
+    --output_dir ${OUTPUT_DIR} \
+    --workers 96 \
+    --max_sequence_length 256_000 \
+    --reasoning_content inline
+done
+```
+
+**[nvidia/Nemotron-Science-v1](https://huggingface.co/datasets/nvidia/Nemotron-Science-v1)** — stored as raw JSONL on HuggingFace, download before tokenizing:
+
+```bash
+hf download nvidia/Nemotron-Science-v1 \
+    --repo-type dataset \
+    --local-dir datasets/Nemotron-Science-v1/
+python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+    --input_dir datasets/Nemotron-Science-v1/data/ \
+    --json_keys messages \
+    --tokenizer ${TOKENIZER} \
+    --output_dir ${OUTPUT_DIR} \
+    --workers 96 \
+    --max_sequence_length 256_000 \
+    --reasoning_content inline
+```
+
+**[nvidia/Nemotron-SFT-Instruction-Following-Chat-v2](https://huggingface.co/datasets/nvidia/Nemotron-SFT-Instruction-Following-Chat-v2)** — stored as raw JSONL on HuggingFace, download before tokenizing:
+
+```bash
+hf download nvidia/Nemotron-SFT-Instruction-Following-Chat-v2 \
+    --repo-type dataset \
+    --local-dir datasets/Nemotron-SFT-Instruction-Following-Chat-v2/
+python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+    --input_dir datasets/Nemotron-SFT-Instruction-Following-Chat-v2/data/ \
+    --json_keys messages \
+    --tokenizer ${TOKENIZER} \
+    --output_dir ${OUTPUT_DIR} \
+    --workers 96 \
+    --max_sequence_length 256_000 \
+    --reasoning_content inline
+```
+
+**[nvidia/Nemotron-Agentic-v1](https://huggingface.co/datasets/nvidia/Nemotron-Agentic-v1)** — `tool_calling.jsonl` (316K samples). Stored as raw JSONL on HuggingFace, download before tokenizing (more reliable than streaming for this dataset due to complex nested `tool_calls` / `tools` fields):
+
+```bash
+hf download nvidia/Nemotron-Agentic-v1 \
+    --repo-type dataset \
+    --local-dir datasets/Nemotron-Agentic-v1/
+python -m modelopt.torch.utils.plugins.megatron_preprocess_data \
+    --jsonl_paths datasets/Nemotron-Agentic-v1/data/tool_calling.jsonl \
+    --json_keys messages \
+    --tokenizer ${TOKENIZER} \
+    --output_dir ${OUTPUT_DIR} \
+    --workers 96 \
+    --max_sequence_length 256_000 \
+    --reasoning_content inline
+
+# Rename to avoid collision with potential future Nemotron-SFT-Agentic-v2 / tool_calling
+mv ${OUTPUT_DIR}/tool_calling_messages.bin ${OUTPUT_DIR}/nvidia--Nemotron-Agentic-v1_tool_calling_messages.bin
+mv ${OUTPUT_DIR}/tool_calling_messages.idx ${OUTPUT_DIR}/nvidia--Nemotron-Agentic-v1_tool_calling_messages.idx
+```
+
+---
+
+### Expected output
+
+After running all commands above, `${OUTPUT_DIR}/` should contain the following `.bin` / `.idx` file pairs:
+
+```text
+nvidia--Nemotron-Pretraining-SFT-v1_Nemotron-SFT-Code_train_text_max10000000.{bin,idx}
+nvidia--Nemotron-Pretraining-SFT-v1_Nemotron-SFT-General_train_text_max10000000.{bin,idx}
+nvidia--Nemotron-Pretraining-SFT-v1_Nemotron-SFT-MATH_train_text_max10000000.{bin,idx}
+nvidia--Nemotron-Post-Training-Dataset-v1_default_stem_messages_max5000000.{bin,idx}
+nvidia--Nemotron-Math-v2_default_high_part00_messages.{bin,idx}
+nvidia--Nemotron-Math-v2_default_high_part01_messages.{bin,idx}
+nvidia--Nemotron-SFT-Math-v3_default_train_messages.{bin,idx}
+competitive_programming_python_00_messages.{bin,idx}
+competitive_programming_cpp_00_messages.{bin,idx}
+MCQ_messages.{bin,idx}
+RQA_messages.{bin,idx}
+reasoning_off_messages.{bin,idx}
+reasoning_on_messages.{bin,idx}
+nvidia--Nemotron-Agentic-v1_tool_calling_messages.{bin,idx}
+```
+
+### Reproducible question-isolated chat blends
+
+Set `group_split: true` in a chat JSONL configuration to enable complete-record
+deduplication and question-isolated train/validation selection. Every source must
+specify a full `revision` commit SHA. `validation_samples` defaults to 1,000;
+`shuffle_buffer_size` defaults to 10,000 and applies to both HF splits and JSONL
+files when `shuffle: true`. This is bounded buffer shuffling, not uniform sampling
+from the entire repository. Configuration and dependency versions must remain
+fixed to reproduce the same result.
+
+This mode retains different answers/reasoning for the same input, but assigns
+whole known question groups to one split. Validation uses one record per group,
+stratified within each source by document/single-turn/multi-turn format and
+reasoning presence where available. Other versions of validation questions are
+reserved, not used for training. Without a reliable problem ID, grouping uses
+exact task inputs; translations and paraphrases can remain undetected.
+
+Optional `filter_image_references`, `filter_tool_calls` and
+`filter_invalid_reasoning` flags reject image-marked text (including HTML/code
+examples), tool interactions, and unbalanced inline `<think>` tags respectively.
+Structured media is always rejected by Bridge's text-only filter. These checks
+do not establish answer correctness or completeness of a nonempty problem.
+
+`question_sources` maps indexed Nemotron competitive-programming source names
+(`taco`, `apps`, `code_contests`, `open-r1/codeforces`) to `hf_dataset` and pinned
+`revision` values. Missing `"-"` prompts are recovered from those indexed sources;
+an unavailable or ambiguous original question fails generation rather than
+silently training the placeholder. See the Nemotron 3.5 Super VL tutorial's
+`data_blend.yaml` for the full configuration, including schema-safe JSONL file
+selection for instruction-following reasoning-on/off data.
+
+Rejected, duplicate and validation-reserved records are replenished from the
+same source. Exhaustion produces a warning and a smaller result, never automatic
+cross-source redistribution; network/authentication failures still fail the run.
+Inspect `report.json` for requested/actual source counts, shortfalls, format
+counts, dependency versions and output hashes. `manifest.jsonl` records selected
+source revisions, sampled positions, IDs, restoration keys and group membership.
+Cross-source duplicates are attributed using a stable source-configuration hash
+order, independently of YAML source order. `config.yaml` preserves the recipe.
+A completed result is reused only when its configuration, pipeline/dependency
+fingerprint and output hashes match; interrupted selection restarts from the
+same seed. The selected data is held in memory, so size `target_samples` accordingly.
+
+Grouped selection writes master records and does not support `max_length` or
+`pack_max_tokens`: sequence-length-specific filtering/packing remains a separate
+step. It does not modify training loss masks or guarantee benchmark decontamination.

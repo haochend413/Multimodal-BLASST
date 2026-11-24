@@ -1,0 +1,1398 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for tied-weight helpers in unified_export_hf."""
+
+import importlib.util
+import json
+from copy import deepcopy
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+import torch
+from _test_utils.torch.distributed.utils import bounded_collectives
+from _test_utils.torch.quantization.tied_modules import (
+    make_tied_linear_pair,
+    wrap_in_parent_with_tied_keys,
+)
+from safetensors.torch import save_file
+
+import modelopt.torch.quantization as mtq
+from modelopt.torch.export import distributed_writer, unified_export_hf
+from modelopt.torch.export.model_utils import (
+    TiedWeightMap,
+    get_language_model_from_vl,
+    is_multimodal_model,
+)
+from modelopt.torch.export.quant_utils import (
+    fuse_prequant_layernorm,
+    postprocess_state_dict,
+    sync_tied_input_amax,
+)
+from modelopt.torch.export.unified_export_hf import (
+    _copy_non_model_files_from_source,
+    _fuse_shared_input_modules,
+    _resolve_export_dtype,
+    _source_checkpoint,
+    _write_base_config,
+    collect_shared_input_modules,
+    export_hf_checkpoint,
+    read_unplaced_weights,
+)
+from modelopt.torch.quantization.nn import TensorQuantizer
+from modelopt.torch.utils.distributed import DistributionPlan, set_distribution_plan
+
+
+def test_multimodal_detection_accepts_null_architectures():
+    """Unified export treats absent architecture metadata as an empty list."""
+    model = SimpleNamespace(config=SimpleNamespace(architectures=None))
+
+    assert not is_multimodal_model(model)
+
+
+def test_language_model_extraction_accepts_aliased_compatibility_property():
+    """A top-level compatibility property may alias the standardized nested LM root."""
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.language_model = torch.nn.Module()
+    model.language_model = model.model.language_model
+
+    assert get_language_model_from_vl(model) == [
+        model,
+        model.model,
+        model.model.language_model,
+    ]
+
+
+def test_language_model_extraction_preserves_nested_preference_by_default():
+    """Generic callers retain the historical nested-root preference."""
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.language_model = torch.nn.Module()
+    model.language_model = torch.nn.Module()
+
+    assert get_language_model_from_vl(model) == [
+        model,
+        model.model,
+        model.model.language_model,
+    ]
+
+
+def test_language_model_extraction_rejects_competing_roots_when_strict():
+    """Search callers can fail closed instead of selecting a competing root."""
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.language_model = torch.nn.Module()
+    model.language_model = torch.nn.Module()
+
+    with pytest.raises(ValueError, match="multiple language-model roots"):
+        get_language_model_from_vl(model, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("configured_dtype", "dtype", "expected_dtype", "warning_count"),
+    [
+        (None, None, torch.float32, 0),
+        (None, torch.float16, torch.float16, 0),
+        (torch.bfloat16, None, torch.bfloat16, 0),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, 0),
+        (torch.bfloat16, torch.float16, torch.float16, 1),
+    ],
+)
+def test_resolve_export_dtype(configured_dtype, dtype, expected_dtype, warning_count, recwarn):
+    model = torch.nn.Linear(1, 1)
+    model.config = (
+        SimpleNamespace(dtype=configured_dtype) if configured_dtype is not None else object()
+    )
+
+    assert _resolve_export_dtype(model, dtype) == expected_dtype
+    assert len(recwarn) == warning_count
+    if warning_count:
+        assert str(recwarn[0].message) == (
+            "Model's original dtype (torch.bfloat16) differs from target dtype "
+            "(torch.float16), which may lead to numerical errors."
+        )
+
+
+def test_resolve_export_dtype_with_empty_diffusers_config():
+    # Import locally so Diffusers stays optional during torch-only test collection.
+    frozen_dict = pytest.importorskip("diffusers.configuration_utils").FrozenDict()
+    model = torch.nn.Linear(1, 1)
+    model.config = frozen_dict
+
+    assert _resolve_export_dtype(model, None) == torch.float32
+
+
+def test_hf_all_tied_weights_keys_contract():
+    """Pin the transformers API we build tied_map from, so a version bump fails loud here.
+
+    We rely on ``model.all_tied_weights_keys`` being a name-based ``{alias: canonical}`` dict
+    (``tie_word_embeddings=True`` -> lm_head aliases the embedding). If transformers renames it or
+    flips the direction, this breaks instead of silently skipping tied-weight dedup.
+    """
+    pytest.importorskip("transformers")
+    from transformers import AutoModelForCausalLM, LlamaConfig
+
+    cfg = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        tie_word_embeddings=True,
+    )
+    cfg.architectures = ["LlamaForCausalLM"]
+    model = AutoModelForCausalLM.from_config(cfg)
+
+    assert model.all_tied_weights_keys == {"lm_head.weight": "model.embed_tokens.weight"}
+    # TiedWeightMap consumes it verbatim.
+    assert TiedWeightMap(model).alias_to_canonical == {
+        "lm_head.weight": "model.embed_tokens.weight"
+    }
+
+
+def test_tied_weight_map_drops_self_entries():
+    """A self-entry (alias == canonical) is filtered, so the kept canonical is never dropped."""
+
+    class _M(torch.nn.Module):
+        all_tied_weights_keys = {"a.weight": "b.weight", "b.weight": "b.weight"}
+
+    assert TiedWeightMap(_M()).alias_to_canonical == {"a.weight": "b.weight"}
+
+
+def test_tied_group_resolver_group_key_is_shared_and_order_independent():
+    """Both sides of a declared tie map to the same key; untied params map to None."""
+    enc, dec = make_tied_linear_pair()
+    parent = wrap_in_parent_with_tied_keys(enc, dec, decoder_canonical=True)
+
+    tied_map = TiedWeightMap(parent)
+
+    assert tied_map.group_key("encoder.weight") == tied_map.group_key("decoder.weight")
+    assert tied_map.group_key("encoder.weight") == "decoder.weight"  # canonical wins
+    assert tied_map.group_key("unrelated.weight") is None
+
+
+def test_tied_group_resolver_per_layer_backreference():
+    """container_group_key resolves each layer's tie independently (no cross-layer collapse).
+
+    HF expands the per-layer regex/backreference into concrete ``all_tied_weights_keys`` names;
+    TiedWeightMap reads that and container_group_key must keep layers distinct.
+    """
+
+    class _Parent(torch.nn.Module):
+        all_tied_weights_keys = {
+            "encoder.layers.0.experts.gate_up_proj": "decoder.layers.0.experts.gate_up_proj",
+            "encoder.layers.1.experts.gate_up_proj": "decoder.layers.1.experts.gate_up_proj",
+        }
+
+    tied_map = TiedWeightMap(_Parent())
+
+    assert (
+        tied_map.container_group_key("encoder.layers.0.experts", "gate_up_proj")
+        == "decoder.layers.0.experts"
+    )
+    assert (
+        tied_map.container_group_key("encoder.layers.1.experts", "gate_up_proj")
+        == "decoder.layers.1.experts"
+    )
+    # Encoder layer 0 must not collapse into decoder layer 1.
+    assert tied_map.container_group_key(
+        "encoder.layers.0.experts", "gate_up_proj"
+    ) != tied_map.container_group_key("encoder.layers.1.experts", "gate_up_proj")
+
+
+def test_tied_group_resolver_parallel_pattern_declaration():
+    """DiffusionGemma-style tie: container resolves to the decoder canonical; per-expert split keys drop by name.
+
+    HF resolves DiffGemma's parallel-regex declaration into concrete ``all_tied_weights_keys``
+    names (incl. the fused expert Parameters); TiedWeightMap reads that.
+    """
+
+    class _Root(torch.nn.Module):
+        all_tied_weights_keys = {
+            "model.encoder.language_model.layers.0.experts.gate_up_proj": (
+                "model.decoder.layers.0.experts.gate_up_proj"
+            ),
+            "model.encoder.language_model.layers.0.experts.down_proj": (
+                "model.decoder.layers.0.experts.down_proj"
+            ),
+        }
+
+    tied_map = TiedWeightMap(_Root())
+
+    # container group key: encoder side resolves to the decoder canonical container
+    assert (
+        tied_map.container_group_key(
+            "model.encoder.language_model.layers.0.experts", "gate_up_proj"
+        )
+        == "model.decoder.layers.0.experts"
+    )
+    # post-export per-expert split keys of the (fully tied) container are dropped by name.
+    enc = "model.encoder.language_model.layers.0.experts"
+    dec = "model.decoder.layers.0.experts"
+    shared = torch.randn(4, 4)  # tied sides export identical bytes
+    sd = {
+        f"{enc}.3.gate_proj.weight": shared.clone(),
+        f"{dec}.3.gate_proj.weight": shared.clone(),
+    }
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None, tied_map=tied_map)
+    assert f"{enc}.3.gate_proj.weight" not in out  # alias split key dropped
+    assert f"{dec}.3.gate_proj.weight" in out  # canonical kept
+
+
+def test_postprocess_moe_alias_container_ties_to_two_canonicals():
+    """One alias container whose projections tie to DIFFERENT canonical containers dedups both.
+
+    Groups are keyed by the full (alias, canonical) pair, so gate_up_proj -> decA and
+    down_proj -> decB under the same 'enc.experts' don't overwrite each other.
+    """
+
+    class _M(torch.nn.Module):
+        all_tied_weights_keys = {
+            "enc.experts.gate_up_proj": "decA.experts.gate_up_proj",
+            "enc.experts.down_proj": "decB.experts.down_proj",
+        }
+
+    tied_map = TiedWeightMap(_M())
+    w = torch.randn(4, 4)  # tied sides export identical bytes
+    sd = {
+        "enc.experts.0.gate_proj.weight": w.clone(),
+        "decA.experts.0.gate_proj.weight": w.clone(),
+        "enc.experts.0.down_proj.weight": w.clone(),
+        "decB.experts.0.down_proj.weight": w.clone(),
+    }
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None, tied_map=tied_map)
+    assert "enc.experts.0.gate_proj.weight" not in out  # tied to decA -> dropped
+    assert (
+        "enc.experts.0.down_proj.weight" not in out
+    )  # tied to decB -> dropped (would leak w/o fix)
+    assert "decA.experts.0.gate_proj.weight" in out
+    assert "decB.experts.0.down_proj.weight" in out
+
+
+def _quantize_and_get_input_quantizers(parent):
+    """Insert FP8 quantizers via no-op forward_loop and return both input_quantizers."""
+    mtq.quantize(parent, mtq.FP8_DEFAULT_CFG, forward_loop=lambda m: None)
+    return parent.encoder.input_quantizer, parent.decoder.input_quantizer
+
+
+def test_sync_tied_input_amax_max_merges_tied_module_amaxes_in_place():
+    """Tied Linears with divergent input_quantizer.amax get both sides overwritten with the max."""
+    enc, dec = make_tied_linear_pair()
+    parent = wrap_in_parent_with_tied_keys(enc, dec, decoder_canonical=True)
+    enc_q, dec_q = _quantize_and_get_input_quantizers(parent)
+
+    enc_q.amax = torch.tensor(2.0)
+    dec_q.amax = torch.tensor(5.0)
+
+    sync_tied_input_amax(parent)
+
+    expected = torch.tensor(5.0)
+    assert torch.allclose(enc_q.amax, expected)
+    assert torch.allclose(dec_q.amax, expected)
+
+
+def test_sync_tied_input_amax_no_op_for_untied_modules():
+    """Untied Linears keep their per-side amaxes — the helper is a no-op when there's no tie."""
+    parent = torch.nn.Module()
+    parent.encoder = torch.nn.Linear(16, 32, bias=False)
+    parent.decoder = torch.nn.Linear(16, 32, bias=False)
+    enc_q, dec_q = _quantize_and_get_input_quantizers(parent)
+
+    enc_q.amax = torch.tensor(2.0)
+    dec_q.amax = torch.tensor(5.0)
+
+    sync_tied_input_amax(parent)
+
+    assert torch.allclose(enc_q.amax, torch.tensor(2.0))
+    assert torch.allclose(dec_q.amax, torch.tensor(5.0))
+
+
+def test_sync_tied_input_amax_merges_undeclared_shared_weight():
+    """Two Linears sharing a weight but declaring no tie still get their input amaxes merged by identity."""
+    parent = torch.nn.Module()
+    parent.a = torch.nn.Linear(16, 32, bias=False)
+    parent.b = torch.nn.Linear(16, 32, bias=False)
+    parent.b.weight = parent.a.weight  # undeclared physical share (same Parameter object)
+
+    mtq.quantize(parent, mtq.FP8_DEFAULT_CFG, forward_loop=lambda m: None)
+    assert parent.a.weight is parent.b.weight  # share survives quantize
+    # No _tied_weights_keys declared, so name-based grouping finds nothing to merge.
+    assert TiedWeightMap(parent).group_key("a.weight") is None
+
+    parent.a.input_quantizer.amax = torch.tensor(2.0)
+    parent.b.input_quantizer.amax = torch.tensor(8.0)
+
+    sync_tied_input_amax(parent)
+
+    expected = torch.tensor(8.0)
+    assert torch.allclose(parent.a.input_quantizer.amax, expected)
+    assert torch.allclose(parent.b.input_quantizer.amax, expected)
+
+
+def test_postprocess_name_based_drops_alias_across_distinct_addresses():
+    """Declared alias dropped by name even when its tensor is at a different address (the FSDP full_state_dict case)."""
+    enc, dec = make_tied_linear_pair()
+    parent = wrap_in_parent_with_tied_keys(enc, dec, decoder_canonical=True)
+    tied_map = TiedWeightMap(parent)
+
+    # Distinct storages (different data_ptr) but identical bytes (genuinely tied): the address
+    # pass could never collapse these, but the name pass does.
+    shared = torch.randn(4, 4)
+    sd = {"encoder.weight": shared.clone(), "decoder.weight": shared.clone()}
+    assert sd["encoder.weight"].data_ptr() != sd["decoder.weight"].data_ptr()
+
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None, tied_map=tied_map)
+
+    assert "decoder.weight" in out  # canonical kept
+    assert "encoder.weight" not in out  # alias dropped by name
+
+
+def test_postprocess_name_based_keeps_alias_when_canonical_absent():
+    """An alias is NOT dropped when its canonical counterpart is missing (no orphaning)."""
+    enc, dec = make_tied_linear_pair()
+    parent = wrap_in_parent_with_tied_keys(enc, dec, decoder_canonical=True)
+    tied_map = TiedWeightMap(parent)
+
+    sd = {"encoder.weight": torch.randn(4, 4)}  # canonical decoder.weight absent
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None, tied_map=tied_map)
+
+    assert "encoder.weight" in out
+
+
+def test_postprocess_keeps_both_sides_when_tied_quant_state_differs():
+    """Tied sides with differing quant state aren't deduped (atomic drop), so no scale is orphaned."""
+    enc, dec = make_tied_linear_pair()
+    parent = wrap_in_parent_with_tied_keys(enc, dec, decoder_canonical=True)
+    tied_map = TiedWeightMap(parent)
+
+    sd = {
+        # alias (encoder) exported as quantized: weight + companion scales
+        "encoder.weight": torch.randn(4, 4),
+        "encoder.weight_scale": torch.randn(4),
+        "encoder.input_scale": torch.randn(1),
+        # canonical (decoder) exported unquantized: weight only, no scales
+        "decoder.weight": torch.randn(4, 4),
+    }
+
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None, tied_map=tied_map)
+
+    # Mismatched companion keys -> keep the whole alias group; no orphaned scales.
+    assert set(out) == set(sd)
+
+
+def test_postprocess_name_based_drops_tied_expert_subtree_by_name():
+    """A container-level declared expert tie drops every per-expert alias key by name,
+    keeping only the canonical subtree -- across distinct addresses (FSDP-safe)."""
+
+    class _Parent(torch.nn.Module):
+        all_tied_weights_keys = {
+            "encoder.experts.gate_up_proj": "decoder.experts.gate_up_proj",
+            "encoder.experts.down_proj": "decoder.experts.down_proj",
+        }
+
+    parent = _Parent()
+    tied_map = TiedWeightMap(parent)
+    assert tied_map.alias_to_canonical == {
+        "encoder.experts.gate_up_proj": "decoder.experts.gate_up_proj",
+        "encoder.experts.down_proj": "decoder.experts.down_proj",
+    }
+
+    # Exported-style per-expert keys; tied sides carry identical bytes (distinct storage).
+    sd = {}
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            w, s = torch.randn(4, 4), torch.randn(4)
+            for side in ("encoder", "decoder"):
+                sd[f"{side}.experts.{e}.{proj}.weight"] = w.clone()
+                sd[f"{side}.experts.{e}.{proj}.weight_scale"] = s.clone()
+
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None, tied_map=tied_map)
+
+    assert not any(k.startswith("encoder.experts.") for k in out)  # all aliases dropped
+    assert all(k.startswith("decoder.experts.") for k in out)  # only canonical remains
+    assert len(out) == 2 * 3 * 2  # 2 experts * 3 projections * (weight + weight_scale)
+
+
+def test_postprocess_keeps_independent_bias_under_tied_weight():
+    """A weight tie must not drop an independent bias sharing the module prefix (the NVBug 6525352 failure class)."""
+
+    class _TwoLinear(torch.nn.Module):
+        all_tied_weights_keys = {"A.weight": "B.weight"}
+
+    tied_map = TiedWeightMap(_TwoLinear())
+    tied_w = torch.randn(4, 4)  # A.weight is B.weight -> identical exported bytes
+    sd = {
+        "A.weight": tied_w.clone(),
+        "A.bias": torch.randn(4),  # independent
+        "B.weight": tied_w.clone(),
+        "B.bias": torch.randn(4),  # independent
+    }
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None, tied_map=tied_map)
+
+    assert "A.weight" not in out  # tied weight dropped
+    assert "A.bias" in out  # independent bias survives
+    assert "B.weight" in out and "B.bias" in out
+
+
+def test_postprocess_partially_tied_container_dedups_only_tied_projections():
+    """Only the tied projection's per-expert keys are deduped; an untied down_proj and a router child survive."""
+
+    class _Parent(torch.nn.Module):
+        all_tied_weights_keys = {"encoder.experts.gate_up_proj": "decoder.experts.gate_up_proj"}
+
+    tied_map = TiedWeightMap(_Parent())
+    assert tied_map.alias_to_canonical == {
+        "encoder.experts.gate_up_proj": "decoder.experts.gate_up_proj"
+    }
+
+    # Tied projections (gate_proj/up_proj, from gate_up_proj) carry identical bytes across sides;
+    # untied down_proj and router differ.
+    sd = {}
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj"):
+            w = torch.randn(4, 4)
+            sd[f"encoder.experts.{e}.{proj}.weight"] = w.clone()
+            sd[f"decoder.experts.{e}.{proj}.weight"] = w.clone()
+        for side in ("encoder", "decoder"):
+            sd[f"{side}.experts.{e}.down_proj.weight"] = torch.randn(4, 4)  # untied
+    for side in ("encoder", "decoder"):
+        sd[f"{side}.experts.router.weight"] = torch.randn(4, 4)  # non-projection child
+
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None, tied_map=tied_map)
+
+    # Tied gate_up_proj (splits to gate_proj/up_proj) is deduped on the encoder (alias) side.
+    assert not any(".gate_proj." in k or ".up_proj." in k for k in out if k.startswith("encoder."))
+    # Untied down_proj and the router survive on both sides.
+    assert all(f"encoder.experts.{e}.down_proj.weight" in out for e in range(2))
+    assert "encoder.experts.router.weight" in out and "decoder.experts.router.weight" in out
+    # Decoder (canonical) side fully kept.
+    assert all(
+        f"decoder.experts.{e}.{p}.weight" in out
+        for e in range(2)
+        for p in ("gate_proj", "up_proj", "down_proj")
+    )
+
+
+def test_postprocess_backstop_collapses_keys_sharing_a_dataptr():
+    """The address backstop drops a later key that shares a ``data_ptr`` with an earlier one (first-wins)."""
+    storage = torch.arange(4)
+    sd = {"short": storage[:2], "long": storage}  # both start at offset 0 -> same data_ptr
+    assert sd["short"].data_ptr() == sd["long"].data_ptr()
+
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None)
+
+    assert len(out) == 1 and "short" in out  # first-seen kept, later collision dropped
+
+
+def test_postprocess_backstop_keeps_keys_with_distinct_dataptrs():
+    """Two slices at different offsets have distinct ``data_ptr``s, so the backstop leaves both."""
+    base = torch.arange(4)
+    sd = {"first": base[:2], "second": base[2:]}  # offsets 0 and 2 -> different data_ptr
+    assert sd["first"].data_ptr() != sd["second"].data_ptr()
+
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None)
+
+    assert set(out) == {"first", "second"}  # neither dropped
+    assert torch.equal(out["first"], torch.tensor([0, 1]))
+    assert torch.equal(out["second"], torch.tensor([2, 3]))
+
+
+def test_postprocess_dense_tie_drops_pre_quant_scale_companion():
+    """An AWQ-style dense tie drops ``pre_quant_scale`` with the weight (no orphaned companion)."""
+    enc, dec = make_tied_linear_pair()
+    parent = wrap_in_parent_with_tied_keys(enc, dec, decoder_canonical=True)
+    tied_map = TiedWeightMap(parent)
+    w, pqs = torch.randn(4, 4), torch.randn(4)  # tied sides export identical bytes
+    sd = {
+        "encoder.weight": w.clone(),
+        "encoder.pre_quant_scale": pqs.clone(),
+        "decoder.weight": w.clone(),
+        "decoder.pre_quant_scale": pqs.clone(),
+    }
+
+    out = postprocess_state_dict(sd, maxbound=448, quantization=None, tied_map=tied_map)
+
+    assert "encoder.weight" not in out and "encoder.pre_quant_scale" not in out  # both dropped
+    assert "decoder.weight" in out and "decoder.pre_quant_scale" in out  # canonical kept
+
+
+def test_postprocess_raises_when_tied_sides_export_different_values():
+    """A declared tie whose two sides export different bytes must raise, not silently corrupt."""
+
+    class _TwoLinear(torch.nn.Module):
+        all_tied_weights_keys = {"A.weight": "B.weight"}
+
+    tied_map = TiedWeightMap(_TwoLinear())
+    sd = {"A.weight": torch.zeros(4, 4), "B.weight": torch.ones(4, 4)}  # declared tie, but differ
+    with pytest.raises(RuntimeError, match="differs from its canonical"):
+        postprocess_state_dict(sd, maxbound=448, quantization=None, tied_map=tied_map)
+
+
+def test_postprocess_state_dict_preserves_zero_pointer_tensors():
+    state_dict = {
+        "first": torch.empty(4, device="meta"),
+        "second": torch.empty(4, device="meta"),
+    }
+
+    processed = postprocess_state_dict(state_dict, maxbound=448, quantization=None)
+
+    assert set(processed) == set(state_dict)
+
+
+def _linear_with_input_quantizer():
+    linear = torch.nn.Linear(4, 4, bias=False)
+    linear.input_quantizer = TensorQuantizer()
+    return linear
+
+
+class _LinearAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        for name in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"):
+            setattr(self, name, torch.nn.Linear(32, 32))
+
+    def forward(self, inputs):
+        return sum(module(inputs) for module in self.children())
+
+
+@pytest.mark.parametrize("mismatch_within_pair", [None, "qkvz", "ba", "ba_reverse"])
+def test_export_preserves_linear_attention_runtime_groups(mismatch_within_pair):
+    model = torch.nn.Sequential()
+    model.add_module("decoder", torch.nn.Module())
+    model.decoder.add_module("linear_attn", _LinearAttention())
+    inputs = torch.randn(1, 8, 32)
+    for name, module in list(model.decoder.linear_attn.named_children()):
+        fp8 = name in {"in_proj_a", "in_proj_b"} or (
+            mismatch_within_pair == "qkvz" and name == "in_proj_z"
+        )
+        if mismatch_within_pair == "ba":
+            fp8 = name == "in_proj_a"
+        elif mismatch_within_pair == "ba_reverse":
+            fp8 = name == "in_proj_b"
+        mtq.quantize(
+            module, mtq.FP8_DEFAULT_CFG if fp8 else mtq.INT8_DEFAULT_CFG, lambda m: m(inputs)
+        )
+    groups, norms = collect_shared_input_modules(model, lambda: model.decoder.linear_attn(inputs))
+    assert any(len(modules) == 4 for modules in groups.values())
+    if mismatch_within_pair:
+        with pytest.raises(AssertionError, match="different quantization formats"):
+            _fuse_shared_input_modules(model, groups, norms)
+    else:
+        fused = _fuse_shared_input_modules(model, groups, norms)
+        assert {frozenset(names) for names in fused.values()} == {
+            frozenset({"decoder.linear_attn.in_proj_qkv", "decoder.linear_attn.in_proj_z"}),
+        }
+
+
+@pytest.mark.parametrize("partitioned", [True, False])
+def test_shared_layernorm_awq_fusion_respects_runtime_groups(partitioned):
+    model = torch.nn.Sequential()
+    model.add_module("decoder", torch.nn.Sequential())
+    norm = torch.nn.LayerNorm(32)
+    model.decoder.add_module("norm", norm)
+    projections = _LinearAttention()
+    model.decoder.add_module("linear_attn" if partitioned else "attention", projections)
+    with torch.no_grad():
+        norm.weight.copy_(torch.linspace(0.7, 1.3, 32))
+        norm.bias.copy_(torch.linspace(-0.2, 0.2, 32))
+    inputs = torch.randn(1, 8, 32)
+    config = deepcopy(mtq.INT4_AWQ_CFG)
+    config["algorithm"] = "max"
+    for entry in config["quant_cfg"]:
+        if entry.get("quantizer_name") == "*weight_quantizer":
+            entry["cfg"]["block_sizes"][-1] = 16
+    config["quant_cfg"].append({"quantizer_name": "*in_proj_[ab].weight_quantizer", "enable": True})
+    mtq.quantize(model, config, lambda m: m(inputs))
+    scale = torch.linspace(1.0, 2.0, 32)
+    # Fixed AWQ smoothing scales isolate export fusion from the calibration search.
+    for name, module in projections.named_children():
+        module.input_quantizer.pre_quant_scale = scale * (
+            2 if partitioned and name in {"in_proj_a", "in_proj_b"} else 1
+        )
+    weight, bias = norm.weight.detach().clone(), norm.bias.detach().clone()
+    groups, norms = collect_shared_input_modules(
+        model, lambda: model(inputs), collect_layernorms=True
+    )
+
+    fused = _fuse_shared_input_modules(model, groups, norms, fuse_layernorms=True)
+
+    assert sorted(len(group) for group in fused.values()) == ([2, 2] if partitioned else [4])
+    torch.testing.assert_close(norm.weight, weight if partitioned else weight * scale)
+    torch.testing.assert_close(norm.bias, bias if partitioned else bias * scale)
+    for module in projections.children():
+        assert hasattr(module.input_quantizer, "_pre_quant_scale") == partitioned
+        assert getattr(module, "fused_with_prequant", False) == (not partitioned)
+
+
+def test_fuse_prequant_layernorm_skips_modules_without_pre_quant_scale():
+    layernorm = torch.nn.LayerNorm(4)
+    original_weight = layernorm.weight.detach().clone()
+    modules = [_linear_with_input_quantizer(), _linear_with_input_quantizer()]
+
+    fuse_prequant_layernorm(layernorm, modules)
+
+    assert torch.allclose(layernorm.weight, original_weight)
+    assert not hasattr(modules[0], "fused_with_prequant")
+    assert not hasattr(modules[1], "fused_with_prequant")
+
+
+def test_fuse_prequant_layernorm_fuses_and_removes_pre_quant_scale():
+    layernorm = torch.nn.LayerNorm(4)
+    modules = [_linear_with_input_quantizer(), _linear_with_input_quantizer()]
+    pre_quant_scale = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    for module in modules:
+        module.input_quantizer._pre_quant_scale = pre_quant_scale
+
+    fuse_prequant_layernorm(layernorm, modules)
+
+    assert torch.allclose(layernorm.weight, pre_quant_scale)
+    assert torch.allclose(layernorm.bias, torch.zeros_like(pre_quant_scale))
+    for module in modules:
+        assert not hasattr(module.input_quantizer, "_pre_quant_scale")
+        assert module.fused_with_prequant
+
+
+# --- carrying over weights the loader could not place --------------------------------------------
+
+
+# ``read_unplaced_weights`` imports model_load_utils inside its try block, before it
+# looks at the recorded keys, and model_load_utils imports accelerate at module scope. With
+# accelerate absent every call raises ImportError, gets caught, warns and returns {} -- so these
+# tests would still "pass" while exercising none of the logic they name.
+requires_accelerate = pytest.mark.skipif(
+    importlib.util.find_spec("accelerate") is None,
+    reason="carry-over goes through model_load_utils, which requires accelerate",
+)
+
+
+class _ProvenanceModel(torch.nn.Module):
+    """A model carrying only what the carry-over reads: recorded keys and a source path."""
+
+    def __init__(self, keys=None, ckpt=None, name_or_path=None):
+        super().__init__()
+        self.lin = torch.nn.Linear(2, 2)
+        # Sentinel already-placed weights this file's checkpoints use to stand in for "the
+        # model loaded this one fine": real parameters, so the derivation an unrecorded model
+        # gets at export does not flag them as unplaced (it only knows a checkpoint key by
+        # whether the model has a matching parameter, not by which test wrote it).
+        self.a = torch.nn.Linear(1, 1)
+        self.other = torch.nn.Linear(1, 1)
+        if keys is not None:
+            self._modelopt_unplaced_source_keys = keys
+        if ckpt is not None:
+            self._modelopt_source_checkpoint = str(ckpt)
+        if name_or_path is not None:
+            self.config = SimpleNamespace(_name_or_path=str(name_or_path))
+
+
+@requires_accelerate
+def test_carry_over_returns_nothing_when_the_loader_placed_everything(tmp_path):
+    """A recorded empty list means the question was asked and answered -- do not re-derive.
+
+    Deriving again would find the stray tensor, which the model has no parameter for, and carry it.
+    """
+    save_file({"stray.weight": torch.zeros(2)}, str(tmp_path / "model.safetensors"))
+    model = _ProvenanceModel(keys=[], ckpt=tmp_path)
+    assert read_unplaced_weights(model) == {}
+
+
+@requires_accelerate
+def test_carry_over_returns_nothing_without_provenance():
+    assert read_unplaced_weights(_ProvenanceModel()) == {}
+
+
+@requires_accelerate
+def test_carry_over_returns_nothing_for_a_hub_id_rather_than_a_local_path():
+    """``_name_or_path`` is often a hub id; there is nothing on disk to re-read."""
+    assert read_unplaced_weights(_ProvenanceModel(name_or_path="org/Some-Model")) == {}
+
+
+@requires_accelerate
+def test_carry_over_reads_the_recorded_keys_off_disk(tmp_path):
+    save_file(
+        {"kept.weight": torch.arange(4, dtype=torch.float32), "other.weight": torch.zeros(2)},
+        str(tmp_path / "model.safetensors"),
+    )
+    model = _ProvenanceModel(keys=["kept.weight"], ckpt=tmp_path)
+
+    carried = read_unplaced_weights(model)
+
+    assert list(carried) == ["kept.weight"]
+    assert torch.equal(carried["kept.weight"], torch.arange(4, dtype=torch.float32))
+
+
+@requires_accelerate
+def test_carry_over_warns_and_keeps_the_export_alive_when_the_checkpoint_is_unreadable(tmp_path):
+    """Best-effort: the rest of the weights are already correct, so this must not abort the export."""
+    model = _ProvenanceModel(keys=["kept.weight"], ckpt=tmp_path / "does-not-exist")
+    with pytest.warns(UserWarning, match="Could not copy"):
+        assert read_unplaced_weights(model) == {}
+
+
+@requires_accelerate
+def test_carry_over_handler_survives_failing_before_the_keys_are_known(tmp_path, monkeypatch):
+    """The failure can land while ``keys`` is still None, and the handler must not throw itself.
+
+    Nothing was recorded here, so the keys are derived from provenance -- and that derivation is
+    what fails. Counting the keys unconditionally in the warning would raise TypeError from inside
+    the very handler that exists to keep the export standing.
+    """
+    from modelopt.torch.utils.plugins import model_load_utils
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("cannot read the index")
+
+    monkeypatch.setattr(model_load_utils, "unplaced_source_keys", _boom)
+    # A real directory holding safetensors, so the derivation is actually reached: a checkpoint
+    # with no safetensors short-circuits earlier, before anything can fail.
+    (tmp_path / "model.safetensors.index.json").write_text('{"weight_map": {}}')
+    model = _ProvenanceModel(name_or_path=tmp_path)
+
+    # Deliberately not "could not copy N weights": with nothing recorded we do not know that
+    # anything is missing, only that we could not check. What must hold is that the handler does
+    # not throw from inside itself.
+    with pytest.warns(UserWarning, match="Could not derive unplaced source keys"):
+        assert read_unplaced_weights(model) == {}
+
+
+def test_carry_over_is_quiet_for_a_checkpoint_with_no_safetensors(tmp_path, recwarn):
+    """A pytorch_model.bin checkpoint has nothing this path can read, and nothing to carry.
+
+    Warning that weights are "missing from the export" would be alarming and wrong -- there are
+    no unplaced weights, only a format this reader does not handle.
+    """
+    (tmp_path / "pytorch_model.bin").write_bytes(b"not safetensors")
+    model = _ProvenanceModel(name_or_path=tmp_path)
+
+    assert read_unplaced_weights(model) == {}
+    assert [w for w in recwarn if "Could not copy" in str(w.message)] == []
+
+
+def test_carry_over_is_quiet_without_the_loader_dependencies(tmp_path, monkeypatch, recwarn):
+    """The quiet path must not depend on the loader's optional imports.
+
+    model_load_utils imports transformers and accelerate at module scope, and the partial-install
+    environments have neither. If the short-circuit sat below that import, the ImportError would
+    land in the handler and emit the very "will be missing them" warning it exists to avoid.
+
+    Blocking safetensors here would prove nothing: this module binds ``safe_open`` at import time,
+    so patching sys.modules afterwards cannot affect it.
+    """
+    import sys as _sys
+
+    monkeypatch.setitem(_sys.modules, "modelopt.torch.utils.plugins.model_load_utils", None)
+    monkeypatch.setitem(_sys.modules, "transformers", None)
+    monkeypatch.setitem(_sys.modules, "accelerate", None)
+    (tmp_path / "pytorch_model.bin").write_bytes(b"not safetensors")
+    model = _ProvenanceModel(name_or_path=tmp_path)
+
+    assert read_unplaced_weights(model) == {}
+    assert [w for w in recwarn if "Could not copy" in str(w.message)] == []
+
+
+def test_carryable_unplaced_keys_skips_keys_no_shard_backs(tmp_path):
+    """Unplaced != carryable. A stale buffer listed by the model is not a weight to lose.
+
+    ``--vllm_fakequant_export`` refuses to run when real weights would be dropped, so this
+    distinction decides whether working exports keep working.
+    """
+    from modelopt.torch.export.unified_export_hf import carryable_unplaced_keys
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"model.mtp.eh_proj.weight": "mtp-0001.safetensors"}}'
+    )
+    model = _ProvenanceModel(name_or_path=tmp_path)
+    model._modelopt_source_checkpoint = str(tmp_path)
+    model._modelopt_unplaced_source_keys = [
+        "model.mtp.eh_proj.weight",  # a shard has it -- losing it matters
+        "model.layers.0.self_attn.rotary_emb.inv_freq",  # nothing backs it
+    ]
+    assert carryable_unplaced_keys(model) == ["model.mtp.eh_proj.weight"]
+
+
+def test_carryable_unplaced_keys_is_quiet_when_nothing_was_recorded():
+    """No provenance, no answer -- and no exception from a diagnostic helper."""
+    from modelopt.torch.export.unified_export_hf import carryable_unplaced_keys
+
+    assert carryable_unplaced_keys(torch.nn.Module()) == []
+
+
+def test_carryable_unplaced_keys_works_without_the_loader_dependencies(tmp_path, monkeypatch):
+    """The shard-backed question must be answerable where transformers/accelerate are absent.
+
+    model_load_utils imports them at module scope, so routing through it would make this return
+    "nothing to carry" in the partial-install environments -- and the --vllm_fakequant_export
+    guard would then stay silent on a checkpoint whose weights it really would drop.
+    """
+    import sys as _sys
+
+    from modelopt.torch.export.unified_export_hf import carryable_unplaced_keys
+
+    for mod in ("transformers", "accelerate", "huggingface_hub", "safetensors"):
+        monkeypatch.setitem(_sys.modules, mod, None)
+    monkeypatch.setitem(_sys.modules, "modelopt.torch.utils.plugins.model_load_utils", None)
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"model.mtp.eh_proj.weight": "mtp-0001.safetensors"}}'
+    )
+    model = _ProvenanceModel(name_or_path=tmp_path)
+    model._modelopt_source_checkpoint = str(tmp_path)
+    model._modelopt_unplaced_source_keys = [
+        "model.mtp.eh_proj.weight",
+        "model.layers.0.self_attn.rotary_emb.inv_freq",
+    ]
+    assert carryable_unplaced_keys(model) == ["model.mtp.eh_proj.weight"]
+
+
+def test_layerwise_finalize_sees_the_carried_keys(tmp_path, monkeypatch):
+    """The layerwise fix depends on an ordering: record the carried set, THEN call finalize().
+
+    LayerwiseExporter.bind() snapshots its quant config during calibration, so finalize() is the
+    only point where it can learn what the export carried. If export_hf_checkpoint ever records
+    _modelopt_carried_over_names after dispatching to the exporter -- or stops recording it on
+    that path -- the sidecar exclusions silently go missing again, with nothing else to catch it.
+    """
+    from modelopt.torch.export import unified_export_hf as uehf
+    from modelopt.torch.export.layerwise_export import LAYERWISE_EXPORTER_ATTR
+
+    seen = {}
+
+    class _Exporter:
+        export_dir = tmp_path
+
+        def finalize(self, extra_state_dict=None):
+            seen["keys"] = getattr(model, "_modelopt_carried_over_names", "<unset>")
+            return {}
+
+    model = torch.nn.Module()
+    setattr(model, LAYERWISE_EXPORTER_ATTR, _Exporter())
+    # Accepts **kwargs because the call site passes keys_only: non-writing ranks resolve
+    # names without reading tensors, and a stub that ignores that would hide a signature drift.
+    monkeypatch.setattr(uehf, "read_unplaced_weights", lambda m, **kw: {})
+    monkeypatch.setattr(uehf, "off_index_tensor_names", lambda m: ["model.mtp.eh_proj.weight"])
+
+    uehf.export_hf_checkpoint(model, export_dir=tmp_path)
+
+    assert seen["keys"] == ["model.mtp.eh_proj.weight"], (
+        f"finalize() saw {seen['keys']!r}; the carried set must be recorded before dispatch"
+    )
+
+
+def test_export_writes_the_off_index_safetensors(tmp_path, monkeypatch):
+    """Off-index safetensors (GLM-4.7's mtp.safetensors) are weights, so the export writes them.
+
+    Their tensors are already seeded into exclude_modules by off_index_tensor_names; if the files
+    themselves did not reach the export, the checkpoint would name exclusions for weights it lacks.
+    On the layerwise path they must land where finalize() wrote -- the exporter's own directory,
+    which a recipe's layerwise.export_dir can set apart from the export_dir argument.
+    """
+    from modelopt.torch.export import unified_export_hf as uehf
+    from modelopt.torch.export.layerwise_export import LAYERWISE_EXPORTER_ATTR
+
+    ckpt, export = tmp_path / "ckpt", tmp_path / "export"
+    ckpt.mkdir()
+    export.mkdir()  # LayerwiseExporter creates it when it binds, before calibration
+    save_file({"a.weight": torch.zeros(2)}, str(ckpt / "model-00001-of-00001.safetensors"))
+    (ckpt / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"a.weight": "model-00001-of-00001.safetensors"}}'
+    )
+    save_file({"model.mtp.eh_proj.weight": torch.ones(2)}, str(ckpt / "mtp.safetensors"))
+
+    class _Exporter:
+        export_dir = export
+
+        def finalize(self, extra_state_dict=None):
+            return {}
+
+    model = _ProvenanceModel(name_or_path=ckpt)
+    model._modelopt_source_checkpoint = str(ckpt)
+    setattr(model, LAYERWISE_EXPORTER_ATTR, _Exporter())
+    monkeypatch.setattr(uehf, "read_unplaced_weights", lambda m, **kw: {})
+
+    uehf.export_hf_checkpoint(model, export_dir=tmp_path / "elsewhere")
+
+    assert sorted(p.name for p in export.iterdir()) == ["mtp.safetensors"]
+    assert model._modelopt_carried_over_names == ["model.mtp.eh_proj.weight"]
+
+
+def test_exporters_copy_non_model_files_from_a_local_source(tmp_path):
+    from modelopt.torch.export import unified_export_hf as uehf
+
+    ckpt, export = tmp_path / "ckpt", tmp_path / "export"
+    ckpt.mkdir()
+    export.mkdir()
+    (ckpt / "tokenizer.json").write_text("{}")
+    (ckpt / "model.safetensors").write_text("weights")
+
+    uehf._copy_non_model_files_from_source(_ProvenanceModel(name_or_path=ckpt), export)
+
+    assert sorted(p.name for p in export.iterdir()) == ["tokenizer.json"]
+
+
+def test_export_hf_checkpoint_copies_the_source_non_model_files(tmp_path):
+    """The regular (non-streaming, non-layerwise) path copies them after save_pretrained."""
+    from _test_utils.torch.transformers_models import create_tiny_llama_dir
+    from transformers import AutoModelForCausalLM
+
+    from modelopt.torch.export import export_hf_checkpoint
+
+    source = create_tiny_llama_dir(tmp_path)
+    (source / "README.md").write_text("# source\n")
+    (source / "assets").mkdir()
+    (source / "assets" / "notes.txt").write_text("asset\n")
+    model = AutoModelForCausalLM.from_pretrained(source)
+    export = tmp_path / "export"
+
+    export_hf_checkpoint(model, export_dir=export)
+
+    assert (export / "README.md").read_text() == "# source\n"
+    assert (export / "assets" / "notes.txt").read_text() == "asset\n"
+    # The export's own config, not the source's.
+    assert (export / "config.json").read_text() != (source / "config.json").read_text()
+
+
+def test_exporters_warn_rather_than_fetch_for_a_hub_source(tmp_path, monkeypatch):
+    """A model loaded by Hub ID has only what loading needed in its cache: warn, do not download."""
+    from modelopt.torch.export import unified_export_hf as uehf
+    from modelopt.torch.utils.plugins import hf_checkpoint_utils
+
+    def fail(*args, **kwargs):
+        raise AssertionError("an exporter must not download")
+
+    monkeypatch.setattr(hf_checkpoint_utils, "snapshot_download", fail)
+
+    with pytest.warns(UserWarning, match="ensure_local_checkpoint"):
+        uehf._copy_non_model_files_from_source(_ProvenanceModel(name_or_path="org/model"), tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_carries_a_key_the_index_does_not_list(tmp_path):
+    """A tensor inside a main shard but absent from weight_map must still be carried.
+
+    model.safetensors.index.json is not a complete inventory. The loader sees the contents of each
+    shard it opens, so such a tensor is recorded in _modelopt_unplaced_source_keys like any other
+    -- but resolving the file purely through weight_map finds
+    nothing and used to drop it silently, with the --vllm_fakequant_export guard staying quiet
+    too because it shared that lookup. An MTP head stored in a main shard is exactly this shape:
+    when MTP is not quantized the loader never places it, so it is the case the carry-over exists
+    for.
+    """
+    from safetensors.torch import save_file
+
+    from modelopt.torch.export.unified_export_hf import (
+        carryable_unplaced_keys,
+        read_unplaced_weights,
+    )
+
+    shard, extra = "model-00001-of-00001.safetensors", "model.mtp.eh_proj.weight"
+    save_file({"a.weight": torch.zeros(2), extra: torch.full((2,), 7.0)}, str(tmp_path / shard))
+    # The index deliberately omits `extra`.
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"a.weight": "model-00001-of-00001.safetensors"}}'
+    )
+
+    model = _ProvenanceModel(name_or_path=tmp_path)
+    model._modelopt_source_checkpoint = str(tmp_path)
+    model._modelopt_unplaced_source_keys = [extra]
+
+    carried = read_unplaced_weights(model)
+    assert extra in carried, f"un-indexed key dropped from the export: {sorted(carried)}"
+    assert torch.equal(carried[extra], torch.full((2,), 7.0))
+
+    # The guard must see it too, or it stays silent on the very weights that would be lost.
+    assert carryable_unplaced_keys(model) == [extra]
+
+
+def test_warns_when_a_recorded_key_is_in_no_shard(tmp_path):
+    """A key in neither the index nor any file is reported, not silently ignored."""
+    from safetensors.torch import save_file
+
+    from modelopt.torch.export.unified_export_hf import read_unplaced_weights
+
+    shard = "model-00001-of-00001.safetensors"
+    save_file({"a.weight": torch.zeros(2)}, str(tmp_path / shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"a.weight": "model-00001-of-00001.safetensors"}}'
+    )
+    model = _ProvenanceModel(name_or_path=tmp_path)
+    model._modelopt_source_checkpoint = str(tmp_path)
+    model._modelopt_unplaced_source_keys = ["ghost.weight"]
+
+    with pytest.warns(UserWarning, match="in no safetensors file"):
+        assert read_unplaced_weights(model) == {}
+
+
+def test_carry_over_works_without_the_loader_dependencies(tmp_path, monkeypatch):
+    """Recorded keys must carry where transformers/accelerate are absent.
+
+    Only deriving the keys of an unrecorded model needs model_load_utils. Importing it
+    unconditionally made the recorded-keys path -- which needs nothing from it -- fail in the
+    partial-install environments,
+    where the handler reported "could not copy" and dropped every carried weight. The sibling test
+    pins this for carryable_unplaced_keys; this pins the carry itself, which is what actually writes.
+    """
+    import sys as _sys
+
+    from safetensors.torch import save_file
+
+    from modelopt.torch.export.unified_export_hf import read_unplaced_weights
+
+    for mod in ("transformers", "accelerate", "huggingface_hub"):
+        monkeypatch.setitem(_sys.modules, mod, None)
+    monkeypatch.setitem(_sys.modules, "modelopt.torch.utils.plugins.model_load_utils", None)
+
+    shard = "model-00001-of-00001.safetensors"
+    save_file({"model.mtp.eh_proj.weight": torch.full((2,), 3.0)}, str(tmp_path / shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"model.mtp.eh_proj.weight": "model-00001-of-00001.safetensors"}}'
+    )
+
+    model = _ProvenanceModel(name_or_path=tmp_path)
+    model._modelopt_source_checkpoint = str(tmp_path)
+    model._modelopt_unplaced_source_keys = ["model.mtp.eh_proj.weight"]
+
+    carried = read_unplaced_weights(model)
+    assert "model.mtp.eh_proj.weight" in carried, "recorded keys must not need the loader imports"
+
+
+def test_an_unrecorded_model_derives_its_unplaced_keys_once(tmp_path, monkeypatch):
+    """A model loaded without ModelOpt's loaders has no record: the export derives it, once.
+
+    Its MTP head must not drop out of the export silently, but nothing should work the list out
+    twice either: the derivation is recorded, and every later reader reads the record.
+    """
+    pytest.importorskip("transformers")
+    from modelopt.torch.export.unified_export_hf import read_unplaced_weights
+    from modelopt.torch.utils.plugins import model_load_utils
+
+    shard, mtp = "model-00001-of-00001.safetensors", "mtp.fc.weight"
+    save_file({"a.weight": torch.zeros(2), mtp: torch.full((2,), 5.0)}, str(tmp_path / shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a.weight": shard, mtp: shard}})
+    )
+    derived_from = []
+    monkeypatch.setattr(
+        model_load_utils,
+        "unplaced_source_keys",
+        lambda m, c, tensor_files=None: derived_from.append(c) or [mtp],
+    )
+    model = _ProvenanceModel(name_or_path=tmp_path)
+
+    for _ in range(2):
+        carried = read_unplaced_weights(model)
+        assert torch.equal(carried[mtp], torch.full((2,), 5.0))
+    assert derived_from == [str(tmp_path)], "derived once, then read back"
+    assert model._modelopt_unplaced_source_keys == [mtp]
+
+
+def test_source_checkpoint_is_none_for_a_model_built_from_config(tmp_path, monkeypatch):
+    """``from_config`` leaves ``_name_or_path`` empty; it must not resolve to the working directory,
+    or every export would copy the cwd as the "source checkpoint"."""
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "tokenizer.json").write_text("{}")
+    monkeypatch.chdir(workdir)
+    model = SimpleNamespace(config=SimpleNamespace(_name_or_path=""))
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+
+    _copy_non_model_files_from_source(model, export_dir)
+
+    assert _source_checkpoint(model) is None
+    assert not any(export_dir.iterdir())
+
+
+@pytest.mark.parametrize("source_plan", [None, {"layers.*.feed_forward.experts": "grouped_gemm"}])
+def test_distributed_export_writes_the_config_a_single_gpu_export_writes(tmp_path, source_plan):
+    """The EP load's DistributedConfig and torch_a2a plan stay out of config.json, the source's own
+    plan survives, and the live configs keep the run's values afterwards."""
+    pytest.importorskip("transformers")
+    # Local import: optional dependency, guarded by the importorskip above.
+    from transformers import AutoConfig, Llama4Config
+    from transformers.distributed import DistributedConfig
+
+    source = tmp_path / "source"
+    Llama4Config().save_pretrained(source)
+    if source_plan is not None:
+        config_json = json.loads((source / "config.json").read_text())
+        config_json["text_config"]["base_model_ep_plan"] = source_plan
+        (source / "config.json").write_text(json.dumps(config_json))
+    AutoConfig.from_pretrained(source).save_pretrained(tmp_path / "single_gpu")
+
+    # What the EP load leaves behind: the stamped DistributedConfig and the swapped plan.
+    config = AutoConfig.from_pretrained(source)
+    distributed_config = DistributedConfig(enable_expert_parallel=True)
+    swapped_plan = {"layers.*.feed_forward.experts": "torch_a2a_experts"}
+    config.distributed_config = distributed_config
+    config.text_config.base_model_ep_plan = swapped_plan
+    model = SimpleNamespace(config=config, _modelopt_source_checkpoint=str(source))
+
+    _write_base_config(model, tmp_path / "export")
+
+    written = json.loads((tmp_path / "export" / "config.json").read_text())
+    assert written == json.loads((tmp_path / "single_gpu" / "config.json").read_text())
+    assert written["text_config"].get("base_model_ep_plan") == source_plan
+    assert config.distributed_config is distributed_config
+    assert config.text_config.base_model_ep_plan is swapped_plan
+
+
+def _one_rank_fails_after_the_write_job(rank, size, tmp_dir, failure):
+    model = torch.nn.Linear(2, 2)
+    set_distribution_plan(model, DistributionPlan(size, ep_size=size))
+    raised = None
+    with (
+        bounded_collectives(),
+        mock.patch.object(unified_export_hf, "_process_hf_model_for_export", return_value={}),
+        mock.patch.object(distributed_writer, "distributed_save_hf_checkpoint") as write,
+        # Rank 0 alone writes config.json, once every rank has written its shards.
+        mock.patch.object(unified_export_hf, "_write_base_config", side_effect=failure),
+    ):
+        # Not pytest.raises: when nothing is raised it fails with a BaseException, which would take
+        # the shared worker down instead of failing this test alone.
+        try:
+            unified_export_hf.export_hf_checkpoint(model, export_dir=tmp_dir)
+        except (OSError, RuntimeError, SystemExit) as e:
+            raised = e
+    assert write.called
+    if isinstance(failure, SystemExit):  # an exit exits every rank, with its code
+        assert isinstance(raised, SystemExit) and raised.code == failure.code, raised
+    else:
+        assert raised is not None and "disk full" in str(raised), raised
+
+
+@pytest.mark.parametrize("failure", [OSError("disk full"), SystemExit(3)], ids=["error", "exit"])
+def test_every_rank_fails_an_export_that_one_rank_failed_after_the_write(
+    cpu_dist_workers, tmp_path, failure
+):
+    """The ranks that wrote their shards must not return as if the checkpoint were whole while rank 0
+    failed to finish it: a barrier alone would let them, and so would an exit, which is no Exception."""
+    cpu_dist_workers.run(_one_rank_fails_after_the_write_job, tmp_dir=tmp_path, failure=failure)
+
+
+def _rank_0_cannot_read_the_carried_weights_job(rank, size, tmp_dir):
+    model = torch.nn.Linear(2, 2)
+    set_distribution_plan(model, DistributionPlan(size, ep_size=size))
+    read = unified_export_hf.read_unplaced_weights
+
+    def unreadable_on_rank_0(*args, **kwargs):
+        if rank == 0:
+            raise OSError("a carried shard of the source is unreadable")
+        return read(*args, **kwargs)
+
+    raised = None
+    with (
+        bounded_collectives(),
+        mock.patch.object(unified_export_hf, "read_unplaced_weights", unreadable_on_rank_0),
+        mock.patch.object(unified_export_hf, "_process_hf_model_for_export", return_value={}),
+        mock.patch.object(distributed_writer, "distributed_save_hf_checkpoint") as write,
+    ):
+        # Not pytest.raises: when nothing is raised it fails with a BaseException, which would take
+        # the shared worker down instead of failing this test alone.
+        try:
+            unified_export_hf.export_hf_checkpoint(model, export_dir=tmp_dir)
+        except (OSError, RuntimeError) as e:
+            raised = e
+    # Rank 0 raises its own error, and rank 1 one that names it, before either writes.
+    assert raised is not None and "a carried shard of the source is unreadable" in str(raised), (
+        raised
+    )
+    write.assert_not_called()
+
+
+def test_every_rank_fails_an_export_whose_carried_weights_rank_0_cannot_read(
+    cpu_dist_workers, tmp_path
+):
+    """Rank 0 alone reads the carried tensors off the source, so its failure there must fail every
+    rank, not leave the others waiting in the export's first collective."""
+    cpu_dist_workers.run(_rank_0_cannot_read_the_carried_weights_job, tmp_dir=tmp_path)
+
+
+def _one_rank_fails_processing_job(rank, size, tmp_dir):
+    model = torch.nn.Linear(2, 2)
+    set_distribution_plan(model, DistributionPlan(size, ep_size=size))
+    failure = NotImplementedError("rank 1's experts mix quantized and unquantized ones")
+
+    def process(*args):
+        if rank == 1:
+            raise failure
+        return {}
+
+    raised = None
+    with (
+        bounded_collectives(),
+        mock.patch.object(unified_export_hf, "_process_hf_model_for_export", process),
+        mock.patch.object(distributed_writer, "distributed_save_hf_checkpoint") as write,
+    ):
+        # Not pytest.raises: when nothing is raised it fails with a BaseException, which would take
+        # the shared worker down instead of failing this test alone.
+        try:
+            unified_export_hf.export_hf_checkpoint(model, export_dir=tmp_dir)
+        except (NotImplementedError, RuntimeError) as e:
+            raised = e
+    # Rank 1 raises its own error, and rank 0 one that names rank 1, before either writes.
+    if rank == 1:
+        assert raised is failure, raised
+    else:
+        assert isinstance(raised, RuntimeError) and "rank 1" in str(raised), raised
+    write.assert_not_called()
+
+
+def test_every_rank_stops_before_the_write_when_one_ranks_processing_failed(
+    cpu_dist_workers, tmp_path
+):
+    """Each rank folds only its own shard, so its processing can fail alone; the others must not
+    go on into the writer's collectives without it."""
+    cpu_dist_workers.run(_one_rank_fails_processing_job, tmp_dir=tmp_path)
+
+
+def _only_rank_0_writes_the_configs_job(rank, size, tmp_dir):
+    model = torch.nn.Linear(2, 2)
+    set_distribution_plan(model, DistributionPlan(size, ep_size=size))
+    with (
+        bounded_collectives(),
+        mock.patch.object(unified_export_hf, "_process_hf_model_for_export", return_value={}),
+        mock.patch.object(distributed_writer, "distributed_save_hf_checkpoint", return_value=True),
+        mock.patch.object(unified_export_hf, "_write_base_config") as base_config,
+        mock.patch.object(unified_export_hf, "_write_hf_export_config") as quant_config,
+    ):
+        unified_export_hf.export_hf_checkpoint(model, export_dir=tmp_dir)
+    calls = (base_config.call_count, quant_config.call_count)
+    assert calls == ((1, 1) if rank == 0 else (0, 0)), (rank, calls)
+
+
+def test_only_rank_0_writes_the_configs_of_an_expert_parallel_export(cpu_dist_workers, tmp_path):
+    """Each rank of an expert-parallel export takes its own rank, so rank 0 alone writes
+    config.json and hf_quant_config.json. Ranks that all took rank 0 would each rewrite them."""
+    cpu_dist_workers.run(_only_rank_0_writes_the_configs_job, tmp_dir=tmp_path)
+
+
+class _FusedExpertsQuantizers(torch.nn.Module):
+    """What the export reads of a fused-experts container: each projection's weight quantizers."""
+
+    def __init__(self, enabled, down_enabled=None):
+        super().__init__()
+        down_enabled = enabled if down_enabled is None else down_enabled
+        self.gate_up_proj_weight_quantizers = [SimpleNamespace(is_enabled=e) for e in enabled]
+        if down_enabled != "absent":  # a layout may register only the first projection's
+            self.down_proj_weight_quantizers = [SimpleNamespace(is_enabled=e) for e in down_enabled]
+
+
+def _expert_quantization_job(rank, size, tmp_dir, enabled_per_rank, down_enabled_per_rank, refused):
+    model = torch.nn.Module()
+    down_enabled = None if down_enabled_per_rank is None else down_enabled_per_rank[rank]
+    model.experts = _FusedExpertsQuantizers(enabled_per_rank[rank], down_enabled)
+    set_distribution_plan(model, DistributionPlan(size, ep_size=size))
+    raised = None
+    with (
+        mock.patch.object(
+            unified_export_hf, "_process_hf_model_for_export", return_value={}
+        ) as fold,
+        mock.patch.object(distributed_writer, "distributed_save_hf_checkpoint") as write,
+        mock.patch.object(unified_export_hf, "_write_base_config"),
+        mock.patch.object(unified_export_hf, "_write_hf_export_config"),
+        bounded_collectives(),
+    ):
+        # Not pytest.raises: when nothing is raised it fails with a BaseException, which would take
+        # the shared worker down instead of failing this test alone.
+        try:
+            unified_export_hf.export_hf_checkpoint(model, export_dir=tmp_dir)
+        except NotImplementedError as e:
+            raised = str(e)
+    if refused is None:
+        assert raised is None, raised
+    else:
+        assert raised is not None and refused in raised, raised
+    # Refused before any rank folds or writes; agreed states export as usual.
+    assert fold.called == write.called == (refused is None)
+
+
+@pytest.mark.parametrize(
+    ("enabled_per_rank", "down_enabled_per_rank", "refused"),
+    [
+        (((False, False), (True, True)), None, "experts.gate_up_proj"),
+        (((True, False), (False, True)), None, "experts.gate_up_proj"),
+        (((True, True), (True, True)), ((False, False), (True, True)), "experts.down_proj"),
+        (((True, True), (True, True)), ("absent", "absent"), None),
+        (((True, True), (True, True)), None, None),
+        (((False, False), (False, False)), None, None),
+    ],
+    ids=[
+        "ranks-disagree",
+        "every-rank-mixed",
+        "down-proj-disagrees",
+        "no-down-proj-quantizers",
+        "all-quantized",
+        "all-unquantized",
+    ],
+)
+def test_expert_parallel_ranks_agree_on_their_experts_quantization_before_folding(
+    cpu_dist_workers, tmp_path, enabled_per_rank, down_enabled_per_rank, refused
+):
+    """Each rank sees only its own experts' quantizers. Ranks that disagree would fold differently,
+    and only the quantized ones would join the writer's input-scale all-reduce."""
+    cpu_dist_workers.run(
+        _expert_quantization_job,
+        tmp_dir=tmp_path,
+        enabled_per_rank=enabled_per_rank,
+        down_enabled_per_rank=down_enabled_per_rank,
+        refused=refused,
+    )
+
+
+@pytest.mark.parametrize(
+    ("plan", "offloaded", "options", "refusal"),
+    [
+        # Each rank holds only its own experts' ModelOpt state: rank 0's would be incomplete.
+        (
+            DistributionPlan(2, ep_size=2),
+            False,
+            {"save_modelopt_state": True},
+            "expert-parallel export",
+        ),
+        # The offloaded streaming path is not expert-parallel-aware: each rank would write its own
+        # experts over the others'.
+        (DistributionPlan(2, ep_size=2), True, {}, "offloaded streaming path"),
+        # Below the world size, EP leaves FSDP2's dense shards replicated across the expert-parallel
+        # groups, which the no-gather writer cannot write.
+        (
+            DistributionPlan(4, ep_size=2, dense="fsdp"),
+            False,
+            {},
+            r"MODELOPT_EP_DEGREE=4 .* MODELOPT_FSDP_SIZE=1",
+        ),
+    ],
+    ids=["modelopt-state", "offloaded", "replicated-dense-shards"],
+)
+def test_an_expert_parallel_export_it_cannot_write_is_refused_before_folding(
+    tmp_path, monkeypatch, plan, offloaded, options, refusal
+):
+    """Refused before anything is folded or written, leaving the model as it was."""
+    model = torch.nn.Sequential(torch.nn.Linear(16, 16))
+    mtq.quantize(model, mtq.FP8_DEFAULT_CFG, lambda m: m(torch.randn(2, 16)))
+    set_distribution_plan(model, plan)
+    if offloaded:
+        monkeypatch.setattr(unified_export_hf, "has_accelerate_offload", lambda model: True)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+
+    with pytest.raises(NotImplementedError, match=refusal):
+        export_hf_checkpoint(model, export_dir=tmp_path / "export", **options)
+
+    after = model.state_dict()
+    assert after.keys() == before.keys()
+    assert all(torch.equal(after[k], v) for k, v in before.items())
+    assert not (tmp_path / "export").exists()

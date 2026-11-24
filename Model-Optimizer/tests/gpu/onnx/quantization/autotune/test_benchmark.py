@@ -1,0 +1,722 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for autotune benchmark (TrtExecBenchmark, TensorRTPyBenchmark).
+
+Covers:
+- Pure-Python logic: _validate_shape_range, _free_buffers, __init__ import guards.
+- Mocked subprocess: TrtExecBenchmark.run error paths and latency parsing.
+- PyTorch CUDA management: pinned host allocation, stream creation, H2D/D2H copy
+  loops in _run_warmup and _run_timing (mocked TRT context). Requires CUDA.
+- Full integration: TensorRTPyBenchmark and TrtExecBenchmark end-to-end.
+  Requires TensorRT and trtexec respectively.
+"""
+
+import contextlib
+import os
+import shutil
+import subprocess
+import tempfile
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import onnx
+import pytest
+import torch
+from _test_utils.onnx.quantization.autotune.models import _create_simple_conv_onnx_model
+from onnx import TensorProto, helper
+
+import modelopt.onnx.quantization.autotune.benchmark as bm
+from modelopt.onnx.quantization.autotune import TensorRTPyBenchmark, TrtExecBenchmark
+from modelopt.onnx.quantization.autotune.autotuner_base import QDQAutotunerBase
+from modelopt.onnx.quantization.autotune.benchmark import _validate_shape_range
+
+# --- fixtures ---
+
+
+@pytest.fixture
+def simple_conv_model_bytes():
+    """ONNX model bytes: Input -> Conv -> Relu -> Output (from _test_utils), small input."""
+    model = _create_simple_conv_onnx_model(batch_size=1, spatial_size=32)
+    return model.SerializeToString()
+
+
+@pytest.fixture
+def simple_conv_model_path(simple_conv_model_bytes, tmp_path):
+    """Path to ONNX model file (same graph as simple_conv_model_bytes)."""
+    path = tmp_path / "simple_conv.onnx"
+    path.write_bytes(simple_conv_model_bytes)
+    return str(path)
+
+
+@pytest.fixture
+def trtexec_bench(tmp_path):
+    return TrtExecBenchmark(
+        timing_cache_file=str(tmp_path / "cache.bin"),
+        warmup_runs=1,
+        timing_runs=2,
+    )
+
+
+# --- helpers ---
+
+
+def _make_bench(warmup_runs=2, timing_runs=3):
+    """Instantiate TensorRTPyBenchmark without triggering __init__ guards."""
+    bench = bm.TensorRTPyBenchmark.__new__(bm.TensorRTPyBenchmark)
+    bench.warmup_runs = warmup_runs
+    bench.timing_runs = timing_runs
+    bench.logger = MagicMock()
+    return bench
+
+
+def _make_buffers(size=4):
+    """Return (inputs, outputs) using real pinned host + CUDA device tensors."""
+    host_in = torch.ones(size).pin_memory()
+    device_in = torch.zeros(size, device="cuda")
+    host_out = torch.zeros(size).pin_memory()
+    device_out = torch.ones(size, device="cuda") * 2.0
+    inputs = [{"host": host_in, "device": device_in, "name": "x"}]
+    outputs = [{"host": host_out, "device": device_out, "name": "y"}]
+    # The fills above run on the default stream, but the benchmark copies on its own stream.
+    # Wait for them, or a late fill can overwrite the copied data.
+    torch.cuda.synchronize()
+    return inputs, outputs
+
+
+# --- _validate_shape_range ---
+
+
+def test_validate_shape_range_valid():
+    _validate_shape_range([1, 1], [2, 2], [4, 4])
+
+
+def test_validate_shape_range_equal_bounds():
+    _validate_shape_range([2, 3], [2, 3], [2, 3])
+
+
+@pytest.mark.parametrize(
+    ("min_s", "opt_s", "max_s"),
+    [
+        ([1, 1], [2, 2], [4]),
+        ([1], [2, 2], [4, 4]),
+    ],
+)
+def test_validate_shape_range_length_mismatch(min_s, opt_s, max_s):
+    with pytest.raises(ValueError, match="same length"):
+        _validate_shape_range(min_s, opt_s, max_s)
+
+
+@pytest.mark.parametrize(
+    ("min_s", "opt_s", "max_s"),
+    [
+        ([3], [2], [4]),  # min > opt
+        ([1], [5], [4]),  # opt > max
+        ([5], [3], [2]),  # both violated
+    ],
+)
+def test_validate_shape_range_invalid_order(min_s, opt_s, max_s):
+    with pytest.raises(ValueError, match="min <= opt <= max"):
+        _validate_shape_range(min_s, opt_s, max_s)
+
+
+# --- TensorRTPyBenchmark._free_buffers ---
+
+
+def test_free_buffers_clears_list():
+    bufs = [{"host": object(), "device": object(), "name": "x"}]
+    bm.TensorRTPyBenchmark._free_buffers(bufs)
+    assert bufs == []
+
+
+def test_free_buffers_empty_list():
+    bufs = []
+    bm.TensorRTPyBenchmark._free_buffers(bufs)
+    assert bufs == []
+
+
+# --- TensorRTPyBenchmark.__init__ import guards ---
+
+
+def test_tensorrt_py_benchmark_raises_without_trt():
+    with patch.object(bm, "TRT_AVAILABLE", False), pytest.raises(ImportError, match="TensorRT"):
+        bm.TensorRTPyBenchmark()
+
+
+def test_tensorrt_py_benchmark_raises_without_torch_cuda():
+    # TRT guard passes; TORCH_CUDA guard fires before any trt symbol is used.
+    with (
+        patch.object(bm, "TRT_AVAILABLE", True),
+        patch.object(bm, "TORCH_CUDA_AVAILABLE", False),
+        pytest.raises(ImportError, match="PyTorch"),
+    ):
+        bm.TensorRTPyBenchmark()
+
+
+# --- TrtExecBenchmark.run (mocked) ---
+
+
+def test_trtexec_run_returns_inf_on_nonzero_returncode(trtexec_bench, tmp_path):
+    model_path = str(tmp_path / "model.onnx")
+    (tmp_path / "model.onnx").write_bytes(b"")
+
+    mock_result = MagicMock()
+    mock_result.returncode = 1
+    mock_result.stderr = "engine build error"
+    mock_result.stdout = ""
+
+    with patch("subprocess.run", return_value=mock_result):
+        assert trtexec_bench.run(model_path) == float("inf")
+
+
+def test_trtexec_run_returns_inf_when_latency_not_parsed(trtexec_bench, tmp_path):
+    model_path = str(tmp_path / "model.onnx")
+    (tmp_path / "model.onnx").write_bytes(b"")
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = "Build complete. No latency line here."
+    mock_result.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_result):
+        assert trtexec_bench.run(model_path) == float("inf")
+
+
+def test_trtexec_run_returns_parsed_latency(trtexec_bench, tmp_path):
+    model_path = str(tmp_path / "model.onnx")
+    (tmp_path / "model.onnx").write_bytes(b"")
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = "[I] Latency: min = 2.50 ms, max = 4.00 ms, median = 3.14 ms"
+    mock_result.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_result):
+        assert trtexec_bench.run(model_path) == pytest.approx(3.14)
+
+
+def test_trtexec_run_returns_inf_when_binary_not_found(trtexec_bench, tmp_path):
+    model_path = str(tmp_path / "model.onnx")
+    (tmp_path / "model.onnx").write_bytes(b"")
+
+    with patch("subprocess.run", side_effect=FileNotFoundError):
+        assert trtexec_bench.run(model_path) == float("inf")
+
+
+def test_trtexec_run_accepts_bytes_input(trtexec_bench):
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = "[I] Latency: min = 4.00 ms, max = 6.00 ms, median = 5.00 ms"
+    mock_result.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_result):
+        assert trtexec_bench.run(b"fake onnx bytes") == pytest.approx(5.0)
+
+
+def test_run_network_command_rejects_unexpected_executable():
+    with pytest.raises(ValueError):
+        bm._run_network_command(["python", "script.py"])
+
+
+def test_trtexec_remote_config_is_validated_before_version_fallback(tmp_path):
+    with patch.object(bm, "_check_for_trtexec") as check_mock:
+        benchmark = TrtExecBenchmark(
+            timing_cache_file=str(tmp_path / "cache.bin"),
+            trtexec_args=["--remoteAutoTuningConfig", "--safe", "--skipInference"],
+        )
+
+    with patch("subprocess.run") as run_mock:
+        assert benchmark.run(str(tmp_path / "model.onnx")) == float("inf")
+
+    check_mock.assert_not_called()
+    run_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("remote_model_path", [None, "/data/models/custom_engine.trt"])
+def test_trtexec_run_returns_remote_safety_latency(tmp_path, remote_model_path):
+    """Remote safety autotuning benchmarks the built engine on the target."""
+    remote_url = (
+        '"ssh://alice@10.0.0.5:2222?'
+        'remote_exec_path=/opt/trt/bin/timing_server&remote_lib_path=/opt/trt/lib"'
+    )
+    with patch.object(bm, "_check_for_trtexec"):
+        benchmark = TrtExecBenchmark(
+            timing_cache_file=str(tmp_path / "cache.bin"),
+            warmup_runs=2,
+            timing_runs=4,
+            trtexec_args=[
+                f"--remoteAutoTuningConfig={remote_url}",
+                "--safe",
+                "--skipInference",
+            ],
+            remote_model_path=remote_model_path,
+        )
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"")
+    log_file = tmp_path / "benchmark.log"
+
+    local_build = MagicMock(returncode=0, stdout="Engine built", stderr="")
+    upload = MagicMock(returncode=0, stdout="", stderr="")
+    remote_benchmark = MagicMock(
+        returncode=0,
+        stdout=(
+            "[I] GPU Compute Time: min = 3.40 ms, max = 3.44 ms, mean = 3.41 ms, median = 3.42 ms"
+        ),
+        stderr="",
+    )
+    cleanup = MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch(
+        "subprocess.run", side_effect=[local_build, upload, remote_benchmark, cleanup]
+    ) as run_mock:
+        latency = benchmark.run(str(model_path), str(log_file))
+
+    assert latency == pytest.approx(3.42)
+    local_command = run_mock.call_args_list[0].args[0]
+    assert (
+        "--remoteAutoTuningConfig=ssh://alice@10.0.0.5:2222?"
+        "remote_exec_path=/opt/trt/bin/timing_server&remote_lib_path=/opt/trt/lib"
+    ) in local_command
+    assert "GPU Compute Time" in log_file.read_text()
+    upload_command = run_mock.call_args_list[1].args[0]
+    remote_command = run_mock.call_args_list[2].args[0]
+    cleanup_command = run_mock.call_args_list[3].args[0]
+    for command in (upload_command, remote_command, cleanup_command):
+        assert "-oBatchMode=yes" in command
+        assert "-oStrictHostKeyChecking=yes" in command
+    assert upload_command[0] == "scp"
+    assert remote_command[0] == "ssh"
+    assert cleanup_command[0] == "ssh"
+    uploaded_remote_engine_path = upload_command[-1].rsplit(":", 1)[1]
+    if remote_model_path is None:
+        remote_engine_path = uploaded_remote_engine_path
+    else:
+        remote_engine_path = remote_model_path
+        assert uploaded_remote_engine_path == remote_engine_path
+    assert f"--loadEngine={remote_engine_path}" in remote_command[-1]
+    assert cleanup_command[-1] == f"rm -f -- {remote_engine_path}"
+    assert "/opt/trt/bin/trtexec_safe" in remote_command[-1]
+    assert "--useCudaGraph" in remote_command[-1]
+    assert "--warmUp=2" in remote_command[-1]
+    assert "--iterations=4" in remote_command[-1]
+    assert "--avgRuns=4" in remote_command[-1]
+
+
+@pytest.mark.parametrize("config_form", ["inline", "split"])
+def test_trtexec_remote_config_falls_back_when_version_is_unsupported(tmp_path, config_form):
+    """An unsupported TensorRT version preserves the existing local build-only fallback."""
+    remote_url = (
+        "ssh://alice@10.0.0.5:2222?remote_exec_path=/opt/trt/bin&remote_lib_path=/opt/trt/lib"
+    )
+    remote_config_args = (
+        [f"--remoteAutoTuningConfig={remote_url}"]
+        if config_form == "inline"
+        else ["--remoteAutoTuningConfig", remote_url]
+    )
+    with patch.object(bm, "_check_for_trtexec", side_effect=ImportError):
+        benchmark = TrtExecBenchmark(
+            timing_cache_file=str(tmp_path / "cache.bin"),
+            trtexec_args=[
+                *remote_config_args,
+                "--safe",
+                "--skipInference",
+            ],
+        )
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"")
+    local_result = MagicMock(
+        returncode=0,
+        stdout="Engine built",
+        stderr="",
+    )
+    with patch("subprocess.run", return_value=local_result) as run_mock:
+        assert benchmark.run(str(model_path)) == float("inf")
+
+    assert run_mock.call_count == 1
+    local_command = run_mock.call_args.args[0]
+    assert remote_url not in local_command
+    assert not any(
+        arg == "--remoteAutoTuningConfig" or arg.startswith("--remoteAutoTuningConfig=")
+        for arg in local_command
+    )
+    assert "--skipInference" in local_command
+
+
+@pytest.mark.parametrize("failure_kind", ["nonzero", "exception"])
+def test_trtexec_cleanup_failure_preserves_remote_safety_latency(tmp_path, failure_kind):
+    """Cleanup failures do not discard latency from a successful remote benchmark."""
+    remote_url = "ssh://alice@10.0.0.5?remote_exec_path=/opt/trt/bin&remote_lib_path=/opt/trt/lib"
+    with patch.object(bm, "_check_for_trtexec"):
+        benchmark = TrtExecBenchmark(
+            timing_cache_file=str(tmp_path / "cache.bin"),
+            trtexec_args=[
+                f"--remoteAutoTuningConfig={remote_url}",
+                "--safe",
+                "--skipInference",
+            ],
+        )
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"")
+    log_file = tmp_path / "benchmark.log"
+    local_build = MagicMock(returncode=0, stdout="Engine built", stderr="")
+    upload = MagicMock(returncode=0, stdout="", stderr="")
+    remote_benchmark = MagicMock(
+        returncode=0,
+        stdout="[I] GPU Compute Time: min = 3.40 ms, max = 3.44 ms, median = 3.42 ms",
+        stderr="",
+    )
+    if failure_kind == "nonzero":
+        cleanup_failure = MagicMock(returncode=1, stdout="", stderr="cleanup denied")
+        expected_log = "cleanup denied"
+    else:
+        cleanup_failure = OSError("cleanup unavailable")
+        expected_log = "cleanup unavailable"
+
+    with patch(
+        "subprocess.run",
+        side_effect=[local_build, upload, remote_benchmark, cleanup_failure],
+    ) as run_mock:
+        latency = benchmark.run(str(model_path), str(log_file))
+
+    assert latency == pytest.approx(3.42)
+    assert run_mock.call_args_list[-1].args[0][0] == "ssh"
+    assert expected_log in log_file.read_text()
+
+
+@pytest.mark.parametrize("failure_kind", ["nonzero", "timeout"])
+def test_trtexec_remote_failure_returns_inf_and_attempts_cleanup(tmp_path, failure_kind):
+    """A target failure is logged, keeps the sentinel, and attempts engine cleanup."""
+    remote_url = "ssh://alice@10.0.0.5?remote_exec_path=/opt/trt/bin&remote_lib_path=/opt/trt/lib"
+    with patch.object(bm, "_check_for_trtexec"):
+        benchmark = TrtExecBenchmark(
+            timing_cache_file=str(tmp_path / "cache.bin"),
+            trtexec_args=[
+                f"--remoteAutoTuningConfig={remote_url}",
+                "--safe",
+                "--skipInference",
+            ],
+        )
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"")
+    log_file = tmp_path / "benchmark.log"
+    local_build = MagicMock(returncode=0, stdout="Engine built", stderr="")
+    upload = MagicMock(returncode=0, stdout="", stderr="")
+    if failure_kind == "nonzero":
+        remote_failure = MagicMock(returncode=1, stdout="", stderr="target execution failed")
+        expected_log = "target execution failed"
+    else:
+        remote_failure = subprocess.TimeoutExpired(cmd="ssh", timeout=600)
+        expected_log = "timed out"
+    cleanup = MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch(
+        "subprocess.run", side_effect=[local_build, upload, remote_failure, cleanup]
+    ) as run_mock:
+        assert benchmark.run(str(model_path), str(log_file)) == float("inf")
+
+    cleanup_command = run_mock.call_args_list[-1].args[0]
+    assert cleanup_command[0] == "ssh"
+    assert cleanup_command[-1].startswith("rm -f -- .modelopt_trtexec_benchmark_")
+    assert expected_log in log_file.read_text()
+
+
+def test_trtexec_remote_password_authentication_is_rejected(tmp_path):
+    """Remote safety benchmarking relies on SSH keys instead of URL passwords."""
+    remote_url = (
+        "ssh://alice:secret@10.0.0.5?remote_exec_path=/opt/trt/bin&remote_lib_path=/opt/trt/lib"
+    )
+    with patch.object(bm, "_check_for_trtexec"):
+        benchmark = TrtExecBenchmark(
+            timing_cache_file=str(tmp_path / "cache.bin"),
+            trtexec_args=[
+                f"--remoteAutoTuningConfig={remote_url}",
+                "--safe",
+                "--skipInference",
+            ],
+        )
+
+    with patch("subprocess.run") as run_mock:
+        assert benchmark.run(str(tmp_path / "model.onnx")) == float("inf")
+
+    run_mock.assert_not_called()
+
+
+# --- TensorRTPyBenchmark._alloc_pinned_host ---
+
+
+def test_alloc_pinned_host_returns_pinned_tensor_and_numpy_view():
+    size = 16
+    host_tensor, arr = bm.TensorRTPyBenchmark._alloc_pinned_host(size, np.float32)
+
+    assert host_tensor.is_pinned()
+    assert isinstance(arr, np.ndarray)
+    assert arr.shape == (size,)
+    assert arr.dtype == np.float32
+
+    # Tensor and numpy array share the same memory.
+    host_tensor[0] = 42.0
+    assert arr[0] == pytest.approx(42.0)
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.int8, np.int32])
+def test_alloc_pinned_host_dtype(dtype):
+    host_tensor, arr = bm.TensorRTPyBenchmark._alloc_pinned_host(8, dtype)
+    assert host_tensor.is_pinned()
+    assert arr.dtype == dtype
+    assert arr.shape == (8,)
+
+
+# --- torch.cuda.Stream integration points ---
+
+
+def test_cuda_stream_handle_is_integer():
+    """stream.cuda_stream must be an int — this is passed directly to TRT execute_async_v3."""
+    stream = torch.cuda.Stream()
+    assert isinstance(stream.cuda_stream, int)
+
+
+# --- TensorRTPyBenchmark._run_warmup ---
+
+
+def test_run_warmup_calls_execute_async_v3_correct_times():
+    bench = _make_bench(warmup_runs=3)
+    inputs, outputs = _make_buffers()
+    context = MagicMock()
+    stream = torch.cuda.Stream()
+
+    bench._run_warmup(context, inputs, outputs, stream)
+
+    assert context.execute_async_v3.call_count == 3
+
+
+def test_run_warmup_passes_stream_handle_to_trt():
+    bench = _make_bench(warmup_runs=1)
+    inputs, outputs = _make_buffers()
+    context = MagicMock()
+    stream = torch.cuda.Stream()
+
+    bench._run_warmup(context, inputs, outputs, stream)
+
+    context.execute_async_v3.assert_called_once_with(stream.cuda_stream)
+
+
+def test_run_warmup_copies_host_to_device():
+    bench = _make_bench(warmup_runs=1)
+    inputs, outputs = _make_buffers()
+    context = MagicMock()
+    stream = torch.cuda.Stream()
+
+    bench._run_warmup(context, inputs, outputs, stream)
+    torch.cuda.synchronize()
+
+    # host_in was all-ones; device_in should now match.
+    assert torch.allclose(inputs[0]["device"].cpu(), inputs[0]["host"])
+
+
+# --- TensorRTPyBenchmark._run_timing ---
+
+
+def test_run_timing_returns_correct_number_of_latencies():
+    bench = _make_bench(timing_runs=4)
+    inputs, outputs = _make_buffers()
+    context = MagicMock()
+    stream = torch.cuda.Stream()
+
+    latencies = bench._run_timing(context, inputs, outputs, stream)
+
+    assert len(latencies) == 4
+
+
+def test_run_timing_latencies_are_non_negative():
+    bench = _make_bench(timing_runs=3)
+    inputs, outputs = _make_buffers()
+    context = MagicMock()
+    stream = torch.cuda.Stream()
+
+    latencies = bench._run_timing(context, inputs, outputs, stream)
+
+    assert all(lat >= 0.0 for lat in latencies)
+
+
+def test_run_timing_calls_execute_async_v3_correct_times():
+    bench = _make_bench(timing_runs=3)
+    inputs, outputs = _make_buffers()
+    context = MagicMock()
+    stream = torch.cuda.Stream()
+
+    bench._run_timing(context, inputs, outputs, stream)
+
+    assert context.execute_async_v3.call_count == 3
+
+
+def test_run_timing_passes_stream_handle_to_trt():
+    bench = _make_bench(timing_runs=1)
+    inputs, outputs = _make_buffers()
+    context = MagicMock()
+    stream = torch.cuda.Stream()
+
+    bench._run_timing(context, inputs, outputs, stream)
+
+    context.execute_async_v3.assert_called_once_with(stream.cuda_stream)
+
+
+# --- TensorRTPyBenchmark (integration) ---
+
+
+class TestTensorRTPyBenchmark:
+    """End-to-end tests for TensorRTPyBenchmark. Requires TensorRT and CUDA."""
+
+    @pytest.fixture(autouse=True)
+    def _require_tensorrt_and_torch_cuda(self):
+        """Skip benchmark integration tests when TensorRT or CUDA is unavailable."""
+        pytest.importorskip("tensorrt")
+        if not bm.TORCH_CUDA_AVAILABLE:
+            pytest.skip("CUDA not available")
+
+    @pytest.mark.parametrize("quant_type", [TensorProto.INT8, TensorProto.FLOAT8E4M3FN])
+    def test_run_quantized_model(self, quant_type):
+        """Quantized candidates build and run with strongly typed networks."""
+        if quant_type == TensorProto.FLOAT8E4M3FN and torch.cuda.get_device_capability() < (8, 9):
+            pytest.skip("FP8 requires SM89 or newer")
+
+        nodes = []
+        for name in ("input", "weight"):
+            nodes.extend(
+                [
+                    helper.make_node(
+                        "QuantizeLinear", [name, "scale", "zero_point"], [f"{name}_q"]
+                    ),
+                    helper.make_node(
+                        "DequantizeLinear", [f"{name}_q", "scale", "zero_point"], [f"{name}_dq"]
+                    ),
+                ]
+            )
+        nodes.append(helper.make_node("MatMul", ["input_dq", "weight_dq"], ["output"]))
+        graph = helper.make_graph(
+            nodes,
+            "quantized_matmul",
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [16, 16])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [16, 16])],
+            initializer=[
+                helper.make_tensor("weight", TensorProto.FLOAT, [16, 16], [0.1] * 256),
+                helper.make_tensor("scale", TensorProto.FLOAT, [], [0.1]),
+                helper.make_tensor("zero_point", quant_type, [], [0]),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 19)], ir_version=9)
+        onnx.checker.check_model(model)
+
+        benchmark = TensorRTPyBenchmark(warmup_runs=1, timing_runs=2)
+        network = benchmark.builder.create_network(benchmark.network_flags)
+        assert network.get_flag(bm.trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+        latency_ms = benchmark.run(model.SerializeToString())
+        assert np.isfinite(latency_ms) and latency_ms > 0
+
+    def test_run_with_bytes(self, simple_conv_model_bytes):
+        """TensorRTPyBenchmark accepts model bytes and returns finite latency."""
+        benchmark = TensorRTPyBenchmark(warmup_runs=1, timing_runs=2)
+        latency_ms = benchmark.run(simple_conv_model_bytes)
+        assert isinstance(latency_ms, float)
+        assert latency_ms > 0
+        assert latency_ms != float("inf")
+
+    @pytest.mark.parametrize("storage", ["inline", "external_absolute", "external_relative"])
+    def test_run_with_path(self, simple_conv_model_path, tmp_path, monkeypatch, storage):
+        """TensorRTPyBenchmark accepts model path and returns finite latency."""
+        if storage != "inline":
+            output_dir = tmp_path / "exports"
+            output_dir.mkdir()
+            working_dir = tmp_path / "working"
+            working_dir.mkdir()
+            model = onnx.load(simple_conv_model_path)
+            for weight in model.graph.initializer:
+                weight.CopyFrom(
+                    onnx.numpy_helper.from_array(onnx.numpy_helper.to_array(weight), weight.name)
+                )
+            autotuner = QDQAutotunerBase(model)
+            autotuner.initialize()
+            path = output_dir / "baseline.onnx"
+            autotuner.export_onnx(str(path), insert_qdq=False)
+            assert (output_dir / "baseline.onnx_data").is_file()
+            monkeypatch.chdir(working_dir)
+            simple_conv_model_path = (
+                os.path.relpath(path) if storage == "external_relative" else str(path)
+            )
+        benchmark = TensorRTPyBenchmark(warmup_runs=1, timing_runs=2)
+        latency_ms = benchmark.run(simple_conv_model_path)
+        assert isinstance(latency_ms, float)
+        assert latency_ms > 0
+        assert latency_ms != float("inf")
+
+    def test_callable(self, simple_conv_model_bytes):
+        """Benchmark is callable and returns same as run()."""
+        benchmark = TensorRTPyBenchmark(warmup_runs=1, timing_runs=2)
+        latency_ms = benchmark(simple_conv_model_bytes)
+        assert isinstance(latency_ms, float)
+        assert latency_ms > 0
+
+
+# --- TrtExecBenchmark (integration) ---
+
+
+class TestTrtExecBenchmark:
+    """End-to-end tests for TrtExecBenchmark. Requires trtexec in PATH."""
+
+    @pytest.fixture(autouse=True)
+    def _require_trtexec(self):
+        if shutil.which("trtexec") is None:
+            pytest.skip("trtexec not found in PATH", allow_module_level=False)
+
+    def test_run_with_path(self, simple_conv_model_path):
+        """TrtExecBenchmark accepts model path and returns finite latency."""
+        with tempfile.NamedTemporaryFile(suffix=".cache", delete=False) as f:
+            cache_path = f.name
+        try:
+            benchmark = TrtExecBenchmark(
+                timing_cache_file=cache_path,
+                warmup_runs=1,
+                timing_runs=2,
+                trtexec_args=["--duration=0"],
+            )
+            latency_ms = benchmark.run(simple_conv_model_path)
+            assert isinstance(latency_ms, float)
+            assert latency_ms > 0
+            assert latency_ms != float("inf")
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(cache_path)
+
+    def test_run_with_bytes(self, simple_conv_model_bytes):
+        """TrtExecBenchmark accepts model bytes (writes temp file) and returns finite latency."""
+        with tempfile.NamedTemporaryFile(suffix=".cache", delete=False) as f:
+            cache_path = f.name
+        try:
+            benchmark = TrtExecBenchmark(
+                timing_cache_file=cache_path,
+                warmup_runs=1,
+                timing_runs=2,
+                trtexec_args=["--duration=0"],
+            )
+            latency_ms = benchmark.run(simple_conv_model_bytes)
+            assert isinstance(latency_ms, float)
+            assert latency_ms > 0
+            assert latency_ms != float("inf")
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(cache_path)

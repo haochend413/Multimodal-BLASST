@@ -1,0 +1,257 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import copy
+
+import pytest
+import torch
+import torch.nn as nn
+import transformer_engine as te
+from _test_utils.torch.misc import set_seed
+from _test_utils.torch.quantization.quantize_common import quantize_model_and_forward
+
+import modelopt.torch.opt as mto
+import modelopt.torch.quantization as mtq
+from modelopt.torch.quantization.extensions import get_cuda_ext_mx
+from modelopt.torch.quantization.nn import GroupedQuantizer, QuantModule
+
+
+class TELinear(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            te.pytorch.Linear(16, 32), te.pytorch.LayerNormLinear(32, 16, normalization="RMSNorm")
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+    def get_input(self):
+        return torch.randn(2, 16)
+
+
+class TEGroupedLinear(nn.Module):
+    """Exercises `_QuantTEGroupedLinear`, used by MoE expert grouped GEMMs."""
+
+    num_gemms = 3
+
+    def __init__(self):
+        super().__init__()
+        self.net = te.pytorch.GroupedLinear(self.num_gemms, 16, 32)
+
+    def forward(self, x):
+        m_splits = [x.shape[0] // self.num_gemms] * self.num_gemms
+        return self.net(x, m_splits)
+
+    def get_input(self):
+        return torch.randn(self.num_gemms * 2, 16)
+
+
+# AWQ-lite and SmoothQuant calibration (model_calib.py's `AWQLiteHelper` and its
+# SmoothQuant counterpart) read `module.weight` directly. `_QuantTEGroupedLinear`
+# deletes `self.weight` and stores per-expert weights as `weight0..weightN` (see
+# `iter_weights_for_calibration`), so these algorithms don't support GroupedLinear yet.
+# That's a separate, pre-existing gap from the TE-signature-compat fix this test
+# module otherwise covers - skip rather than silently expanding scope here.
+_AWQ_SMOOTHQUANT_CFGS = [
+    mtq.W4A8_AWQ_BETA_CFG,
+    mtq.INT8_SMOOTHQUANT_CFG,
+    mtq.INT4_AWQ_CFG,
+    mtq.NVFP4_AWQ_LITE_CFG,
+]
+
+
+@pytest.mark.parametrize("model_cls", [TELinear, TEGroupedLinear])
+@pytest.mark.parametrize(
+    "config",
+    [
+        mtq.INT8_DEFAULT_CFG,
+        mtq.FP8_DEFAULT_CFG,
+        mtq.W4A8_AWQ_BETA_CFG,
+        mtq.INT8_SMOOTHQUANT_CFG,
+        mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
+        mtq.INT4_AWQ_CFG,
+        mtq.NVFP4_DEFAULT_CFG,
+        mtq.NVFP4_AWQ_LITE_CFG,
+        mtq.MXFP8_DEFAULT_CFG,
+        mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG,
+    ],
+)
+def test_quantize(model_cls, config):
+    """Test quantize function can run without problems."""
+    if model_cls is TEGroupedLinear and config in _AWQ_SMOOTHQUANT_CFGS:
+        pytest.skip("AWQ-lite/SmoothQuant calibration doesn't support GroupedLinear yet")
+
+    if (
+        config
+        in [
+            mtq.NVFP4_DEFAULT_CFG,
+            mtq.NVFP4_AWQ_LITE_CFG,
+            mtq.MXFP8_DEFAULT_CFG,
+            mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG,
+        ]
+        and get_cuda_ext_mx() is None
+    ):
+        pytest.skip("cuda_ext_mx is not available")
+
+    if config == mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG:
+        # reduce block sizes for simple testing models
+        config = copy.deepcopy(config)
+        for entry in config["quant_cfg"]:
+            if entry.get("quantizer_name") == "*weight_quantizer":
+                entry["cfg"]["block_sizes"] = {-1: 8, -2: 8}
+                break
+    model = model_cls().cuda()
+    calib_data = [model.get_input().cuda() for _ in range(1)]
+    quantize_model_and_forward(model, config, calib_data)
+
+
+def test_grouped_post_restore_preserves_weight_amax():
+    """Grouped restore must not clear calibrated state for non-representative experts."""
+    model = TEGroupedLinear().cuda()
+    with torch.no_grad():
+        for index in range(model.num_gemms):
+            getattr(model.net, f"weight{index}").fill_(0.25 + index)
+
+    data = model.get_input().cuda()
+    mtq.quantize(model, copy.deepcopy(mtq.FP8_DEFAULT_CFG), lambda module: module(data))
+
+    quantizers = model.net.weight_quantizer
+    assert isinstance(quantizers, GroupedQuantizer)
+    before_restore = [quantizer.amax.clone() for quantizer in quantizers]
+
+    model.net.modelopt_post_restore()
+
+    for quantizer, expected in zip(quantizers, before_restore):
+        torch.testing.assert_close(quantizer.amax, expected)
+
+
+@pytest.mark.parametrize("share_weight_quantizer", [False, True])
+def test_fold_weight_grouped_linear(share_weight_quantizer):
+    model = TEGroupedLinear().cuda()
+    calib_data = [model.get_input().cuda()]
+    quantize_model_and_forward(model, mtq.INT8_DEFAULT_CFG, calib_data)
+
+    grouped_linear = model.net
+    assert isinstance(grouped_linear.weight_quantizer, GroupedQuantizer)
+    if share_weight_quantizer:
+        grouped_linear.weight_quantizer = grouped_linear.weight_quantizer[0]
+    weights = [getattr(grouped_linear, f"weight{i}") for i in range(grouped_linear.num_gemms)]
+    quantizers = [quantizer for _, quantizer in grouped_linear.iter_weights_for_calibration()]
+    with torch.no_grad():
+        output_before = model(calib_data[0])
+        expected_weights = [
+            quantizer(weight.float().contiguous()).to(weight.dtype)
+            for weight, quantizer in zip(weights, quantizers)
+        ]
+
+    mtq.fold_weight(model)
+
+    with torch.no_grad():
+        output_after = model(calib_data[0])
+    if isinstance(output_before, tuple):
+        output_before = output_before[0]
+        output_after = output_after[0]
+    assert torch.allclose(output_after, output_before)
+
+    for weight, expected_weight, quantizer in zip(weights, expected_weights, quantizers):
+        assert torch.allclose(weight, expected_weight)
+        assert not quantizer.is_enabled
+        assert not hasattr(quantizer, "_amax")
+
+
+@pytest.mark.parametrize("share_weight_quantizer", [False, True])
+def test_initialize_grouped_weights(share_weight_quantizer):
+    model = TEGroupedLinear().cuda()
+    data = [model.get_input().cuda()]
+    quantize_model_and_forward(model, mtq.INT8_DEFAULT_CFG, data)
+    module = model.net
+    if share_weight_quantizer:
+        module.weight_quantizer = module.weight_quantizer[0]
+    pairs = list(module.iter_weights_for_calibration())
+    expected = [q(weight).detach().clone() for weight, q in pairs]
+    parameters = dict(model.named_parameters())
+    mtq.initialize_qdq_weights(model)
+    for (weight, q), target in zip(pairs, expected):
+        torch.testing.assert_close(weight, target, rtol=0, atol=0)
+        assert q.is_enabled
+    assert all(p is parameters[name] for name, p in model.named_parameters())
+
+
+def test_initialize_preserves_unquantized_output_rows():
+    model = TELinear().cuda()
+    quantize_model_and_forward(model, mtq.INT8_DEFAULT_CFG, [model.get_input().cuda()])
+    layer = model.net[1]
+    rows = slice(2, 5)
+    layer._modelopt_unquantized_output_rows = rows
+    original = layer.weight.detach().clone()
+    expected = layer.weight_quantizer(layer.weight).detach().clone()
+    expected[rows] = original[rows]
+    mtq.initialize_qdq_weights(model)
+    with torch.enable_grad():
+        layer._initialize_qdq_weights(set())
+    torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
+
+
+def test_quantize_forward_backward():
+    set_seed()
+    model = TELinear().cuda()
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            param.data.copy_(param.data.abs() + 0.1)  # hack to get non-zero gradient
+
+    # hack to get non-zero gradient
+    calib_data = [model.get_input().cuda().abs() + 0.1 for _ in range(1)]
+
+    quantize_model_and_forward(model, mtq.INT8_DEFAULT_CFG, calib_data)
+
+    model.train()
+    for name, param in model.named_parameters():
+        param.grad = None
+
+    loss = model(calib_data[0]).sum()
+    loss.backward()
+
+    for i, linear in enumerate(model.net):
+        assert isinstance(linear, QuantModule)
+        # In-directly tests that data was passed to the quantizers
+        assert linear.input_quantizer.amax is not None
+        assert linear.weight_quantizer.amax is not None
+
+        # In-directly tests that gradients were computed correctly
+        assert linear.weight.grad is not None and linear.weight.grad.abs().sum() > 0.0
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "quant_config"),
+    [
+        (TELinear, mtq.INT8_SMOOTHQUANT_CFG),
+    ],
+)
+def test_save_restore(model_cls, quant_config):
+    # test restoring to an unquantized model
+    # Transformer Engine does not support cpu device
+    device = "cuda"
+    model_quant = model_cls().to(device)
+    model_ref = model_cls().to(device)
+
+    calib_data = [model_quant.get_input().to(device) for _ in range(2)]
+    quantize_model_and_forward(model_quant.to(device), quant_config, calib_data)
+
+    state_dict = mto.modelopt_state(model_quant)
+
+    mto.restore_from_modelopt_state(model_ref, state_dict)
+    model_ref.load_state_dict(model_quant.state_dict())
+    assert torch.allclose(model_quant(calib_data[0]), model_ref(calib_data[0]))

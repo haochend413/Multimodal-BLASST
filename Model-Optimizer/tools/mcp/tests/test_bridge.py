@@ -1,0 +1,2401 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for modelopt-mcp's bridge module — subprocess + filesystem interactions mocked."""
+
+import asyncio
+import json
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+# Skip the whole module if mcp / pydantic aren't installed (the [mcp]
+# extra is opt-in).
+pytest.importorskip("mcp")
+pytest.importorskip("pydantic")
+
+from modelopt_mcp import bridge, server
+
+
+@pytest.fixture(autouse=True)
+def _disable_managed_source(monkeypatch):
+    """Keep legacy subprocess tests offline unless a test opts into source routing."""
+    monkeypatch.setenv("MODELOPT_MCP_DISABLE_MANAGED_SOURCE", "1")
+
+
+# ---------------------------------------------------------------------------
+# list_examples
+# ---------------------------------------------------------------------------
+
+
+def test_list_examples_returns_structured_metadata(tmp_path, monkeypatch):
+    """Drop two YAMLs into a fake examples dir and verify metadata extraction (model, description) and path shape."""
+    examples = tmp_path / "examples"
+    (examples / "Qwen").mkdir(parents=True)
+    (examples / "Qwen" / "ptq.yaml").write_text(
+        "job_name: qwen-ptq\nmodel: Qwen/Qwen3-8B\ndescription: PTQ test\n"
+    )
+    (examples / "moonshotai").mkdir(parents=True)
+    (examples / "moonshotai" / "train.yaml").write_text(
+        "job_name: kimi-train\nbase_model: moonshotai/Kimi-K2\n"
+    )
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(examples))
+
+    result = bridge.list_examples_impl()
+    assert result["ok"] is True
+    assert result["count"] == 2
+    by_model = {e["model"]: e for e in result["examples"]}
+    assert "Qwen/Qwen3-8B" in by_model
+    assert by_model["Qwen/Qwen3-8B"]["description"] == "PTQ test"
+    assert "moonshotai/Kimi-K2" in by_model
+
+
+def test_list_examples_missing_dir(monkeypatch, tmp_path):
+    """When examples dir can't be located, return a structured failure — no exception."""
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(tmp_path / "ghost"))
+    result = bridge.list_examples_impl()
+    assert result["ok"] is False
+    assert result["reason"] == "examples_dir_not_found"
+
+
+def test_list_examples_tolerates_malformed_yaml(tmp_path, monkeypatch):
+    """A single malformed YAML doesn't crash list_examples — it lands with model=None."""
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    (examples / "good.yaml").write_text("job_name: g\nmodel: ok\n")
+    (examples / "bad.yaml").write_text("not: [unbalanced\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(examples))
+
+    result = bridge.list_examples_impl()
+    assert result["ok"] is True
+    assert result["count"] == 2
+    by_path = {e["path"]: e for e in result["examples"]}
+    assert any("bad.yaml" in p for p in by_path)
+    bad = next(e for e in result["examples"] if "bad.yaml" in e["path"])
+    assert bad["model"] is None
+
+
+# ---------------------------------------------------------------------------
+# verify_docker_setup
+# ---------------------------------------------------------------------------
+
+
+def test_verify_docker_daemon_unavailable(monkeypatch):
+    """When `docker info` exits non-zero, verify returns docker_daemon_unavailable."""
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=1,
+            stdout="",
+            stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("MODELOPT_MCP_SKIP_GPU_CHECK", "1")
+
+    result = bridge.verify_docker_setup_impl()
+    assert result["ok"] is False
+    assert result["reason"] == "docker_daemon_unavailable"
+
+
+def test_verify_docker_daemon_not_installed(monkeypatch):
+    """When `docker` is not on PATH, verify returns docker_not_installed."""
+
+    def fake_run(argv, **kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.verify_docker_setup_impl()
+    assert result["ok"] is False
+    assert result["reason"] == "docker_not_installed"
+
+
+def test_verify_docker_skip_gpu_when_env_set(monkeypatch):
+    """MODELOPT_MCP_SKIP_GPU_CHECK lets CI hosts without GPUs report ok after the daemon check passes."""
+
+    def fake_run(argv, **kwargs):
+        # Daemon check passes; GPU check is skipped — so only one call.
+        assert argv[:2] == ["docker", "info"], f"only `docker info` should run; got {argv}"
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("MODELOPT_MCP_SKIP_GPU_CHECK", "1")
+    result = bridge.verify_docker_setup_impl()
+    assert result["ok"] is True
+    assert result["gpu_check_skipped"] is True
+
+
+def test_verify_docker_gpu_unavailable(monkeypatch):
+    """GPU passthrough container exits non-zero → gpu_unavailable + install-toolkit pointer."""
+    call_count = {"n": 0}
+
+    def fake_run(argv, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Daemon check: ok
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+        # GPU check: failed
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=125,
+            stdout="",
+            stderr='could not select device driver "" with capabilities: [[gpu]]',
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.delenv("MODELOPT_MCP_SKIP_GPU_CHECK", raising=False)
+    result = bridge.verify_docker_setup_impl()
+    assert result["ok"] is False
+    assert result["reason"] == "gpu_unavailable"
+    assert "NVIDIA Container Toolkit" in result["diagnostic"]
+
+
+# ---------------------------------------------------------------------------
+# verify_slurm_setup
+# ---------------------------------------------------------------------------
+
+
+def test_verify_slurm_ssh_success(monkeypatch):
+    """Mocked ssh probe returns whoami + hostname; verify returns ok."""
+
+    def fake_run(argv, **kwargs):
+        assert argv[0] == "ssh"
+        assert "BatchMode=yes" in argv
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="alice\ncluster-login-01\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.verify_slurm_setup_impl(
+        cluster_host="login.example.com",
+        cluster_user="alice",
+    )
+    assert result["ok"] is True
+    assert result["whoami"] == "alice"
+    assert result["remote_hostname"] == "cluster-login-01"
+
+
+def test_verify_slurm_controlmaster_success(monkeypatch):
+    """MFA clusters can verify through an existing OpenSSH ControlMaster socket."""
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+        assert "ControlPath=/tmp/mfa.sock" in argv
+        assert "ControlMaster=no" in argv
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="alice-mfa\nmfa-login\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.verify_slurm_setup_impl(
+        cluster_host="mfa-login.example.com",
+        cluster_user="alice-mfa",
+        control_socket="/tmp/mfa.sock",
+        reconnect_command="ssh mfa-cluster",
+    )
+
+    assert result["ok"] is True
+    assert result["control_socket"] == "/tmp/mfa.sock"
+    assert len(calls) == 2
+
+
+def test_verify_slurm_controlmaster_missing(monkeypatch):
+    """Missing ControlMaster socket returns a reauth diagnostic before probing SSH."""
+
+    def fake_run(argv, **kwargs):
+        assert argv[:3] == ["ssh", "-O", "check"]
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=255,
+            stdout="",
+            stderr="Control socket connect failed",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.verify_slurm_setup_impl(
+        cluster_host="mfa-login.example.com",
+        cluster_user="alice-mfa",
+        control_socket="/tmp/missing.sock",
+        reconnect_command="ssh mfa-cluster",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "mfa_reauth_required"
+    assert result["reconnect_command"] == "ssh mfa-cluster"
+
+
+def test_verify_slurm_controlmaster_timeout(monkeypatch):
+    """ControlMaster probe timeouts return structured ssh_timeout diagnostics."""
+
+    def fake_run(argv, **kwargs):
+        assert argv[:3] == ["ssh", "-O", "check"]
+        raise subprocess.TimeoutExpired(argv, timeout=15)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.verify_slurm_setup_impl(
+        cluster_host="mfa-login.example.com",
+        cluster_user="alice-mfa",
+        control_socket="/tmp/mfa.sock",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "ssh_timeout"
+
+
+def test_verify_slurm_auth_failed(monkeypatch):
+    """Ssh -o BatchMode=yes exit 255 → ssh_auth_failed with diagnostic."""
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=255,
+            stdout="",
+            stderr="Permission denied (publickey).",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.verify_slurm_setup_impl(
+        cluster_host="ghost-cluster.example.com",
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "ssh_auth_failed"
+
+
+# ---------------------------------------------------------------------------
+# submit_job mode resolution
+# ---------------------------------------------------------------------------
+
+
+def test_submit_job_rejects_no_executor():
+    """Neither hf_local nor cluster_host → no_executor_specified."""
+    result = bridge.submit_job_impl(
+        yaml_path="examples/test.yaml",
+        hf_local=None,
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=True,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "no_executor_specified"
+
+
+def test_submit_job_rejects_both_executors():
+    """Both hf_local AND cluster_host → ambiguous_executor."""
+    result = bridge.submit_job_impl(
+        yaml_path="examples/test.yaml",
+        hf_local="/tmp/hf",
+        cluster_host="cluster.example.com",
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=True,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "ambiguous_executor"
+
+
+def test_submit_job_yaml_not_found(monkeypatch, tmp_path):
+    """yaml_path that doesn't resolve to an existing file → yaml_not_found."""
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(tmp_path))
+    result = bridge.submit_job_impl(
+        yaml_path="does/not/exist.yaml",
+        hf_local="/tmp/hf",
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=True,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "yaml_not_found"
+
+
+def test_submit_job_mfa_requires_control_socket():
+    """MFA Slurm submissions require a reusable ControlMaster socket."""
+    result = bridge.submit_job_impl(
+        yaml_path="examples/test.yaml",
+        cluster_host="mfa-login.example.com",
+        mfa=True,
+        ssh_alias="mfa-cluster",
+        skip_verify=True,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "mfa_control_socket_required"
+    assert result["ssh_alias"] == "mfa-cluster"
+
+
+def test_ensure_source_checkout_defaults_to_main(monkeypatch, tmp_path):
+    """Managed source defaults to Model-Optimizer main and the default repo."""
+    monkeypatch.delenv("MODELOPT_MCP_DISABLE_MANAGED_SOURCE", raising=False)
+    monkeypatch.setenv("MODELOPT_MCP_SOURCE_CACHE", str(tmp_path / "cache"))
+    seen = {}
+
+    def fake_resolve(repo, ref):
+        seen["repo"] = repo
+        seen["ref"] = ref
+        return {"ok": True, "resolved_sha": "a" * 40}
+
+    monkeypatch.setattr(bridge, "_resolve_source_ref", fake_resolve)
+    monkeypatch.setattr(bridge, "_checkout_ready", lambda path, sha: True)
+
+    result = bridge._ensure_source_checkout()
+
+    assert result["ok"] is True
+    assert seen["repo"] == "https://github.com/NVIDIA/Model-Optimizer.git"
+    assert seen["ref"] == "main"
+    assert result["checkout"].resolved_sha == "a" * 40
+
+
+@pytest.mark.parametrize(
+    ("env_repo", "source_repo", "allowed"),
+    [
+        (None, "https://github.com/NVIDIA/Model-Optimizer.git", True),
+        (
+            "https://github.com/alice/Model-Optimizer.git",
+            "https://github.com/alice/Model-Optimizer.git",
+            True,
+        ),
+        (None, "https://github.com/attacker/Model-Optimizer.git", False),
+        ("https://github.com/alice/Model-Optimizer.git", "/tmp/evil-repo", False),
+    ],
+)
+def test_ensure_source_checkout_source_repo_allowlist(
+    monkeypatch, tmp_path, env_repo, source_repo, allowed
+):
+    """Only the default or operator-configured repo can be checked out."""
+    monkeypatch.delenv("MODELOPT_MCP_DISABLE_MANAGED_SOURCE", raising=False)
+    monkeypatch.setenv("MODELOPT_MCP_SOURCE_CACHE", str(tmp_path / "cache"))
+    if env_repo:
+        monkeypatch.setenv("MODELOPT_MCP_SOURCE_REPO", env_repo)
+    else:
+        monkeypatch.delenv("MODELOPT_MCP_SOURCE_REPO", raising=False)
+    seen = []
+
+    def fake_resolve(repo, ref):
+        seen.append(repo)
+        return {"ok": True, "resolved_sha": "a" * 40}
+
+    monkeypatch.setattr(bridge, "_resolve_source_ref", fake_resolve)
+    monkeypatch.setattr(bridge, "_checkout_ready", lambda path, sha: True)
+
+    result = bridge._ensure_source_checkout(source_repo=source_repo)
+
+    assert result["ok"] is allowed
+    assert seen == ([source_repo] if allowed else [])
+    if not allowed:
+        assert result["reason"] == "source_repo_not_allowed"
+
+
+def test_source_ref_is_operator_only(monkeypatch, tmp_path):
+    """Agents cannot pick the checkout ref; only MODELOPT_MCP_SOURCE_REF sets it."""
+    tools = {t.name: t for t in asyncio.run(server._build_server().list_tools())}
+    assert "source_ref" not in tools["submit_job"].inputSchema["properties"]
+
+    monkeypatch.delenv("MODELOPT_MCP_DISABLE_MANAGED_SOURCE", raising=False)
+    monkeypatch.setenv("MODELOPT_MCP_SOURCE_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("MODELOPT_MCP_SOURCE_REF", "release/0.49.0")
+    seen = []
+
+    def fake_resolve(repo, ref):
+        seen.append(ref)
+        return {"ok": True, "resolved_sha": "a" * 40}
+
+    monkeypatch.setattr(bridge, "_resolve_source_ref", fake_resolve)
+    monkeypatch.setattr(bridge, "_checkout_ready", lambda path, sha: True)
+
+    assert bridge._ensure_source_checkout()["ok"] is True
+    assert seen == ["release/0.49.0"]
+
+
+def test_submit_job_dry_run_uses_managed_source_checkout(monkeypatch, tmp_path):
+    """Managed source routes launcher execution through an editable checkout."""
+    checkout_root = tmp_path / "checkout"
+    yaml_dir = checkout_root / "tools" / "launcher" / "examples" / "fam" / "model"
+    yaml_dir.mkdir(parents=True)
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    checkout = bridge.SourceCheckout(
+        repo="https://example.com/modelopt.git",
+        ref="feature/ref",
+        resolved_sha="b" * 40,
+        root=checkout_root,
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_ensure_source_checkout",
+        lambda **_: {"ok": True, "checkout": checkout},
+    )
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="Dry-run OK\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="fam/model/config.yaml",
+        hf_local=None,
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=True,
+        dry_run=True,
+    )
+
+    assert result["ok"] is True
+    assert result["source_ref"] == "feature/ref"
+    assert result["source_sha"] == "b" * 40
+    assert captured["argv"][:5] == [
+        "uv",
+        "run",
+        "--with-editable",
+        str(checkout_root / "tools" / "launcher"),
+        "modelopt-launcher",
+    ]
+    assert str(yaml_path) in captured["argv"]
+    assert captured["env"]["MODELOPT_MCP_SOURCE_ROOT"] == str(checkout_root)
+    assert captured["env"]["MODELOPT_MCP_SOURCE_SHA"] == "b" * 40
+
+
+def test_submit_job_source_checkout_failure_short_circuits(monkeypatch):
+    """Source checkout failures return structured diagnostics and do not launch."""
+    monkeypatch.setattr(
+        bridge,
+        "_ensure_source_checkout",
+        lambda **_: {
+            "ok": False,
+            "reason": "source_ref_not_found",
+            "diagnostic": "missing ref",
+        },
+    )
+
+    result = bridge.submit_job_impl(
+        yaml_path="examples/test.yaml",
+        hf_local=None,
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=True,
+        dry_run=True,
+    )
+
+    assert result["ok"] is False
+    assert result["dry_run"] is True
+    assert result["reason"] == "source_ref_not_found"
+
+
+def test_submit_job_docker_captures_experiment_id_from_launcher_output(monkeypatch, tmp_path):
+    """Docker submit tails launcher output long enough to return nemo_run's id."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path / "nemo"))
+    monkeypatch.setattr(bridge, "verify_docker_setup_impl", lambda: {"ok": True})
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, argv, **kwargs):
+            self.argv = argv
+            out = kwargs["stdout"]
+            out.write(
+                b"Experiment Status for docker_1782173197\n"
+                b'experiment = run.Experiment.from_id("docker_1782173197")\n'
+            )
+            out.flush()
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        hf_local="/tmp/hf",
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=False,
+    )
+
+    assert result["ok"] is True
+    assert result["executor"] == "docker"
+    assert result["pid"] == 4242
+    assert result["experiment_id"] == "docker_1782173197"
+    assert "docker_1782173197" in result["stdout_tail"]
+    assert result["stdout_log"].endswith(".log")
+
+
+def test_submit_job_docker_no_experiment_id_returns_pid_and_log(monkeypatch, tmp_path):
+    """Docker submit stays detached when the id is not printed immediately."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path / "nemo"))
+    monkeypatch.setenv("MODELOPT_MCP_DOCKER_ID_TIMEOUT_SEC", "0")
+    monkeypatch.setattr(bridge, "verify_docker_setup_impl", lambda: {"ok": True})
+
+    class FakePopen:
+        pid = 4243
+
+        def __init__(self, argv, **kwargs):
+            kwargs["stdout"].write(b"launcher starting\n")
+            kwargs["stdout"].flush()
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        hf_local="/tmp/hf",
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=False,
+    )
+
+    assert result["ok"] is True
+    assert result["executor"] == "docker"
+    assert result["pid"] == 4243
+    assert result["experiment_id"] is None
+    assert "launcher starting" in result["stdout_tail"]
+    assert "no experiment_id was captured" in result["diagnostic"]
+
+
+def test_parse_launcher_submission_ignores_experiment_dir_as_id():
+    """A path field must not be misread as a usable experiment id."""
+    experiment_id, experiment_dir, slurm_job_id = bridge._parse_launcher_submission(
+        "experiment_dir=/tmp/nemorun/experiments/docker_1782173197\n"
+    )
+
+    assert experiment_id is None
+    assert experiment_dir == "/tmp/nemorun/experiments/docker_1782173197"
+    assert slurm_job_id is None
+
+
+def test_submit_job_docker_log_creation_failure_is_structured(monkeypatch, tmp_path):
+    """Docker submit should not raise if the side-channel log cannot be created."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path / "nemo"))
+    monkeypatch.setattr(bridge, "verify_docker_setup_impl", lambda: {"ok": True})
+
+    def fail_named_temporary_file(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(bridge.tempfile, "NamedTemporaryFile", fail_named_temporary_file)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        hf_local="/tmp/hf",
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=False,
+    )
+
+    assert result["ok"] is False
+    assert result["executor"] == "docker"
+    assert result["reason"] == "docker_submit_log_unavailable"
+    assert "disk full" in result["diagnostic"]
+
+
+def test_submit_job_docker_log_creation_failure_marks_mlflow_failed(monkeypatch, tmp_path):
+    """Post-MLflow Docker submit failures should not leave submitted runs orphaned."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path / "nemo"))
+    monkeypatch.setattr(bridge, "verify_docker_setup_impl", lambda: {"ok": True})
+    monkeypatch.setattr(
+        bridge,
+        "_create_mlflow_run",
+        lambda **kwargs: {
+            "ok": True,
+            "enabled": True,
+            "mlflow_run_id": "run-123",
+            "mlflow_tracking_uri": "https://mlflow.example",
+        },
+    )
+
+    marked = {}
+
+    def fake_mark(run_id, tracking_uri, reason):
+        marked.update({"run_id": run_id, "tracking_uri": tracking_uri, "reason": reason})
+
+    def fail_named_temporary_file(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(bridge, "_mark_mlflow_submission_failed", fake_mark)
+    monkeypatch.setattr(bridge.tempfile, "NamedTemporaryFile", fail_named_temporary_file)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        hf_local="/tmp/hf",
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=False,
+        enable_mlflow=True,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "docker_submit_log_unavailable"
+    assert marked == {
+        "run_id": "run-123",
+        "tracking_uri": "https://mlflow.example",
+        "reason": "docker_submit_log_unavailable",
+    }
+
+
+def test_submit_job_slurm_zero_exit_without_ids_is_failure(monkeypatch, tmp_path):
+    """Slurm submit must not report success when launcher emits no ids."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+    monkeypatch.setattr(
+        bridge,
+        "verify_slurm_setup_impl",
+        lambda **_: {"ok": True},
+    )
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="Configuring global options\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        hf_local=None,
+        cluster_host="cluster.example.com",
+        cluster_user="user",
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=False,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "launch_result_unparsed"
+
+
+def test_submit_job_slurm_parses_nemo_job_id(monkeypatch, tmp_path):
+    """Parse Slurm job id from Nemo's experiment status output."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+    exp_dir = tmp_path / "experiments" / "cicd" / "cicd_1782173197"
+    exp_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        bridge,
+        "verify_slurm_setup_impl",
+        lambda **_: {"ok": True},
+    )
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=(
+                "Experiment Status for cicd_1782173197\n"
+                "- Job id: 13049989\n"
+                'experiment = run.Experiment.from_id("cicd_1782173197")\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        hf_local=None,
+        cluster_host="cluster.example.com",
+        cluster_user="user",
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=False,
+    )
+    assert result["ok"] is True
+    assert result["slurm_job_id"] == "13049989"
+    assert result["experiment_id"] == "cicd_1782173197"
+    meta = json.loads((exp_dir / bridge._SLURM_STATUS_META).read_text())
+    assert meta["slurm_job_id"] == "13049989"
+    assert meta["cluster_host"] == "cluster.example.com"
+    assert meta["cluster_user"] == "user"
+
+
+def test_submit_job_slurm_creates_mlflow_run_and_injects_env(monkeypatch, tmp_path):
+    """enable_mlflow=True creates a run and passes standard env vars to launcher."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+    monkeypatch.setenv("USER", "alice")
+    (tmp_path / "experiments" / "cicd" / "cicd_1782173197").mkdir(parents=True)
+    monkeypatch.setattr(bridge, "verify_slurm_setup_impl", lambda **_: {"ok": True})
+
+    mlflow = pytest.importorskip("mlflow")
+    tracking_uri = f"sqlite:///{tmp_path / 'tracking.db'}"
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+    context = {
+        "PENSIEVE_LAUNCH_ID": "pl_existing",
+        "PENSIEVE_MLFLOW_RUN_ID": "existing-lifecycle-run",
+        "PENSIEVE_MLFLOW_TRACKING_URI": "https://lifecycle.example",
+        "PENSIEVE_MLFLOW_EXPERIMENT_ID": "22",
+    }
+    for key, value in context.items():
+        monkeypatch.setenv(key, value)
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=(
+                "Experiment Status for cicd_1782173197\n"
+                "- Job id: 13049989\n"
+                'experiment = run.Experiment.from_id("cicd_1782173197")\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        cluster_host="cluster.example.com",
+        cluster_user="user",
+        skip_verify=False,
+        enable_mlflow=True,
+        mlflow_tracking_uri=tracking_uri,
+        mlflow_experiment="mcp-tests",
+    )
+
+    assert result["ok"] is True
+    run_id = result["mlflow"]["mlflow_run_id"]
+    assert captured["env"]["MLFLOW_RUN_ID"] == run_id
+    assert captured["env"]["MLFLOW_TRACKING_URI"] == tracking_uri
+    run = client.get_run(run_id)
+    assert captured["env"]["MLFLOW_EXPERIMENT_ID"] == run.info.experiment_id
+    assert run_id != context["PENSIEVE_MLFLOW_RUN_ID"]
+    assert {key: captured["env"][key] for key in context} == context
+    assert run.data.tags["pensieve.launch_id"] == "pl_existing"
+    assert run.data.tags["pensieve.mlflow_run_id"] == "existing-lifecycle-run"
+    assert run.data.tags["pensieve.mlflow_tracking_uri"] == "https://lifecycle.example"
+    assert run.data.tags["pensieve.mlflow_experiment_id"] == "22"
+    assert run.info.status == "RUNNING"
+    assert run.info.end_time is None
+    assert run.data.tags["mlflow.runName"] == "alice/cluster.example.com/examples/config"
+    assert run.data.tags["lifecycle"] == "submitted"
+    assert run.data.tags["managed_by"] == "modelopt-mcp"
+
+
+def test_mark_mlflow_submission_failed_terminates_run_as_failed(tmp_path):
+    """Submission compensation persists FAILED in the tracking store."""
+    mlflow = pytest.importorskip("mlflow")
+    uri = f"sqlite:///{tmp_path / 'tracking.db'}"
+    client = mlflow.tracking.MlflowClient(tracking_uri=uri)
+    run_id = client.create_run(client.create_experiment("mcp-tests")).info.run_id
+
+    bridge._mark_mlflow_submission_failed(run_id, uri, "launch_failed")
+
+    run = client.get_run(run_id)
+    assert run.info.status == "FAILED"
+    assert run.data.tags["result_label"] == "SUBMIT_FAILED"
+    assert run.data.metrics["result"] == 0.0
+
+
+def test_submit_job_slurm_accepts_nmm_cluster_fields(monkeypatch, tmp_path):
+    """nmm-sandbox resolved cluster config maps to launcher overrides and env."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    (yaml_dir / "config.yaml").write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+
+    verify_seen = {}
+
+    def fake_verify(**kwargs):
+        verify_seen.update(kwargs)
+        return {"ok": True}
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=(
+                "Experiment Status for cicd_1782173197\n"
+                "- Job id: 13049989\n"
+                'experiment = run.Experiment.from_id("cicd_1782173197")\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(bridge, "verify_slurm_setup_impl", fake_verify)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        cluster_host="mfa-login.example.com",
+        cluster_user="alice-mfa",
+        account="project_account",
+        partition="batch",
+        container="ubuntu:24.04",
+        ntasks_per_node=1,
+        control_socket="~/.ssh/mfa.sock",
+        reconnect_command="ssh mfa-cluster",
+        skip_verify=False,
+    )
+
+    assert result["ok"] is True
+    assert verify_seen["control_socket"] == "~/.ssh/mfa.sock"
+    assert verify_seen["reconnect_command"] == "ssh mfa-cluster"
+    assert "pipeline.task_0.slurm_config.account=project_account" in captured["argv"]
+    assert "pipeline.task_0.slurm_config.partition=batch" in captured["argv"]
+    assert "pipeline.task_0.slurm_config.container=ubuntu:24.04" in captured["argv"]
+    assert "pipeline.task_0.slurm_config.ntasks_per_node=1" in captured["argv"]
+    assert captured["env"]["SLURM_ACCOUNT"] == "project_account"
+    assert captured["env"]["SLURM_PARTITION"] == "batch"
+    assert captured["env"]["MODELOPT_LAUNCHER_SSH_CONTROL_PATH"].endswith(".ssh/mfa.sock")
+    assert captured["env"]["MODELOPT_LAUNCHER_SSH_RECONNECT_COMMAND"] == "ssh mfa-cluster"
+
+
+def test_submit_job_slurm_job_id_without_experiment_id_is_failure(monkeypatch, tmp_path):
+    """A Slurm job id alone is not enough for MCP status/log polling."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+    monkeypatch.setattr(
+        bridge,
+        "verify_slurm_setup_impl",
+        lambda **_: {"ok": True},
+    )
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="Task 0\n- Job id: 13049989\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        hf_local=None,
+        cluster_host="cluster.example.com",
+        cluster_user="user",
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=False,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "launch_result_unparsed"
+    assert result["slurm_job_id"] == "13049989"
+
+
+def test_submit_job_slurm_zero_exit_with_launcher_error_is_failure(monkeypatch, tmp_path):
+    """Launcher fatal text must override a misleading zero exit status."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+    monkeypatch.setattr(
+        bridge,
+        "verify_slurm_setup_impl",
+        lambda **_: {"ok": True},
+    )
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="Configuring global options\n",
+            stderr="Unexpected error: Failed to parse slurm_factory\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        hf_local=None,
+        cluster_host="cluster.example.com",
+        cluster_user="user",
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=False,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "launch_py_failed"
+    assert "Unexpected error" in result["stderr_tail"]
+
+
+# ---------------------------------------------------------------------------
+# submit_job dry-run branch
+# ---------------------------------------------------------------------------
+
+
+def test_submit_job_dry_run_yaml_validates(monkeypatch, tmp_path):
+    """dry_run=True with a valid YAML → ok+validated, no cluster contact."""
+    yaml_dir = tmp_path / "examples" / "fam" / "model"
+    yaml_dir.mkdir(parents=True)
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(tmp_path / "examples"))
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="Dry-run OK — YAML compiles\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="fam/model/config.yaml",
+        hf_local=None,
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=True,
+        dry_run=True,
+    )
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["validated"] is True
+    assert "experiment_id" not in result  # dry-run produces no experiment
+    assert "--dryrun" in captured["argv"]  # launcher CLI spells it as one word
+    assert "--yes" in captured["argv"]  # launcher requires --yes to suppress confirm prompt
+
+
+def test_submit_job_dry_run_uses_slurm_inventory_fields(monkeypatch, tmp_path):
+    """dry-run must mirror live submit Slurm overrides and env."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    (yaml_dir / "config.yaml").write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="Dry-run OK\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        cluster_host="mfa-login.example.com",
+        cluster_user="alice-mfa",
+        account="project_account",
+        partition="batch",
+        container="ubuntu:24.04",
+        ntasks_per_node=1,
+        control_socket="~/.ssh/mfa.sock",
+        ssh_alias="mfa-cluster",
+        skip_verify=True,
+        dry_run=True,
+    )
+
+    assert result["ok"] is True
+    assert "pipeline.task_0.slurm_config.account=project_account" in captured["argv"]
+    assert "pipeline.task_0.slurm_config.partition=batch" in captured["argv"]
+    assert "pipeline.task_0.slurm_config.container=ubuntu:24.04" in captured["argv"]
+    assert "pipeline.task_0.slurm_config.ntasks_per_node=1" in captured["argv"]
+    assert captured["env"]["SLURM_HOST"] == "mfa-login.example.com"
+    assert captured["env"]["SLURM_ACCOUNT"] == "project_account"
+    assert captured["env"]["SLURM_PARTITION"] == "batch"
+    assert captured["env"]["MODELOPT_LAUNCHER_SSH_CONTROL_PATH"].endswith(".ssh/mfa.sock")
+    assert captured["env"]["MODELOPT_LAUNCHER_SSH_RECONNECT_COMMAND"] == "ssh mfa-cluster"
+
+
+def test_submit_job_dry_run_yaml_invalid(monkeypatch, tmp_path):
+    """dry_run=True + launcher rejects YAML → ok=True but validated=False."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "bad.yaml"
+    yaml_path.write_text("not: [unbalanced\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=1,
+            stdout="",
+            stderr="yaml.YAMLError: while parsing a flow sequence\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="bad.yaml",
+        hf_local=None,
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=True,
+        dry_run=True,
+    )
+    assert result["ok"] is True  # The TOOL ran cleanly
+    assert result["dry_run"] is True
+    assert result["validated"] is False  # ...but the YAML failed validation
+    assert result["exit_code"] == 1
+    assert "yaml.YAMLError" in result["stderr_tail"]
+
+
+def test_submit_job_dry_run_zero_exit_with_launcher_error_is_invalid(monkeypatch, tmp_path):
+    """dry-run must treat fatal launcher text as invalid even with exit 0."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "bad.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="Configuring global options\n",
+            stderr="Unexpected error: Failed to parse slurm_factory\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="bad.yaml",
+        hf_local=None,
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=True,
+        dry_run=True,
+    )
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["validated"] is False
+    assert result["exit_code"] == 0
+    assert "Unexpected error" in result["stderr_tail"]
+
+
+def test_submit_job_dry_run_yaml_not_found(monkeypatch, tmp_path):
+    """dry_run=True + missing yaml → yaml_not_found with dry_run flag set."""
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(tmp_path))
+    result = bridge.submit_job_impl(
+        yaml_path="missing.yaml",
+        hf_local=None,
+        cluster_host=None,
+        cluster_user=None,
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=True,
+        dry_run=True,
+    )
+    assert result["ok"] is False
+    assert result["dry_run"] is True
+    assert result["reason"] == "yaml_not_found"
+
+
+def test_submit_job_dry_run_skips_verify(monkeypatch, tmp_path):
+    """dry_run=True bypasses verify_setup even when skip_verify=False."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    (yaml_dir / "ok.yaml").write_text("job_name: ok\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+
+    verify_called = {"n": 0}
+    real_verify = bridge.verify_slurm_setup_impl
+
+    def fake_verify(**kwargs):
+        verify_called["n"] += 1
+        return real_verify(**kwargs)
+
+    monkeypatch.setattr(bridge, "verify_slurm_setup_impl", fake_verify)
+    monkeypatch.setattr(bridge, "verify_docker_setup_impl", lambda: {"ok": True})
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kw: subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="dry-run ok\n",
+            stderr="",
+        ),
+    )
+
+    bridge.submit_job_impl(
+        yaml_path="ok.yaml",
+        hf_local=None,
+        cluster_host="cluster.example.com",
+        cluster_user="alice",
+        identity=None,
+        job_dir=None,
+        job_name=None,
+        extra_overrides=None,
+        skip_verify=False,  # would normally trigger verify
+        dry_run=True,
+    )
+    assert verify_called["n"] == 0  # verify_setup never invoked in dry-run
+
+
+# ---------------------------------------------------------------------------
+# job_status / job_logs — filesystem-based
+# ---------------------------------------------------------------------------
+
+
+def test_job_status_done_success(tmp_path, monkeypatch):
+    """_DONE marker + all task statuses succeeded → status='done'."""
+    exp = tmp_path / "experiments" / "exp_1781000000"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / "status_task_0.out").write_text("succeeded\n")
+    (exp / "status_task_1.out").write_text("succeeded\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.job_status_impl("exp_1781000000")
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert result["task_statuses"] == {"task_0": "succeeded", "task_1": "succeeded"}
+
+
+def test_job_status_failed_task(tmp_path, monkeypatch):
+    """_DONE marker + at least one task status contains 'fail' → status='failed'."""
+    exp = tmp_path / "experiments" / "exp_1781000001"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / "status_task_0.out").write_text("succeeded\n")
+    (exp / "status_task_1.out").write_text("failed (rc=1)\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.job_status_impl("exp_1781000001")
+    assert result["ok"] is True
+    assert result["status"] == "failed"
+    assert "failed" in result["task_statuses"]["task_1"]
+
+
+def test_job_status_running(tmp_path, monkeypatch):
+    """No _DONE marker → running."""
+    exp = tmp_path / "experiments" / "exp_1781000002"
+    exp.mkdir(parents=True)
+    (exp / "status_task_0.out").write_text("running\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.job_status_impl("exp_1781000002")
+    assert result["ok"] is True
+    assert result["status"] == "running"
+    assert result["has_done_marker"] is False
+
+
+def test_job_status_nested_nemo_title_dir(tmp_path, monkeypatch):
+    """nemo_run stores experiments under experiments/<title>/<experiment_id>."""
+    exp = tmp_path / "experiments" / "cicd" / "exp_1781000006"
+    exp.mkdir(parents=True)
+    (exp / "status_task_0.out").write_text("running\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.job_status_impl("exp_1781000006")
+    assert result["ok"] is True
+    assert result["experiment_dir"] == str(exp)
+    assert result["status"] == "running"
+
+
+def test_job_status_slurm_sidecar_overrides_local_done_marker(tmp_path, monkeypatch):
+    """Detached Slurm jobs are not done until Slurm says they are done."""
+    exp = tmp_path / "experiments" / "cicd" / "exp_slurm_running"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / bridge._SLURM_STATUS_META).write_text(
+        json.dumps(
+            {
+                "executor": "slurm",
+                "experiment_id": "exp_slurm_running",
+                "slurm_job_id": "12345",
+                "cluster_host": "cluster.example.com",
+                "cluster_user": "alice",
+            }
+        )
+    )
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    def fake_run(argv, **kwargs):
+        assert argv[:2] == ["ssh", "-o"]
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=("JobID|State|ExitCode|Elapsed|NodeList\n12345|RUNNING|0:0|00:00:30|node001\n"),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.job_status_impl("exp_slurm_running")
+
+    assert result["ok"] is True
+    assert result["status"] == "running"
+    assert result["has_done_marker"] is True
+    assert result["slurm_status"]["slurm_state"] == "RUNNING"
+
+
+def test_job_status_slurm_sidecar_reports_terminal_state(tmp_path, monkeypatch):
+    """Slurm terminal state becomes the MCP terminal status."""
+    exp = tmp_path / "experiments" / "cicd" / "exp_slurm_done"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / bridge._SLURM_STATUS_META).write_text(
+        json.dumps(
+            {
+                "executor": "slurm",
+                "experiment_id": "exp_slurm_done",
+                "slurm_job_id": "12346",
+                "cluster_host": "cluster.example.com",
+                "cluster_user": "alice",
+            }
+        )
+    )
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=(
+                "JobID|State|ExitCode|Elapsed|NodeList\n12346|COMPLETED|0:0|00:02:42|node001\n"
+            ),
+            stderr="",
+        ),
+    )
+
+    result = bridge.job_status_impl("exp_slurm_done")
+
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert result["slurm_status"]["slurm_exit_code"] == "0:0"
+
+
+def test_job_status_slurm_not_found_falls_back_to_local_done_marker(tmp_path, monkeypatch):
+    """Aged-out Slurm records should not make completed local experiments run forever."""
+    exp = tmp_path / "experiments" / "cicd" / "exp_slurm_aged_out"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / bridge._SLURM_STATUS_META).write_text(
+        json.dumps(
+            {
+                "executor": "slurm",
+                "experiment_id": "exp_slurm_aged_out",
+                "slurm_job_id": "12348",
+                "cluster_host": "cluster.example.com",
+                "cluster_user": "alice",
+            }
+        )
+    )
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        bridge,
+        "_query_slurm_status",
+        lambda meta: {
+            "ok": False,
+            "reason": "slurm_status_not_found",
+            "slurm_job_id": meta["slurm_job_id"],
+        },
+    )
+
+    result = bridge.job_status_impl("exp_slurm_aged_out")
+
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert result["slurm_status"]["reason"] == "slurm_status_not_found"
+
+
+def test_job_status_slurm_not_found_falls_back_to_local_failed_marker(tmp_path, monkeypatch):
+    """Aged-out Slurm records still preserve local task failure status."""
+    exp = tmp_path / "experiments" / "cicd" / "exp_slurm_aged_out_failed"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / "status_task_0.out").write_text("failed (rc=1)\n")
+    (exp / bridge._SLURM_STATUS_META).write_text(
+        json.dumps(
+            {
+                "executor": "slurm",
+                "experiment_id": "exp_slurm_aged_out_failed",
+                "slurm_job_id": "12349",
+                "cluster_host": "cluster.example.com",
+                "cluster_user": "alice",
+            }
+        )
+    )
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        bridge,
+        "_query_slurm_status",
+        lambda meta: {
+            "ok": False,
+            "reason": "slurm_status_not_found",
+            "slurm_job_id": meta["slurm_job_id"],
+        },
+    )
+
+    result = bridge.job_status_impl("exp_slurm_aged_out_failed")
+
+    assert result["ok"] is True
+    assert result["status"] == "failed"
+
+
+def test_job_status_launcher_experiments_fallback(tmp_path, monkeypatch):
+    """Resolve experiments under the installed launcher's package directory."""
+    launcher_dir = tmp_path / "launcher"
+    exp = launcher_dir / "experiments" / "cicd" / "exp_1781000007"
+    exp.mkdir(parents=True)
+    (exp / "status_task_0.out").write_text("running\n")
+    monkeypatch.delenv("NEMORUN_HOME", raising=False)
+    other_cwd = tmp_path / "other"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    monkeypatch.setattr(bridge, "_find_launcher_package_dir", lambda: launcher_dir)
+
+    result = bridge.job_status_impl("exp_1781000007")
+    assert result["ok"] is True
+    assert result["experiment_dir"] == str(exp)
+    assert result["status"] == "running"
+
+
+def test_job_status_rejects_unsafe_experiment_id():
+    """Experiment ids are path tokens, not filesystem paths or globs."""
+    result = bridge.job_status_impl("../exp_1781000008")
+    assert result["ok"] is False
+    assert result["reason"] == "invalid_experiment_id"
+
+
+def test_job_status_unknown_id(tmp_path, monkeypatch):
+    """No experiment dir matching the id → experiment_dir_not_found."""
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+    result = bridge.job_status_impl("does_not_exist")
+    assert result["ok"] is False
+    assert result["reason"] == "experiment_dir_not_found"
+
+
+def test_job_status_unknown_id_reports_launcher_fallback(tmp_path, monkeypatch):
+    """The not-found diagnostic stays in sync with the searched roots."""
+    launcher_dir = tmp_path / "launcher"
+    launcher_dir.mkdir()
+    monkeypatch.delenv("NEMORUN_HOME", raising=False)
+    monkeypatch.setattr(bridge, "_find_launcher_package_dir", lambda: launcher_dir)
+
+    result = bridge.job_status_impl("does_not_exist")
+
+    assert result["ok"] is False
+    assert result["reason"] == "experiment_dir_not_found"
+    assert str(launcher_dir / "experiments") in result["diagnostic"]
+
+
+def test_job_logs_all_tasks(tmp_path, monkeypatch):
+    """task=None returns logs for every log_*.out under the experiment dir."""
+    exp = tmp_path / "experiments" / "exp_1781000003"
+    exp.mkdir(parents=True)
+    (exp / "log_task_0.out").write_text("hello\nworld\n")
+    (exp / "log_task_1.out").write_text("done\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.job_logs_impl("exp_1781000003", task=None, tail=None)
+    assert result["ok"] is True
+    assert set(result["logs"].keys()) == {"task_0", "task_1"}
+    assert "hello" in result["logs"]["task_0"]
+
+
+def test_job_logs_with_tail(tmp_path, monkeypatch):
+    """tail=N returns only the last N lines per task."""
+    exp = tmp_path / "experiments" / "exp_1781000004"
+    exp.mkdir(parents=True)
+    (exp / "log_task_0.out").write_text("line1\nline2\nline3\nline4\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.job_logs_impl("exp_1781000004", task="task_0", tail=2)
+    assert result["ok"] is True
+    body = result["logs"]["task_0"]
+    assert body.splitlines() == ["line3", "line4"]
+
+
+def test_job_logs_missing_task(tmp_path, monkeypatch):
+    """Requested task name has no log file → task_log_not_found."""
+    exp = tmp_path / "experiments" / "exp_1781000005"
+    exp.mkdir(parents=True)
+    (exp / "log_task_0.out").write_text("only task 0\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.job_logs_impl("exp_1781000005", task="task_99", tail=None)
+    assert result["ok"] is False
+    assert result["reason"] == "task_log_not_found"
+
+
+def test_job_logs_rejects_unsafe_experiment_id():
+    """job_logs applies the same experiment-id validation as job_status."""
+    result = bridge.job_logs_impl("exp_*", task=None, tail=None)
+    assert result["ok"] is False
+    assert result["reason"] == "invalid_experiment_id"
+
+
+# ---------------------------------------------------------------------------
+# wait_for_experiment
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_experiment_returns_terminal_immediately(tmp_path, monkeypatch):
+    """If the experiment is already terminal, return without polling."""
+    exp = tmp_path / "experiments" / "exp_already_done"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / "status_task_0.out").write_text("succeeded\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.wait_for_experiment_impl(
+        "exp_already_done",
+        timeout_sec=10,
+        poll_interval_sec=1,
+    )
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert result["waited_seconds"] < 1  # didn't actually wait
+
+
+@pytest.mark.parametrize(
+    ("task_status", "native_status", "metric"),
+    [("succeeded", "FINISHED", 1.0), ("failed", "FAILED", 0.0)],
+)
+def test_finalize_mlflow_run_uploads_launcher_logs(
+    tmp_path, monkeypatch, task_status, native_status, metric
+):
+    """Real MLflow storage preserves terminal status and exact artifact contents."""
+    mlflow = pytest.importorskip("mlflow")
+    uri = f"sqlite:///{tmp_path / 'tracking.db'}"
+    client = mlflow.tracking.MlflowClient(tracking_uri=uri)
+    experiment_id = client.create_experiment(
+        "mcp-tests", artifact_location=(tmp_path / "artifacts").as_uri()
+    )
+    run_id = client.create_run(experiment_id).info.run_id
+    exp = tmp_path / "experiments" / "exp_done"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / "status_task_0.out").write_text(task_status + "\n")
+    (exp / "log_task_0.out").write_text("hello from slurm\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.finalize_mlflow_run_impl(
+        experiment_id="exp_done",
+        mlflow_run_id=run_id,
+        tracking_uri=uri,
+        fetch_remote_logs=False,
+    )
+
+    assert result["ok"] is True
+    run = client.get_run(run_id)
+    assert run.info.status == native_status
+    assert run.data.metrics["result"] == metric
+    assert run.data.tags["lifecycle"] == "finalized"
+    assert set(result["uploaded_artifacts"]) == {"_DONE", "log_task_0.out", "status_task_0.out"}
+    log_path = client.download_artifacts(run_id, "logs/log_task_0.out")
+    assert Path(log_path).read_text() == "hello from slurm\n"
+
+
+def test_finalize_mlflow_run_fetches_nemo_logs_before_upload(tmp_path, monkeypatch):
+    """Terminal finalization fetches Nemo logs and uploads the fetched files."""
+    exp = tmp_path / "experiments" / "exp_done"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / "status_task_0.out").write_text("succeeded\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    fetch_calls = []
+
+    def fake_fetch_single(*, experiment_id, job_idx, target, timeout_sec=120):
+        fetch_calls.append(
+            {
+                "experiment_id": experiment_id,
+                "job_idx": job_idx,
+                "target": target,
+                "timeout_sec": timeout_sec,
+            }
+        )
+        target.write_text(f"log for task {job_idx}\n")
+        return {"ok": True}
+
+    calls: list[tuple[Any, ...]] = []
+
+    class _Client:
+        def log_param(self, run_id, key, value):
+            calls.append(("param", key, value))
+
+        def log_metric(self, run_id, key, value):
+            calls.append(("metric", key, value))
+
+        def set_tag(self, run_id, key, value):
+            calls.append(("tag", key, value))
+
+        def log_artifact(self, run_id, path, artifact_path=None):
+            calls.append(("artifact", path, artifact_path))
+
+        def set_terminated(self, run_id, status):
+            calls.append(("terminated", run_id, status))
+
+    fake_mlflow = SimpleNamespace(tracking=SimpleNamespace(MlflowClient=lambda **kwargs: _Client()))
+    monkeypatch.setattr(bridge, "_fetch_single_nemo_log_to_file", fake_fetch_single)
+    monkeypatch.setattr(bridge, "_setup_mlflow", lambda: (fake_mlflow, None))
+
+    result = bridge.finalize_mlflow_run_impl(
+        experiment_id="exp_done",
+        mlflow_run_id="run-123",
+        tracking_uri="https://mlflow.example",
+        task_count=2,
+    )
+
+    assert result["ok"] is True
+    assert result["log_fetch"] == {
+        "fetched_artifacts": ["nemo_logs_task_0.log", "nemo_logs_task_1.log"],
+        "errors": [],
+    }
+    assert (exp / "nemo_logs_task_0.log").read_text() == "log for task 0\n"
+    assert (exp / "nemo_logs_task_1.log").read_text() == "log for task 1\n"
+    assert [call["job_idx"] for call in fetch_calls] == [0, 1]
+    assert all(call["timeout_sec"] <= 120 for call in fetch_calls)
+    uploaded = {(Path(item[1]).name, item[2]) for item in calls if item[0] == "artifact"}
+    assert {("nemo_logs_task_0.log", "logs"), ("nemo_logs_task_1.log", "logs")} <= uploaded
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_fetch_single_nemo_log_captures_full_streams(monkeypatch, tmp_path, exit_code):
+    """Both readers use the resolved home; archives retain untruncated streams."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path / "wrong-home"))
+    exp = tmp_path / "experiments" / "cicd" / "exp_done"
+    exp.mkdir(parents=True)
+    script = tmp_path / "nemo"
+    script.write_text(
+        f"#!{sys.executable}\nimport os, sys\n"
+        f"assert os.environ['NEMORUN_HOME'] == {str(tmp_path)!r}\n"
+        "print('stdout-' + 'o' * 9000)\nprint('stderr-' + 'e' * 9000, file=sys.stderr)\n"
+        f"sys.exit({exit_code})\n"
+    )
+    script.chmod(0o700)
+    monkeypatch.setattr(shutil, "which", lambda _: str(script))
+    target = exp / "nemo_logs_task_0.log"
+    result = bridge._fetch_single_nemo_log_to_file(
+        experiment_id="exp_done", job_idx=0, target=target
+    )
+
+    assert result["ok"] is (exit_code == 0)
+    assert "stdout-" in target.read_text()
+    assert "stderr-" in target.read_text()
+    assert len(target.read_text()) > 18000
+    if exit_code:
+        assert result["reason"] == "logs_fetch_failed"
+        assert len(result["diagnostic"]) <= 8192
+
+
+def test_fetch_nemo_logs_treats_zero_task_count_as_unknown(tmp_path, monkeypatch):
+    """An empty local status map should still fetch task 0 after terminal status."""
+    exp = tmp_path / "experiments" / "exp_done"
+    exp.mkdir(parents=True)
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    calls = []
+
+    def fake_fetch_single(*, experiment_id, job_idx, target, timeout_sec=120):
+        calls.append(job_idx)
+        target.write_text("task 0 log\n")
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge, "_fetch_single_nemo_log_to_file", fake_fetch_single)
+
+    result = bridge._fetch_nemo_logs_to_experiment_dir(
+        experiment_id="exp_done",
+        exp_dir=exp,
+        task_count=0,
+    )
+
+    assert result == {"fetched_artifacts": ["nemo_logs_task_0.log"], "errors": []}
+    assert calls == [0]
+
+
+def test_fetch_nemo_logs_enforces_overall_deadline(tmp_path, monkeypatch):
+    """Finalization should stop scheduling task fetches after the total budget."""
+    exp = tmp_path / "experiments" / "exp_done"
+    exp.mkdir(parents=True)
+    times = iter([0.0, 0.0, 2.0])
+    calls = []
+
+    def fake_fetch_single(*, experiment_id, job_idx, target, timeout_sec=120):
+        calls.append((job_idx, timeout_sec))
+        target.write_text("task log\n")
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(bridge, "_infer_nemo_log_task_count", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(bridge, "_fetch_single_nemo_log_to_file", fake_fetch_single)
+
+    result = bridge._fetch_nemo_logs_to_experiment_dir(
+        experiment_id="exp_done",
+        exp_dir=exp,
+        max_total_sec=1,
+    )
+
+    assert result["fetched_artifacts"] == ["nemo_logs_task_0.log"]
+    assert calls == [(0, 1.0)]
+    assert result["errors"][0]["job_idx"] == 1
+    assert result["errors"][0]["reason"] == "logs_fetch_timeout"
+
+
+def test_mlflow_artifacts_skip_symlinks_and_snapshot_regular_files(tmp_path):
+    """MLflow upload candidates must not follow job-created symlinks."""
+    exp = tmp_path / "experiments" / "exp_done"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").write_text("")
+    (exp / "log_task_0.out").write_text("safe\n")
+    (exp / "log_task_1.out").symlink_to(tmp_path / "outside.log")
+    (tmp_path / "outside.log").write_text("secret\n")
+    snapshot_dir = tmp_path / "snapshots"
+    snapshot_dir.mkdir()
+
+    files = bridge._mlflow_artifact_files(exp)
+    snapshots = bridge._snapshot_mlflow_artifacts(exp, snapshot_dir)
+
+    assert {path.name for path in files} == {"_DONE", "log_task_0.out"}
+    assert {path.name for path in snapshots} == {"_DONE", "log_task_0.out"}
+    assert (snapshot_dir / "log_task_0.out").read_text() == "safe\n"
+    assert not (snapshot_dir / "log_task_1.out").exists()
+
+
+def test_nemo_log_writer_rejects_existing_symlink(tmp_path):
+    """Log capture must not truncate a symlink target controlled by the job."""
+    outside = tmp_path / "outside.log"
+    outside.write_text("keep me\n")
+    target = tmp_path / "nemo_logs_task_0.log"
+    target.symlink_to(outside)
+
+    with pytest.raises(OSError), bridge._open_no_follow_text_writer(target):
+        pass
+
+    assert outside.read_text() == "keep me\n"
+    assert bridge._read_text_tail(target) == ""
+
+
+def test_finalize_mlflow_run_rejects_invalid_experiment_id():
+    """finalize_mlflow_run is an external boundary and validates ids itself."""
+    result = bridge.finalize_mlflow_run_impl(
+        experiment_id="../secret",
+        mlflow_run_id="run-123",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "invalid_experiment_id"
+    assert result["mlflow_run_id"] == "run-123"
+
+
+def test_finalize_mlflow_run_rejects_non_terminal_experiment(tmp_path, monkeypatch):
+    """Standalone finalization should not mark running experiments as finalized."""
+    exp = tmp_path / "experiments" / "exp_running"
+    exp.mkdir(parents=True)
+    (exp / "status_task_0.out").write_text("running\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.finalize_mlflow_run_impl(
+        experiment_id="exp_running",
+        mlflow_run_id="run-123",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "experiment_not_terminal"
+    assert result["status"] == "running"
+
+
+def test_wait_for_experiment_can_finalize_mlflow(tmp_path, monkeypatch):
+    """wait_for_experiment(..., finalize_mlflow=True) delegates finalization at terminal."""
+    exp = tmp_path / "experiments" / "exp_done"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / "status_task_0.out").write_text("succeeded\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    seen = {}
+
+    def fake_finalize(**kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "mlflow_run_id": kwargs["mlflow_run_id"]}
+
+    monkeypatch.setattr(bridge, "finalize_mlflow_run_impl", fake_finalize)
+    result = bridge.wait_for_experiment_impl(
+        "exp_done",
+        timeout_sec=10,
+        poll_interval_sec=1,
+        finalize_mlflow=True,
+        mlflow_run_id="run-123",
+        mlflow_tracking_uri="https://mlflow.example",
+    )
+
+    assert result["ok"] is True
+    assert result["mlflow_finalize"]["ok"] is True
+    assert seen == {
+        "experiment_id": "exp_done",
+        "mlflow_run_id": "run-123",
+        "tracking_uri": "https://mlflow.example",
+        "status": "done",
+        "task_count": 1,
+    }
+
+
+def test_wait_for_experiment_polls_until_done(tmp_path, monkeypatch):
+    """Spin through running → done."""
+    exp = tmp_path / "experiments" / "exp_in_flight"
+    exp.mkdir(parents=True)
+    (exp / "status_task_0.out").write_text("running\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    # Flip the marker after 2 polls via a counter side-effect
+    call_count = {"n": 0}
+    real_status = bridge.job_status_impl
+
+    def fake_status(experiment_id):
+        call_count["n"] += 1
+        if call_count["n"] >= 2:
+            (exp / "_DONE").touch()
+        return real_status(experiment_id)
+
+    monkeypatch.setattr(bridge, "job_status_impl", fake_status)
+    result = bridge.wait_for_experiment_impl(
+        "exp_in_flight",
+        timeout_sec=10,
+        poll_interval_sec=0,
+    )
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert call_count["n"] >= 2
+
+
+def test_wait_for_experiment_polls_slurm_despite_local_done_marker(tmp_path, monkeypatch):
+    """Detached Slurm local _DONE does not stop wait before Slurm is terminal."""
+    exp = tmp_path / "experiments" / "cicd" / "exp_slurm_wait"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / bridge._SLURM_STATUS_META).write_text(
+        json.dumps(
+            {
+                "executor": "slurm",
+                "experiment_id": "exp_slurm_wait",
+                "slurm_job_id": "12347",
+                "cluster_host": "cluster.example.com",
+                "cluster_user": "alice",
+            }
+        )
+    )
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    calls = {"n": 0}
+
+    def fake_run(argv, **kwargs):
+        calls["n"] += 1
+        state = "RUNNING" if calls["n"] == 1 else "COMPLETED"
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=(f"JobID|State|ExitCode|Elapsed|NodeList\n12347|{state}|0:0|00:00:30|node001\n"),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.wait_for_experiment_impl(
+        "exp_slurm_wait",
+        timeout_sec=10,
+        poll_interval_sec=0,
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert calls["n"] == 2
+
+
+def test_wait_for_experiment_timeout(tmp_path, monkeypatch):
+    """Never reaches terminal → wait_timeout with last_status."""
+    exp = tmp_path / "experiments" / "exp_stuck"
+    exp.mkdir(parents=True)
+    (exp / "status_task_0.out").write_text("running\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    result = bridge.wait_for_experiment_impl(
+        "exp_stuck",
+        timeout_sec=1,
+        poll_interval_sec=0,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "wait_timeout"
+    assert result["last_status"]["status"] == "running"
+
+
+def test_wait_for_experiment_passes_through_dir_not_found(tmp_path, monkeypatch):
+    """If the experiment dir doesn't exist, don't spin to timeout."""
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+    result = bridge.wait_for_experiment_impl(
+        "does_not_exist",
+        timeout_sec=60,
+        poll_interval_sec=0,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "experiment_dir_not_found"
+    # Bail out fast — not the full timeout
+    assert result["waited_seconds"] < 1
+
+
+# ---------------------------------------------------------------------------
+# provision_passwordless_ssh_dry_run
+# ---------------------------------------------------------------------------
+
+
+def test_provision_ssh_no_key_emits_keygen(tmp_path, monkeypatch):
+    """Missing private key → keygen command, step='keygen_required'."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".ssh").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("IDENTITY", raising=False)
+
+    result = bridge.provision_passwordless_ssh_dry_run_impl(
+        cluster_host="cw-dfw.example.com",
+        cluster_user="alice",
+        identity=None,
+    )
+    assert result["ok"] is True
+    assert result["step"] == "keygen_required"
+    assert "ssh-keygen" in result["commands"][0]
+    assert "ed25519" in result["commands"][0]
+    assert result["identity_path"].endswith(".ssh/id_ed25519")
+
+
+def test_provision_ssh_key_present_emits_copy_id(tmp_path, monkeypatch):
+    """Key + pubkey present → ssh-copy-id command + pubkey content."""
+    fake_home = tmp_path / "home"
+    ssh = fake_home / ".ssh"
+    ssh.mkdir(parents=True)
+    (ssh / "id_ed25519").write_text("PRIVKEY")
+    pubkey_content = "ssh-ed25519 AAAAC3NzaC... alice@host"
+    (ssh / "id_ed25519.pub").write_text(pubkey_content + "\n")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("IDENTITY", raising=False)
+
+    result = bridge.provision_passwordless_ssh_dry_run_impl(
+        cluster_host="cw-dfw.example.com",
+        cluster_user="alice",
+        identity=None,
+    )
+    assert result["ok"] is True
+    assert result["step"] == "ssh_copy_id_required"
+    assert "ssh-copy-id" in result["commands"][0]
+    assert "alice@cw-dfw.example.com" in result["commands"][0]
+    assert result["pubkey"] == pubkey_content
+    assert "verify_setup" in result["next_check"]
+
+
+def test_provision_ssh_priv_without_pub_surfaces_failure(tmp_path, monkeypatch):
+    """Private key but no .pub → pubkey_missing with recovery hint."""
+    fake_home = tmp_path / "home"
+    ssh = fake_home / ".ssh"
+    ssh.mkdir(parents=True)
+    (ssh / "id_ed25519").write_text("PRIVKEY")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("IDENTITY", raising=False)
+
+    result = bridge.provision_passwordless_ssh_dry_run_impl(
+        cluster_host="cw-dfw.example.com",
+        cluster_user="alice",
+        identity=None,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "pubkey_missing"
+    assert "ssh-keygen" in result["diagnostic"]
+
+
+def test_provision_ssh_explicit_identity_overrides_default(tmp_path, monkeypatch):
+    """Explicit identity arg wins over $IDENTITY and ~/.ssh/id_ed25519."""
+    explicit = tmp_path / "custom_key"
+    explicit.write_text("CUSTOM")
+    (tmp_path / "custom_key.pub").write_text("ssh-ed25519 AAAA alice\n")
+    monkeypatch.setenv("IDENTITY", "/wrong/path")  # should be ignored
+
+    result = bridge.provision_passwordless_ssh_dry_run_impl(
+        cluster_host="cw-dfw.example.com",
+        cluster_user="alice",
+        identity=str(explicit),
+    )
+    assert result["ok"] is True
+    assert result["identity_path"] == str(explicit)
+
+
+# ---------------------------------------------------------------------------
+# read_cluster_artifact — logs mode (subprocess mocked)
+# ---------------------------------------------------------------------------
+
+
+def test_read_cluster_artifact_logs_mode_ok(monkeypatch, tmp_path):
+    """path=None → wraps `nemo experiment logs <id> <job_idx>`."""
+    captured = {}
+    monkeypatch.setattr(shutil, "which", lambda command: f"/mcp/bin/{command}")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path / "wrong-home"))
+    (tmp_path / "experiments" / "cicd" / "cicd_42").mkdir(parents=True)
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="line 1\nline 2\nline 3\n",
+            stderr="remote log line\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.read_cluster_artifact_impl(
+        experiment_id="cicd_42",
+        path=None,
+        job_idx=0,
+    )
+    assert result["ok"] is True
+    assert result["mode"] == "logs"
+    assert "line 1" in result["content"]
+    assert "remote log line" in result["content"]
+    # Verify the wrapped command
+    assert captured["argv"] == [
+        "/mcp/bin/nemo",
+        "experiment",
+        "logs",
+        "cicd_42",
+        "0",
+    ]
+    assert captured["env"]["NEMORUN_HOME"] == str(tmp_path)
+
+
+def test_read_cluster_artifact_logs_mode_uses_interpreter_sibling(monkeypatch, tmp_path):
+    """Missing PATH entry falls back to the CLI beside the Python interpreter."""
+    captured = {}
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "experiments" / "cicd" / "cicd_42").mkdir(parents=True)
+    monkeypatch.setattr(shutil, "which", lambda _command: None)
+    monkeypatch.setattr(bridge.sys, "executable", "/venv/bin/python")
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="log", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.read_cluster_artifact_impl("cicd_42", None, 0)
+
+    assert result["ok"] is True
+    assert captured["argv"][0] == "/venv/bin/nemo"
+    assert captured["env"]["NEMORUN_HOME"] == str(tmp_path)
+
+
+@pytest.mark.parametrize("archive", [False, True])
+def test_nemo_log_readers_reject_noncanonical_home(monkeypatch, tmp_path, archive):
+    """A discovered launcher-only layout is not misrepresented as a Nemo home."""
+    monkeypatch.chdir(tmp_path)
+    exp = tmp_path / "local_experiments" / "cicd" / "cicd_42"
+    exp.mkdir(parents=True)
+    if archive:
+        result = bridge._fetch_single_nemo_log_to_file(
+            experiment_id="cicd_42", job_idx=0, target=exp / "nemo.log"
+        )
+    else:
+        result = bridge.read_cluster_artifact_impl("cicd_42", None, 0)
+    assert result["ok"] is False
+    assert result["reason"] == "experiment_layout_unsupported"
+
+
+def test_read_cluster_artifact_logs_mode_missing_cli(monkeypatch, tmp_path):
+    """Missing Nemo cli returns a structured failure instead of raising."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "experiments" / "cicd" / "cicd_42").mkdir(parents=True)
+    monkeypatch.setattr(shutil, "which", lambda _command: None)
+    monkeypatch.setattr(bridge.sys, "executable", "/venv/bin/python")
+
+    def fake_run(argv, **kwargs):
+        raise FileNotFoundError(argv[0])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.read_cluster_artifact_impl("cicd_42", None, 0)
+
+    assert result["ok"] is False
+    assert result["reason"] == "nemo_cli_not_found"
+    assert "/venv/bin/nemo" in result["diagnostic"]
+
+
+def test_read_cluster_artifact_logs_mode_preserves_both_streams(monkeypatch, tmp_path):
+    """Large stderr output cannot evict stdout from the returned excerpt."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "experiments" / "cicd" / "cicd_42").mkdir(parents=True)
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout="stdout-marker\n" + "o" * 5000,
+            stderr="stderr-marker\n" + "e" * 5000,
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.read_cluster_artifact_impl("cicd_42", None, 0)
+
+    assert result["ok"] is True
+    assert result["content"].startswith("o" * 4095)
+    assert result["content"].endswith("e" * 4096)
+    assert len(result["content"]) == 8192
+
+
+def test_read_cluster_artifact_logs_mode_subprocess_failed(monkeypatch, tmp_path):
+    """Nemo cli non-zero → structured logs_fetch_failed."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "experiments" / "cicd" / "cicd_42").mkdir(parents=True)
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=1,
+            stdout="",
+            stderr="experiment cicd_42 not found\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.read_cluster_artifact_impl(
+        experiment_id="cicd_42",
+        path=None,
+        job_idx=0,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "logs_fetch_failed"
+    assert result["exit_code"] == 1
+
+
+def test_read_cluster_artifact_logs_mode_timeout(monkeypatch, tmp_path):
+    """Hanging tunnel → structured logs_fetch_timeout, no exception."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "experiments" / "cicd" / "cicd_42").mkdir(parents=True)
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=60)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.read_cluster_artifact_impl(
+        experiment_id="cicd_42",
+        path=None,
+        job_idx=0,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "logs_fetch_timeout"
+
+
+@pytest.mark.parametrize(
+    ("experiment_id", "path", "reason"),
+    [
+        ("cicd_42; id", None, "invalid_experiment_id"),
+        ("cicd_42", "/etc/passwd", "invalid_path"),
+        ("cicd_42", "../../.ssh/id_rsa", "invalid_path"),
+    ],
+)
+def test_read_cluster_artifact_rejects_unsafe_args(experiment_id, path, reason):
+    """Non-token experiment ids, absolute paths and '..' are refused before any I/O."""
+    result = bridge.read_cluster_artifact_impl(experiment_id=experiment_id, path=path, job_idx=0)
+    assert result["ok"] is False
+    assert result["reason"] == reason
+
+
+def _fake_artifact_tunnel(monkeypatch, symlinks=None):
+    """Install a fake nemo_run experiment whose tunnel resolves paths via ``symlinks``."""
+    commands = []
+
+    class FakeTunnel:
+        job_dir = "/remote/exp/cicd/cicd_42"
+
+        def run(self, cmd, warn=False):
+            commands.append(cmd)
+            argv = shlex.split(cmd)
+            if argv[0] == "realpath":
+                return SimpleNamespace(
+                    stdout="\n".join((symlinks or {}).get(a, a) for a in argv[3:]), exited=0
+                )
+            return SimpleNamespace(stdout="content", exited=0)
+
+    # executor.job_dir is nemo_run's local copy and must not be used for the remote path.
+    executor = SimpleNamespace(tunnel=FakeTunnel(), job_dir="/local/exp/task")
+    exp = SimpleNamespace(tasks=[SimpleNamespace(executor=executor)])
+    experiment_mod = SimpleNamespace(Experiment=SimpleNamespace(from_id=lambda _: exp))
+    monkeypatch.setitem(sys.modules, "nemo_run.run.experiment", experiment_mod)
+    return commands
+
+
+def test_read_cluster_artifact_path_is_one_shell_word(monkeypatch):
+    """Shell metacharacters in path reach `cat` as a literal filename, not as commands."""
+    commands = _fake_artifact_tunnel(monkeypatch)
+    path = "x; touch /tmp/pwned $(whoami) #"
+    result = bridge.read_cluster_artifact_impl(experiment_id="cicd_42", path=path, job_idx=0)
+    assert result["ok"] is True
+    target = f"/remote/exp/cicd/cicd_42/{path}"
+    assert shlex.split(commands[0]) == ["realpath", "-e", "--", "/remote/exp/cicd/cicd_42", target]
+    assert shlex.split(commands[1]) == ["cat", "--", target]
+
+
+def test_read_cluster_artifact_rejects_symlink_escape(monkeypatch):
+    """A symlink inside the experiment dir that points outside it is not read."""
+    commands = _fake_artifact_tunnel(
+        monkeypatch, symlinks={"/remote/exp/cicd/cicd_42/link": "/home/user/.ssh/id_rsa"}
+    )
+    result = bridge.read_cluster_artifact_impl(experiment_id="cicd_42", path="link", job_idx=0)
+    assert result["ok"] is False
+    assert result["reason"] == "path_outside_experiment"
+    assert len(commands) == 1  # no cat issued
+
+
+# ---------------------------------------------------------------------------
+# open_draft_pr — subprocess mocked
+# ---------------------------------------------------------------------------
+
+
+def test_open_draft_pr_happy_path(monkeypatch, tmp_path):
+    """Git push ok → gh pr create ok → returns parsed pr_url."""
+    (tmp_path / ".git").mkdir()  # pretend it's a git repo
+
+    call_log = []
+
+    def fake_run(argv, **kwargs):
+        call_log.append(argv[0])
+        if argv[0] == "git":
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+        # gh pr create — return a typical PR URL on stdout
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=(
+                "Warning: 1 uncommitted change\n"
+                "https://github.com/NVIDIA/Model-Optimizer/pull/9999\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.open_draft_pr_impl(
+        target_repo="NVIDIA/Model-Optimizer",
+        title="test pr",
+        body="body text",
+        base_branch="main",
+        cwd=str(tmp_path),
+    )
+    assert result["ok"] is True
+    assert result["pr_url"] == "https://github.com/NVIDIA/Model-Optimizer/pull/9999"
+    assert call_log == ["git", "gh"]
+
+
+def test_open_draft_pr_not_a_git_repo(tmp_path):
+    """Cwd without .git → structured not_a_git_repo failure, no subprocess."""
+    result = bridge.open_draft_pr_impl(
+        target_repo="NVIDIA/Model-Optimizer",
+        title="x",
+        body="x",
+        base_branch="main",
+        cwd=str(tmp_path),
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "not_a_git_repo"
+
+
+def test_open_draft_pr_git_push_failed(monkeypatch, tmp_path):
+    """Git push non-zero → structured git_push_failed."""
+    (tmp_path / ".git").mkdir()
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "git":
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=128,
+                stdout="",
+                stderr="rejected: non-fast-forward\n",
+            )
+        pytest.fail(f"gh should not be called when git push fails; got {argv}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.open_draft_pr_impl(
+        target_repo="NVIDIA/Model-Optimizer",
+        title="x",
+        body="x",
+        base_branch="main",
+        cwd=str(tmp_path),
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "git_push_failed"
+
+
+def test_open_draft_pr_gh_failed_but_branch_pushed(monkeypatch, tmp_path):
+    """Gh pr create non-zero → reports branch_pushed=True so the operator can retry just the PR-open step."""
+    (tmp_path / ".git").mkdir()
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "git":
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=1,
+            stdout="",
+            stderr="resource not found: NVIDIA/Model-Optimizer\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = bridge.open_draft_pr_impl(
+        target_repo="NVIDIA/Model-Optimizer",
+        title="x",
+        body="x",
+        base_branch="main",
+        cwd=str(tmp_path),
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "gh_pr_create_failed"
+    assert result["branch_pushed"] is True

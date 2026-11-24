@@ -1,0 +1,187 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for ModelOptArgParser."""
+
+import argparse
+from dataclasses import field
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("transformers")
+
+from modelopt.torch.distill.plugins.huggingface import DistillArguments
+from modelopt.torch.opt.plugins.transformers import ModelOptArgParser, ModelOptHFArguments
+
+
+class _ModelArgs(ModelOptHFArguments):
+    model_name: str = field(default="test-model", metadata={"help": "The model name."})
+    hidden_size: int = field(default=128, metadata={"help": "Hidden size."})
+
+
+class _TrainArgs(ModelOptHFArguments):
+    learning_rate: float = field(default=1e-4, metadata={"help": "Learning rate."})
+    epochs: int = field(default=3, metadata={"help": "Number of epochs."})
+
+
+class _NewWarmupArgs(ModelOptHFArguments):
+    """transformers >= 5.15: only ``warmup_steps`` (a float; below 1 it is a ratio)."""
+
+    warmup_steps: float = field(default=0)
+
+
+class _OldWarmupArgs(ModelOptHFArguments):
+    """transformers < 5.15: a float ``warmup_steps`` plus ``warmup_ratio``."""
+
+    warmup_steps: float = field(default=0)
+    warmup_ratio: float = field(default=0.0)
+
+
+@pytest.mark.parametrize(
+    ("arg_type", "yaml", "expected"),
+    [
+        (_NewWarmupArgs, "warmup_ratio: 0.05\n", {"warmup_steps": 0.05}),
+        (_NewWarmupArgs, "warmup_steps: 0.05\n", {"warmup_steps": 0.05}),
+        (_OldWarmupArgs, "warmup_steps: 0.05\n", {"warmup_steps": 0.05, "warmup_ratio": 0.0}),
+        (_OldWarmupArgs, "warmup_ratio: 0.05\n", {"warmup_steps": 0, "warmup_ratio": 0.05}),
+    ],
+)
+def test_yaml_warmup_spelling_follows_transformers(tmp_path, arg_type, yaml, expected):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml)
+
+    (args,) = ModelOptArgParser((arg_type,)).parse_args_into_dataclasses(
+        args=["--config", str(config_file)]
+    )
+    assert {k: getattr(args, k) for k in expected} == expected
+
+
+class TestModelOptArgParser:
+    """Tests for ModelOptArgParser --config and --generate_docs features."""
+
+    @pytest.mark.parametrize(
+        "formatter_class",
+        [argparse.ArgumentDefaultsHelpFormatter, argparse.MetavarTypeHelpFormatter],
+    )
+    @pytest.mark.parametrize(
+        "entry_point", ["parse_args_into_dataclasses", "parse_args", "parse_known_args"]
+    )
+    def test_help_matches_entry_point(self, capsys, formatter_class, entry_point):
+        parser = ModelOptArgParser((_ModelArgs, _TrainArgs), formatter_class=formatter_class)
+        with pytest.raises(SystemExit) as exc_info:
+            getattr(parser, entry_point)(args=["--help"])
+        assert exc_info.value.code == 0
+        help_text = capsys.readouterr().out
+        dataclass_help = entry_point == "parse_args_into_dataclasses"
+        assert ("--config PATH" in help_text) == dataclass_help
+        assert ("--generate_docs [PATH]" in help_text) == dataclass_help
+        if dataclass_help and formatter_class is argparse.ArgumentDefaultsHelpFormatter:
+            docs_help = " ".join(help_text.split("--generate_docs [PATH]")[-1].split())
+            assert "(default: ARGUMENTS.md)" in docs_help
+            assert "(default: None)" not in docs_help
+        assert "--config" not in parser.format_help()
+        assert "--generate_docs" not in parser.format_help()
+
+    def test_distill_help_formats_loss_percentages(self, capsys):
+        parser = ModelOptArgParser((DistillArguments,))
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args_into_dataclasses(args=["--help"])
+        assert exc_info.value.code == 0
+        help_text = capsys.readouterr().out
+        assert "70% KD loss + 30% CE loss" in " ".join(help_text.split())
+
+    def test_cli_args_only(self):
+        parser = ModelOptArgParser((_ModelArgs, _TrainArgs))
+        model_args, train_args = parser.parse_args_into_dataclasses(
+            args=["--model_name", "my-model", "--learning_rate", "0.01"]
+        )
+        assert model_args.model_name == "my-model"
+        assert train_args.learning_rate == 0.01
+        assert train_args.epochs == 3  # default
+
+    def test_yaml_config(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("model_name: yaml-model\nepochs: 10\n")
+
+        parser = ModelOptArgParser((_ModelArgs, _TrainArgs))
+        model_args, train_args = parser.parse_args_into_dataclasses(
+            args=["--config", str(config_file)]
+        )
+        assert model_args.model_name == "yaml-model"
+        assert train_args.epochs == 10
+
+    def test_cli_overrides_yaml(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("model_name: yaml-model\nlearning_rate: 0.001\n")
+
+        parser = ModelOptArgParser((_ModelArgs, _TrainArgs))
+        model_args, train_args = parser.parse_args_into_dataclasses(
+            args=["--config", str(config_file), "--learning_rate", "0.01"]
+        )
+        assert model_args.model_name == "yaml-model"  # from yaml
+        assert train_args.learning_rate == 0.01  # CLI override
+
+    def test_empty_yaml_config(self, tmp_path):
+        config_file = tmp_path / "empty.yaml"
+        config_file.write_text("")
+
+        parser = ModelOptArgParser((_ModelArgs, _TrainArgs))
+        model_args, train_args = parser.parse_args_into_dataclasses(
+            args=["--config", str(config_file)]
+        )
+        assert model_args.model_name == "test-model"  # defaults
+        assert train_args.epochs == 3
+
+    def test_generate_docs(self, tmp_path):
+        output_path = tmp_path / "ARGUMENTS.md"
+        parser = ModelOptArgParser((_ModelArgs, _TrainArgs))
+
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args_into_dataclasses(args=["--generate_docs", str(output_path)])
+        assert exc_info.value.code == 0
+
+        content = output_path.read_text()
+        assert "## _ModelArgs" in content
+        assert "## _TrainArgs" in content
+        assert "--model_name" in content
+        assert "--learning_rate" in content
+        assert "--epochs" in content
+
+    def test_generate_docs_default_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        parser = ModelOptArgParser((_ModelArgs, _TrainArgs))
+
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args_into_dataclasses(args=["--generate_docs"])
+        assert exc_info.value.code == 0
+
+        content = Path("ARGUMENTS.md").read_text()
+        assert "# Argument Reference" in content
+
+    def test_docs_table_format(self, tmp_path):
+        output_path = tmp_path / "ARGUMENTS.md"
+        parser = ModelOptArgParser((_ModelArgs, _TrainArgs))
+
+        with pytest.raises(SystemExit):
+            parser.parse_args_into_dataclasses(args=["--generate_docs", str(output_path)])
+
+        content = output_path.read_text()
+        # Check table headers
+        assert "| Argument | Type | Default | Description |" in content
+        # Check a specific row
+        assert "`--model_name`" in content
+        assert '`"test-model"`' in content
+        assert "The model name." in content

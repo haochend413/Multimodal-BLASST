@@ -1,0 +1,882 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import sys
+from unittest.mock import Mock
+
+import numpy as np
+import onnx
+import onnx_graphsurgeon as gs
+import pytest
+from _test_utils.torch.vision_models import get_tiny_resnet_and_input
+from onnx.helper import (
+    make_graph,
+    make_model,
+    make_node,
+    make_opsetid,
+    make_tensor,
+    make_tensor_value_info,
+)
+from onnx_graphsurgeon.exporters.onnx_exporter import OnnxExporter
+
+import modelopt.onnx.utils as onnx_utils
+from modelopt.onnx.quantization.gs_patching import _export_tensor_proto, _export_value_info_proto
+from modelopt.onnx.trt_utils import load_onnx_model
+from modelopt.onnx.utils import (
+    clear_stale_value_info,
+    get_input_names_from_bytes,
+    get_output_names_from_bytes,
+    infer_types,
+    randomize_weights_onnx_bytes,
+    remove_node_training_mode,
+    remove_weights_data,
+    save_onnx_bytes_to_dir,
+    validate_onnx,
+)
+from modelopt.torch._deploy.utils import OnnxBytes, get_onnx_bytes_and_metadata
+
+
+@pytest.mark.parametrize("layout", ["flat", "local", "capture", "nested"])
+@pytest.mark.parametrize("value_type", ["sequence_type", "optional_type"])
+def test_export_onnx_large_initializer_metadata(monkeypatch, tmp_path, layout, value_type):
+    monkeypatch.setattr(OnnxExporter, "export_tensor_proto", _export_tensor_proto)
+    monkeypatch.setattr(OnnxExporter, "export_value_info_proto", _export_value_info_proto)
+    weight = gs.Constant("weight", np.arange(2048, dtype=np.float16))
+    output = gs.Variable("output", dtype=np.float16, shape=[2048])
+    weight_node = gs.Node("Identity", inputs=[weight], outputs=[output])
+    if layout == "flat":
+        graph = gs.Graph(nodes=[weight_node], outputs=[output], opset=21)
+    else:
+        condition = gs.Variable("condition", dtype=np.bool_, shape=[])
+        branch = gs.Graph(nodes=[weight_node], outputs=[output], opset=21)
+        other = branch.copy()
+        other.nodes[0].inputs[0] = weight
+        result = gs.Variable("result", dtype=np.float16, shape=[2048])
+        graph = gs.Graph(
+            nodes=[
+                gs.Node(
+                    "If",
+                    inputs=[condition],
+                    outputs=[result],
+                    attrs={"then_branch": branch, "else_branch": other},
+                )
+            ],
+            inputs=[condition],
+            outputs=[result],
+            opset=21,
+        )
+        if layout == "capture":
+            outer = gs.Variable("outer", dtype=np.float16, shape=[2048])
+            graph.nodes.insert(0, gs.Node("Identity", inputs=[weight], outputs=[outer]))
+            graph.outputs.append(outer)
+        elif layout == "nested":
+            graph.inputs.clear()  # Both levels capture the enclosing condition.
+            nested_result = gs.Variable("nested_result", dtype=np.float16, shape=[2048])
+            graph = gs.Graph(
+                nodes=[
+                    gs.Node(
+                        "If",
+                        inputs=[condition],
+                        outputs=[nested_result],
+                        attrs={"then_branch": graph, "else_branch": graph.copy()},
+                    )
+                ],
+                inputs=[condition],
+                outputs=[nested_result],
+                opset=21,
+            )
+
+    # Sequence value_info is lost by GraphSurgeon copying, even without quantization.
+    value = gs.Variable("value", dtype=np.float32, shape=[1])
+    sequence = gs.Variable("sequence", dtype=np.float32, shape=[1])
+    sequence.type = value_type
+    is_sequence = value_type == "sequence_type"
+    length = gs.Variable("length", dtype=np.int64 if is_sequence else np.bool_, shape=[])
+    graph.inputs.append(value)
+    graph.nodes.extend(
+        [
+            gs.Node(
+                "SequenceConstruct" if is_sequence else "Optional",
+                inputs=[value],
+                outputs=[sequence],
+            ),
+            gs.Node(
+                "SequenceLength" if is_sequence else "OptionalHasElement",
+                inputs=[sequence],
+                outputs=[length],
+            ),
+        ]
+    )
+    graph.outputs.append(length)
+    expected_type = onnx.helper.make_tensor_type_proto(onnx.TensorProto.FLOAT, [1])
+    wrap_type = (
+        onnx.helper.make_sequence_type_proto
+        if is_sequence
+        else onnx.helper.make_optional_type_proto
+    )
+    expected_type = wrap_type(expected_type)
+    with monkeypatch.context() as patch:
+        patch.setattr(onnx.checker, "MAXIMUM_PROTOBUF", 1024)
+        model = onnx_utils.export_onnx(graph)
+    assert next(v.type for v in model.graph.value_info if v.name == "sequence") == expected_type
+    branches = [a.g for n in model.graph.node for a in n.attribute if a.HasField("g")]
+    if layout in ("local", "nested"):
+        assert not model.graph.initializer
+        if layout == "nested":
+            assert all(not branch.initializer for branch in branches)
+            branches = [
+                a.g
+                for branch in branches
+                for n in branch.node
+                for a in n.attribute
+                if a.HasField("g")
+            ]
+        assert len(branches) == (4 if layout == "nested" else 2)
+        initializers = [b.initializer[0] for b in branches]
+    else:
+        assert all(not b.initializer for b in branches)
+        assert len(model.graph.initializer) == 1
+        initializers = list(model.graph.initializer)
+    for tensor in initializers:
+        np.testing.assert_array_equal(onnx.numpy_helper.to_array(tensor), weight.values)
+    assert sequence.type == value_type
+    assert isinstance(weight, gs.Constant)
+    path = str(tmp_path / "model.onnx")
+    onnx_utils.save_onnx(model, path, save_as_external_data=True)
+    onnx.checker.check_model(path)
+
+
+def test_export_onnx_large_initializer_explicit_dtype(monkeypatch):
+    # Exercise the real ModelOpt exporter without leaking its global patches to other tests.
+    with monkeypatch.context() as patch:
+        patch.setattr(OnnxExporter, "export_tensor_proto", _export_tensor_proto)
+        patch.setattr(OnnxExporter, "export_value_info_proto", _export_value_info_proto)
+        patch.setattr(onnx.checker, "MAXIMUM_PROTOBUF", 1024)
+        large = gs.Constant("large", np.ones(2048, dtype=np.float16))
+        small = gs.Constant("small", np.array([0x3F80], dtype=np.uint16))
+        small.explicit_dtype = onnx.TensorProto.BFLOAT16
+        out = gs.Variable("small_out", dtype=np.uint16, shape=[1])
+        out.explicit_dtype = onnx.TensorProto.BFLOAT16
+        large_out = gs.Variable("large_out", dtype=np.float16, shape=[2048])
+        graph = gs.Graph(
+            nodes=[
+                gs.Node("Identity", inputs=[large], outputs=[large_out]),
+                gs.Node("Identity", inputs=[small], outputs=[out]),
+            ],
+            outputs=[large_out, out, small],
+            opset=21,
+        )
+        model = onnx_utils.export_onnx(graph)
+    assert (
+        next(t for t in model.graph.initializer if t.name == "small").data_type
+        == onnx.TensorProto.BFLOAT16
+    )
+    assert all(
+        v.type.tensor_type.elem_type == onnx.TensorProto.BFLOAT16 for v in model.graph.output[1:]
+    )
+    onnx.checker.check_model(model)
+
+
+@pytest.mark.parametrize(
+    "onnx_bytes",
+    [None, b"", b"invalid onnx"],
+)
+def test_validate_onnx(onnx_bytes):
+    assert not validate_onnx(onnx_bytes)
+
+
+def test_save_onnx(tmp_path):
+    save_onnx_bytes_to_dir(b"test_onnx_bytes", tmp_path, "test")
+    assert os.path.exists(os.path.join(tmp_path, "test.onnx"))
+
+
+@pytest.mark.parametrize("size", [991, 1023, 1024])
+def test_save_onnx_external_data_threshold(tmp_path, size):
+    weight = np.arange(size, dtype=np.uint8)
+    model = make_model(
+        make_graph(
+            [make_node("Identity", ["weight"], ["output"])],
+            "external_data_threshold",
+            [],
+            [make_tensor_value_info("output", onnx.TensorProto.UINT8, [size])],
+            initializer=[onnx.numpy_helper.from_array(weight, "weight")],
+        ),
+        opset_imports=[make_opsetid("", 21)],
+    )
+    path = tmp_path / "model.onnx"
+
+    onnx_utils.save_onnx(model, str(path), save_as_external_data=True)
+
+    saved = onnx.load(path, load_external_data=False)
+    assert onnx.external_data_helper.uses_external_data(saved.graph.initializer[0]) == (
+        size >= 1024
+    )
+    assert (tmp_path / "model.onnx_data").exists() == (size >= 1024)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(onnx.load(path).graph.initializer[0]), weight
+    )
+    onnx.checker.check_model(str(path))
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("same_cwd", [False, True])
+def test_save_onnx_preserves_unloaded_external_data(tmp_path, monkeypatch, mixed, same_cwd):
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    path = model_dir / "model.onnx"
+    sidecar = model_dir / "model.onnx_data"
+    weight = np.arange(2048, dtype=np.float32)
+    model = make_model(
+        make_graph(
+            [make_node("Identity", ["weight"], ["output"])],
+            "external_weights",
+            [],
+            [make_tensor_value_info("output", onnx.TensorProto.FLOAT, [2048])],
+            initializer=[onnx.numpy_helper.from_array(weight, "weight")],
+        ),
+        opset_imports=[make_opsetid("", 21)],
+    )
+    monkeypatch.chdir(model_dir if same_cwd else tmp_path)
+    onnx.save_model(
+        model, path, save_as_external_data=True, location=sidecar.name, size_threshold=0
+    )
+    unloaded = onnx.load(path, load_external_data=False)
+    if mixed:
+        unloaded.graph.initializer.append(onnx.numpy_helper.from_array(weight + 1, "new_weight"))
+        unloaded.graph.node.append(make_node("Identity", ["new_weight"], ["new_output"]))
+        unloaded.graph.output.append(
+            make_tensor_value_info("new_output", onnx.TensorProto.FLOAT, [2048])
+        )
+    original_graph = unloaded.graph.SerializeToString()
+
+    onnx_utils.save_onnx(unloaded, str(path), save_as_external_data=True)
+
+    onnx.checker.check_model(str(path))
+    loaded = onnx.load(path)
+    for i, tensor in enumerate(loaded.graph.initializer):
+        np.testing.assert_array_equal(onnx.numpy_helper.to_array(tensor), weight + i)
+    assert sidecar.read_bytes() == weight.tobytes() + ((weight + 1).tobytes() if mixed else b"")
+    assert unloaded.graph.SerializeToString() == original_graph
+
+
+def _make_external_initializer(
+    name: str, location: str = "missing-shared-data.bin"
+) -> onnx.TensorProto:
+    initializer = onnx.TensorProto(name=name, data_type=onnx.TensorProto.FLOAT, dims=[1])
+    initializer.data_location = onnx.TensorProto.EXTERNAL
+    for key, value in [
+        ("location", location),
+        ("offset", "0"),
+        ("length", "4"),
+    ]:
+        entry = initializer.external_data.add()
+        entry.key = key
+        entry.value = value
+    return initializer
+
+
+def test_duplicate_shared_constants_preserves_and_materializes_external_data(tmp_path):
+    external_values = np.array([3.25], dtype=np.float32)
+    external_data_path = tmp_path / "shared.bin"
+    external_data_path.write_bytes(external_values.tobytes())
+    shared = _make_external_initializer("shared", external_data_path.name)
+    collision = make_tensor("shared_1", onnx.TensorProto.FLOAT, [1], [0.0])
+    sparse_collision = onnx.helper.make_sparse_tensor(
+        make_tensor("shared_2", onnx.TensorProto.FLOAT, [1], [0.0]),
+        make_tensor("", onnx.TensorProto.INT64, [1], [0]),
+        [1],
+    )
+    nodes = [
+        make_node("Add", ["input", "shared"], ["intermediate"]),
+        make_node("Add", ["intermediate", "shared"], ["output"]),
+    ]
+    graph = make_graph(
+        nodes,
+        "shared_external_initializer",
+        [
+            make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1]),
+            make_tensor_value_info("shared", onnx.TensorProto.FLOAT, [1]),
+        ],
+        [make_tensor_value_info("output", onnx.TensorProto.FLOAT, [1])],
+        initializer=[shared, collision],
+    )
+    graph.sparse_initializer.append(sparse_collision)
+    model = make_model(graph)
+
+    result, modified = onnx_utils.duplicate_shared_constants(model)
+
+    assert result is model
+    assert modified
+    duplicated_names = ("shared_3", "shared_4")
+    assert [node.input[1] for node in result.graph.node] == list(duplicated_names)
+    initializers = {initializer.name: initializer for initializer in result.graph.initializer}
+    assert set(initializers) == {"shared_1", *duplicated_names}
+    assert result.graph.sparse_initializer[0].values.name == "shared_2"
+    assert {graph_input.name for graph_input in result.graph.input} == {"input"}
+    for name in duplicated_names:
+        initializer = initializers[name]
+        assert initializer.data_location == onnx.TensorProto.EXTERNAL
+        assert [(entry.key, entry.value) for entry in initializer.external_data] == [
+            ("location", "shared.bin"),
+            ("offset", "0"),
+            ("length", "4"),
+        ]
+        assert not initializer.HasField("raw_data")
+
+    onnx.external_data_helper.load_external_data_for_model(result, str(tmp_path))
+    for name in duplicated_names:
+        np.testing.assert_array_equal(
+            onnx.numpy_helper.to_array(initializers[name]), external_values
+        )
+
+
+def test_duplicate_shared_constants_fast_path_returns_original_model():
+    shared = _make_external_initializer("single_use")
+    graph = make_graph(
+        [make_node("Add", ["input", "single_use"], ["output"])],
+        "single_external_initializer",
+        [make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1])],
+        [make_tensor_value_info("output", onnx.TensorProto.FLOAT, [1])],
+        initializer=[shared],
+    )
+    model = make_model(graph)
+    serialized_model = model.SerializeToString()
+
+    result, modified = onnx_utils.duplicate_shared_constants(model)
+
+    assert result is model
+    assert not modified
+    assert result.SerializeToString() == serialized_model
+
+
+def test_duplicate_shared_constants_retains_initializer_captured_by_subgraphs():
+    def make_branch(name):
+        output = make_tensor_value_info("branch_output", onnx.TensorProto.FLOAT, [1])
+        return make_graph([make_node("Identity", ["shared"], [output.name])], name, [], [output])
+
+    shared = make_tensor("shared", onnx.TensorProto.FLOAT, [1], [1.0])
+    nodes = [
+        make_node("Add", ["input", "shared"], ["left"]),
+        make_node("Add", ["input", "shared"], ["right"]),
+        make_node(
+            "If",
+            ["condition"],
+            ["branch_value"],
+            then_branch=make_branch("then_branch"),
+            else_branch=make_branch("else_branch"),
+        ),
+        make_node("Sum", ["left", "right", "branch_value"], ["output"]),
+    ]
+    graph = make_graph(
+        nodes,
+        "captured_initializer",
+        [
+            make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1]),
+            make_tensor_value_info("condition", onnx.TensorProto.BOOL, []),
+            make_tensor_value_info("shared", onnx.TensorProto.FLOAT, [1]),
+        ],
+        [make_tensor_value_info("output", onnx.TensorProto.FLOAT, [1])],
+        initializer=[shared],
+    )
+    model = make_model(graph, opset_imports=[make_opsetid("", 17)])
+
+    result, modified = onnx_utils.duplicate_shared_constants(model)
+
+    assert modified
+    assert [node.input[1] for node in result.graph.node[:2]] == ["shared_1", "shared_2"]
+    assert {initializer.name for initializer in result.graph.initializer} == {
+        "shared",
+        "shared_1",
+        "shared_2",
+    }
+    assert "shared" in {graph_input.name for graph_input in result.graph.input}
+    onnx.checker.check_model(result)
+
+
+def test_duplicate_shared_constants_retains_initializer_exposed_as_graph_output():
+    shared = make_tensor("shared", onnx.TensorProto.FLOAT, [1], [1.0])
+    graph = make_graph(
+        [
+            make_node("Add", ["input", "shared"], ["left"]),
+            make_node("Add", ["input", "shared"], ["right"]),
+        ],
+        "initializer_graph_output",
+        [make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1])],
+        [
+            make_tensor_value_info("left", onnx.TensorProto.FLOAT, [1]),
+            make_tensor_value_info("right", onnx.TensorProto.FLOAT, [1]),
+            make_tensor_value_info("shared", onnx.TensorProto.FLOAT, [1]),
+        ],
+        initializer=[shared],
+    )
+    model = make_model(graph)
+
+    result, modified = onnx_utils.duplicate_shared_constants(model)
+
+    assert modified
+    assert [node.input[1] for node in result.graph.node] == ["shared_1", "shared_2"]
+    assert {initializer.name for initializer in result.graph.initializer} == {
+        "shared",
+        "shared_1",
+        "shared_2",
+    }
+    assert [output.name for output in result.graph.output] == ["left", "right", "shared"]
+    onnx.checker.check_model(result)
+
+
+@pytest.mark.parametrize(
+    ("model_size", "expected"),
+    [
+        (1, False),
+        (onnx.checker.MAXIMUM_PROTOBUF - sys.getsizeof(b""), False),
+        (onnx.checker.MAXIMUM_PROTOBUF - sys.getsizeof(b"") + 1, True),
+        (0, True),
+        (ValueError("model size unavailable"), True),
+    ],
+)
+def test_is_model_too_large_for_protobuf(model_size, expected):
+    model = Mock()
+    if isinstance(model_size, Exception):
+        model.ByteSize.side_effect = model_size
+    else:
+        model.ByteSize.return_value = model_size
+    assert onnx_utils.is_model_too_large_for_protobuf(model) is expected
+
+
+def make_onnx_model_for_matmul_op():
+    input_left = np.array([1, 2])
+    input_right = np.array([1, 3])
+    output_shape = np.matmul(input_left, input_right).shape
+    node = make_node("MatMul", ["X", "Y"], ["Z"], name="matmul")
+    graph = make_graph(
+        [node],
+        "test_graph",
+        [
+            make_tensor_value_info("X", onnx.TensorProto.FLOAT, input_left.shape),
+            make_tensor_value_info("Y", onnx.TensorProto.FLOAT, input_right.shape),
+        ],
+        [make_tensor_value_info("Z", onnx.TensorProto.FLOAT, output_shape)],
+    )
+    model = make_model(graph, producer_name="Omniengine Tester")
+    return model.SerializeToString()
+
+
+def test_input_names():
+    model_bytes = make_onnx_model_for_matmul_op()
+    input_names = get_input_names_from_bytes(model_bytes)
+    assert input_names == ["X", "Y"]
+
+
+def test_output_names():
+    model_bytes = make_onnx_model_for_matmul_op()
+    output_names = get_output_names_from_bytes(model_bytes)
+    assert output_names == ["Z"]
+
+
+def _get_avg_var_of_weights(model):
+    inits = model.graph.initializer
+    avg_var_dict = {}
+
+    for init in inits:
+        if len(init.dims) > 1:
+            dtype = onnx.helper.tensor_dtype_to_np_dtype(init.data_type)
+            if dtype in ["float16", "float32", "float64"]:
+                np_tensor = np.frombuffer(init.raw_data, dtype=dtype)
+                avg_var_dict[init.name + "_avg"] = np.average(np_tensor)
+                avg_var_dict[init.name + "_var"] = np.var(np_tensor)
+
+    return avg_var_dict
+
+
+def test_random_onnx_weights():
+    model, args, kwargs = get_tiny_resnet_and_input()
+    assert not kwargs
+
+    onnx_bytes, _ = get_onnx_bytes_and_metadata(model, args)
+    onnx_bytes_obj = OnnxBytes.from_bytes(onnx_bytes)
+    model_bytes = onnx_bytes_obj.get_onnx_model_file_bytes()
+    model = onnx.load_from_string(model_bytes)
+
+    original_avg_var_dict = _get_avg_var_of_weights(model)
+    original_model_size = len(model_bytes)
+
+    onnx_model_wo_weights = remove_weights_data(model_bytes)
+    # Removed model weights should be greater than 18 MB
+    assert original_model_size - len(onnx_model_wo_weights) > 18e6
+
+    # After assigning random weights, model size should be slightly greater than the original
+    # size due to some extra metadata
+    onnx_model_randomized = randomize_weights_onnx_bytes(onnx_model_wo_weights)
+    assert len(onnx_model_randomized) > original_model_size
+
+    randomized_avg_var_dict = _get_avg_var_of_weights(onnx.load_from_string(onnx_model_randomized))
+    for key, value in original_avg_var_dict.items():
+        assert abs(value - randomized_avg_var_dict[key]) < 0.1
+
+
+def test_reproducible_random_weights():
+    model, args, kwargs = get_tiny_resnet_and_input()
+    assert not kwargs
+
+    onnx_bytes, _ = get_onnx_bytes_and_metadata(model, args)
+    onnx_bytes_obj = OnnxBytes.from_bytes(onnx_bytes)
+    model_bytes = onnx_bytes_obj.get_onnx_model_file_bytes()
+    model = onnx.load_from_string(model_bytes)
+
+    # Check if the randomization produces the same weights
+    onnx_bytes_1 = randomize_weights_onnx_bytes(model_bytes)
+    onnx_bytes_2 = randomize_weights_onnx_bytes(model_bytes)
+    assert onnx_bytes_1 == onnx_bytes_2
+
+
+def _make_bn_initializer(name: str, shape, value=1.0):
+    """Helper to create an initializer tensor for BatchNorm."""
+    data = np.full(shape, value, dtype=np.float32)
+    return make_tensor(name, onnx.TensorProto.FLOAT, shape, data.flatten())
+
+
+def _make_batchnorm_model(bn_node, extra_value_infos=None):
+    """Helper to create an ONNX model with a BatchNormalization node.
+
+    The created model has the following schematic structure:
+
+        graph name: "test_graph"
+          inputs:
+            - input: FLOAT [1, 3, 224, 224]
+          initializers:
+            - scale: FLOAT [3]
+            - bias:  FLOAT [3]
+            - mean:  FLOAT [3]
+            - var:   FLOAT [3]
+          nodes:
+            - BatchNormalization (name comes from `bn_node`), with:
+                inputs  = ["input", "scale", "bias", "mean", "var"]
+                outputs = as provided by `bn_node` (e.g., ["output"], or
+                          ["output", "running_mean", "running_var", "saved_mean"])
+          outputs:
+            - output: FLOAT [1, 3, 224, 224]
+
+    If `extra_value_infos` is provided (e.g., value_info for non-training outputs
+    like "running_mean"/"running_var" and/or training-only outputs like
+    "saved_mean"/"saved_inv_std"), they are attached to the graph's value_info.
+    Some tests subsequently invoke utilities (e.g., remove_node_training_mode)
+    that prune training-only outputs and their value_info entries, while keeping
+    regular outputs such as "running_mean" and "running_var" intact.
+    """
+    initializers = [
+        _make_bn_initializer("scale", [3], 1.0),
+        _make_bn_initializer("bias", [3], 0.0),
+        _make_bn_initializer("mean", [3], 0.0),
+        _make_bn_initializer("var", [3], 1.0),
+    ]
+
+    graph_outputs = []
+    for output_name, shape in [
+        ("output", [1, 3, 224, 224]),
+        ("running_mean", [3]),
+        ("running_var", [3]),
+    ]:
+        if output_name in bn_node.output:
+            graph_outputs.append(make_tensor_value_info(output_name, onnx.TensorProto.FLOAT, shape))
+
+    graph_def = make_graph(
+        [bn_node],
+        "test_graph",
+        [make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1, 3, 224, 224])],
+        graph_outputs,
+        initializer=initializers,
+        value_info=extra_value_infos or [],
+    )
+
+    return make_model(graph_def, opset_imports=[make_opsetid("", 14)])
+
+
+def test_remove_node_training_mode_attribute():
+    """Test removal of training_mode attribute from BatchNormalization nodes."""
+    bn_node = make_node(
+        "BatchNormalization",
+        inputs=["input", "scale", "bias", "mean", "var"],
+        outputs=["output"],
+        name="bn1",
+        training_mode=1,  # This attribute should be removed
+    )
+
+    model = _make_batchnorm_model(bn_node)
+    result_model = remove_node_training_mode(model, "BatchNormalization")
+
+    bn_node_result = result_model.graph.node[0]
+    assert bn_node_result.op_type == "BatchNormalization"
+
+    # Check that training_mode attribute is not present
+    attr_names = [attr.name for attr in bn_node_result.attribute]
+    assert "training_mode" not in attr_names
+
+
+def test_remove_node_extra_training_outputs():
+    """Test removal of extra training outputs from BatchNormalization nodes."""
+    bn_node = make_node(
+        "BatchNormalization",
+        inputs=["input", "scale", "bias", "mean", "var"],
+        outputs=[
+            "output",
+            "running_mean",
+            "running_var",
+            "saved_mean",
+            "saved_inv_std",
+        ],
+        name="bn1",
+        training_mode=1,
+    )
+
+    # Extra training outputs are attached to the graph's value_info
+    value_infos = [
+        make_tensor_value_info("saved_mean", onnx.TensorProto.FLOAT, [3]),
+        make_tensor_value_info("saved_inv_std", onnx.TensorProto.FLOAT, [3]),
+    ]
+
+    model = _make_batchnorm_model(bn_node, extra_value_infos=value_infos)
+    result_model = remove_node_training_mode(model, "BatchNormalization")
+
+    # Verify only the non-training outputs remain
+    bn_node_result = result_model.graph.node[0]
+    print(bn_node_result.output)
+    assert len(bn_node_result.output) == 3
+    assert bn_node_result.output[0] == "output"
+    assert bn_node_result.output[1] == "running_mean"
+    assert bn_node_result.output[2] == "running_var"
+
+    # Verify value_info entries for removed outputs are cleaned up
+    value_info_names = [vi.name for vi in result_model.graph.value_info]
+    assert "saved_mean" not in value_info_names
+    assert "saved_inv_std" not in value_info_names
+
+
+def _make_matmul_relu_model(ir_version=12):
+    # Define your model inputs and outputs
+    input_names = ["input_0"]
+    output_names = ["output_0"]
+    input_shapes = [(1, 1024, 1024)]
+    output_shapes = [(1, 1024, 16)]
+
+    inputs = [
+        make_tensor_value_info(input_name, onnx.TensorProto.FLOAT, input_shape)
+        for input_name, input_shape in zip(input_names, input_shapes)
+    ]
+    outputs = [
+        make_tensor_value_info(output_name, onnx.TensorProto.FLOAT, output_shape)
+        for output_name, output_shape in zip(output_names, output_shapes)
+    ]
+
+    # Create the ONNX graph with the nodes
+    nodes = [
+        make_node(
+            op_type="MatMul",
+            inputs=["input_0", "weights_1"],
+            outputs=["matmul1_matmul/MatMul:0"],
+            name="matmul1_matmul/MatMul",
+        ),
+        make_node(
+            op_type="Relu",
+            inputs=["matmul1_matmul/MatMul:0"],
+            outputs=["output_0"],
+            name="relu1_relu/Relu",
+        ),
+    ]
+
+    # Create the ONNX initializers
+    initializers = [
+        make_tensor(
+            name="weights_1",
+            data_type=onnx.TensorProto.FLOAT,
+            dims=(1024, 16),
+            vals=np.random.uniform(low=0.5, high=1.0, size=1024 * 16),
+        ),
+    ]
+
+    # Create the ONNX graph with the nodes and initializers
+    graph = make_graph(
+        nodes, f"matmul_relu_ir_{ir_version}", inputs, outputs, initializer=initializers
+    )
+
+    # Create the ONNX model
+    model = make_model(graph)
+    model.opset_import[0].version = 13
+    model.ir_version = ir_version
+
+    # Check the ONNX model
+    model_inferred = onnx.shape_inference.infer_shapes(model)
+    onnx.checker.check_model(model_inferred)
+
+    return model_inferred
+
+
+def test_ir_version_support(tmp_path):
+    model = _make_matmul_relu_model(ir_version=12)
+    model_path = os.path.join(tmp_path, "test_matmul_relu.onnx")
+    onnx.save(model, model_path)
+    model_reload, _, _, _, _ = load_onnx_model(model_path, intermediate_generated_files=[])
+    assert model_reload.ir_version == 10, (
+        f"The maximum supported IR version is 10, but version {model_reload.ir_version} was detected."
+    )
+
+
+def _make_cast_model(cast_to, output_elem_type, with_value_info=False):
+    """Build a tiny X -> Cast(to=cast_to) -> Y model."""
+    nodes = [make_node("Cast", ["X"], ["Y"], to=cast_to, name="cast")]
+    inputs = [make_tensor_value_info("X", onnx.TensorProto.FLOAT16, [1, 4])]
+    outputs = [make_tensor_value_info("Y", output_elem_type, [1, 4])]
+    value_info = (
+        [make_tensor_value_info("Y", onnx.TensorProto.FLOAT16, [1, 4])] if with_value_info else []
+    )
+    graph = make_graph(nodes, "cast_graph", inputs, outputs, value_info=value_info)
+    return make_model(graph, producer_name="modelopt test", opset_imports=[make_opsetid("", 17)])
+
+
+@pytest.mark.parametrize(
+    ("output_elem_type", "with_value_info", "expected_count"),
+    [
+        (onnx.TensorProto.FLOAT16, True, 2),  # stale output + value_info: reconcile + clear
+        (onnx.TensorProto.FLOAT, False, 0),  # output already matches Cast.to: no-op
+    ],
+    ids=["stale_output_and_value_info", "no_op_when_matching"],
+)
+def test_clear_stale_value_info(output_elem_type, with_value_info, expected_count):
+    model = _make_cast_model(
+        cast_to=onnx.TensorProto.FLOAT,
+        output_elem_type=output_elem_type,
+        with_value_info=with_value_info,
+    )
+
+    count = clear_stale_value_info(model)
+
+    assert model.graph.output[0].type.tensor_type.elem_type == onnx.TensorProto.FLOAT
+    assert len(model.graph.value_info) == 0
+    assert count == expected_count
+
+
+def _make_matmul_model(output_shape):
+    """Build an X[3,4] @ W[4,5] -> Y model with Y declared using ``output_shape``."""
+    weights = make_tensor("W", onnx.TensorProto.FLOAT, [4, 5], np.zeros(20, dtype=np.float32))
+    nodes = [make_node("MatMul", ["X", "W"], ["Y"], name="matmul")]
+    inputs = [make_tensor_value_info("X", onnx.TensorProto.FLOAT, [3, 4])]
+    outputs = [make_tensor_value_info("Y", onnx.TensorProto.FLOAT, output_shape)]
+    graph = make_graph(nodes, "matmul_graph", inputs, outputs, initializer=[weights])
+    return make_model(graph, producer_name="modelopt test", opset_imports=[make_opsetid("", 17)])
+
+
+def test_clear_stale_value_info_reconciles_stale_rank0_output():
+    # Y is really rank-2 [3, 5] but the model declares it as a rank-0 scalar (stale
+    # metadata typical of weakly-typed exports). This is the rank-(N)-vs-(0) class of
+    # conflict that crashes downstream shape inference (NVBug 6058907).
+    model = _make_matmul_model(output_shape=[])
+    assert len(model.graph.output[0].type.tensor_type.shape.dim) == 0  # stale rank-0
+
+    clear_stale_value_info(model)
+
+    out_type = model.graph.output[0].type.tensor_type
+    assert out_type.HasField("shape")  # shape field must remain (onnx.checker requires it)
+    assert [d.dim_value for d in out_type.shape.dim] == [3, 5]  # reconciled to the real shape
+    onnx.checker.check_model(model)
+
+
+def test_clear_stale_value_info_preserves_valid_output_shape():
+    # A correct output shape must be left untouched (no-op for healthy models).
+    model = _make_matmul_model(output_shape=[3, 5])
+
+    clear_stale_value_info(model)
+
+    out_type = model.graph.output[0].type.tensor_type
+    assert [d.dim_value for d in out_type.shape.dim] == [3, 5]
+
+
+def _make_dynamic_dim_model():
+    """Build an X[batch,4] -> Relu -> Y[my_batch,4] model (output declares a different dim_param)."""
+    nodes = [make_node("Relu", ["X"], ["Y"], name="relu")]
+    inputs = [make_tensor_value_info("X", onnx.TensorProto.FLOAT, ["batch", 4])]
+    outputs = [make_tensor_value_info("Y", onnx.TensorProto.FLOAT, ["my_batch", 4])]
+    graph = make_graph(nodes, "dyn_graph", inputs, outputs)
+    return make_model(graph, producer_name="modelopt test", opset_imports=[make_opsetid("", 17)])
+
+
+def test_clear_stale_value_info_preserves_dynamic_dim_names():
+    # A healthy output with a named dynamic dim must not be rewritten just because
+    # symbolic shape inference re-derives a different dim_param. Y is declared with
+    # "my_batch" while the graph would infer "batch" from the input: same rank, no
+    # concrete-dim conflict, so the declaration (incl. its dim_param) must be preserved.
+    model = _make_dynamic_dim_model()
+
+    clear_stale_value_info(model)
+
+    out_dims = model.graph.output[0].type.tensor_type.shape.dim
+    assert [d.dim_param or d.dim_value for d in out_dims] == ["my_batch", 4]
+    onnx.checker.check_model(model)
+
+
+def _make_topk_overflow_model():
+    """Build a model whose TopK ``k`` (5) exceeds the static axis dim (3).
+
+    ONNX shape inference raises "Axis has less than the requested k elements" on this
+    model (the same failure class seen in NVBug 6058907), while standalone type
+    inference can still derive the output types (values float, indices int64).
+    """
+    k = make_tensor("k", onnx.TensorProto.INT64, [1], [5])
+    nodes = [
+        make_node("TopK", ["X", "k"], ["vals", "inds"], axis=1, name="topk"),
+        make_node("Cast", ["inds"], ["out"], to=onnx.TensorProto.FLOAT, name="cast_inds"),
+    ]
+    inputs = [make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 3])]
+    outputs = [make_tensor_value_info("out", onnx.TensorProto.FLOAT, [1, 5])]
+    graph = make_graph(nodes, "topk_overflow", inputs, outputs, initializer=[k])
+    return make_model(graph, producer_name="modelopt test", opset_imports=[make_opsetid("", 17)])
+
+
+def test_infer_types_falls_back_to_standalone_when_onnx_fails():
+    # ONNX shape inference cannot resolve this model's TopK. With strict_mode=True it raises
+    # (instead of silently leaving the TopK outputs untyped), so infer_types catches the
+    # error and falls back to standalone type inference, which still types every tensor.
+    model = _make_topk_overflow_model()
+
+    inferred = infer_types(model, strict_mode=True)
+
+    value_info_types = {vi.name: vi.type.tensor_type.elem_type for vi in inferred.graph.value_info}
+    output_types = {o.name: o.type.tensor_type.elem_type for o in inferred.graph.output}
+    assert value_info_types.get("vals") == onnx.TensorProto.FLOAT
+    assert value_info_types.get("inds") == onnx.TensorProto.INT64  # TopK indices
+    assert output_types.get("out") == onnx.TensorProto.FLOAT
+
+
+def test_unset_input_dimension_keeps_its_rank():
+    value_info = make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 4, 3])
+    value_info.type.tensor_type.shape.dim[1].ClearField("dim_value")
+    graph = make_graph(
+        [make_node("Relu", ["X"], ["Y"], name="relu")],
+        "unset_dim",
+        [value_info],
+        [make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1, 4, 3])],
+    )
+    model = make_model(graph, producer_name="modelopt test", opset_imports=[make_opsetid("", 17)])
+
+    assert onnx_utils.get_input_shapes(model)["X"] == [1, 1, 3]
+
+
+def test_get_shapes_keep_rank_for_unknown_dims():
+    # A dim with neither dim_value nor dim_param is valid ONNX and must still count as a dim.
+    tensor = make_tensor_value_info("t", onnx.TensorProto.FLOAT, ["batch", None, 8, -1])
+    graph = make_graph([], "unknown_dims", [tensor], [tensor])
+    model = make_model(graph, opset_imports=[make_opsetid("", 17)])
+
+    assert onnx_utils.get_input_shapes(model) == {"t": [1, 1, 8, 1]}
+    assert onnx_utils.get_output_shapes(model) == {"t": [1, 1, 8, 1]}

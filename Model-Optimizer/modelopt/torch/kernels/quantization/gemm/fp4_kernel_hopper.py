@@ -1,0 +1,167 @@
+#!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""NVFP4 Fake Quantization Triton kernels requiring compute capability >= 8.9 (Hopper+).
+
+These kernels use tl.float8e4nv which requires native FP8 hardware support.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+from ..common.nvfp4_quant import fp8_quantize_scale, nvfp4_scalar_quant
+from .fp4_kernel import _torch_dtype_to_tl
+
+__all__ = ["fp4_fake_quant_block"]
+
+
+@triton.jit
+def fp4_fake_quant_kernel(
+    x_ptr,
+    y_ptr,
+    M,
+    N,
+    global_scale_ptr,
+    ROWS_PER_SCALE,
+    stride_xm,
+    stride_xn,
+    stride_ym,
+    stride_yn,
+    BLOCK_SIZE: tl.constexpr,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+    NUM_FP4_BLOCKS: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    """Applies FP4 fake quantization to one ``(TILE_M, TILE_N)`` tile.
+
+    Each run of ``ROWS_PER_SCALE`` rows uses its own global scale: all ``M`` rows share one for a
+    single tensor, and each slice of a stacked tensor (e.g. one expert) has its own.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
+    offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
+    # Plain masked pointers, not tl.make_block_ptr: Triton 3.9 removed block pointers.
+    # int64 row offsets keep addresses valid past 2**31 elements (e.g. stacked expert weights).
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x_ptrs = x_ptr + offs_m[:, None].to(tl.int64) * stride_xm + offs_n[None, :] * stride_xn
+    y_ptrs = y_ptr + offs_m[:, None].to(tl.int64) * stride_ym + offs_n[None, :] * stride_yn
+
+    rows = tl.minimum(offs_m, M - 1)  # padding rows reuse the last one
+    global_scale = tl.load(global_scale_ptr + rows // ROWS_PER_SCALE).to(tl.float32)
+    global_scale = tl.reshape(global_scale, (TILE_M, 1, 1))
+    global_scale_valid = (global_scale > 0.0) & (global_scale < float("inf"))  # False for NaN
+    global_scale_safe = tl.where(global_scale_valid, global_scale, 1.0)
+
+    tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    tile_reshaped = tl.reshape(tile, (TILE_M, NUM_FP4_BLOCKS, BLOCK_SIZE))
+    block_max = tl.max(tl.abs(tile_reshaped), axis=2, keep_dims=True)
+    block_max_quant = fp8_quantize_scale(block_max, global_scale_safe)
+    # Like the CUDA extension, a zero, inf or NaN global amax uses a unit block scale.
+    block_max_quant = tl.where(global_scale_valid, block_max_quant, 1.0)
+
+    # Only a zero block scale zeroes the block; small nonzero scales quantize normally.
+    x_quant = nvfp4_scalar_quant(tile_reshaped, block_max_quant, BLOCK_SIZE)
+    tile_quant = tl.reshape(x_quant, (TILE_M, TILE_N))
+
+    tl.store(y_ptrs, tile_quant.to(OUT_DTYPE), mask=mask)
+
+
+def fp4_fake_quant_block(
+    x: torch.Tensor,
+    global_amax: torch.Tensor,
+    block_size: int = 16,
+    tile_rows: int = 16,
+    tile_cols: int = 64,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
+) -> torch.Tensor:
+    """FP4 fake quantization implementation using 2D tiling.
+
+    Args:
+        x (torch.Tensor): Input tensor of shape ``(M, N)`` or higher.
+        global_amax (torch.Tensor): Global maximum value for scaling: one value, or one per index
+            of ``x``'s first dimension (e.g. per expert of a stacked ``(E, N, K)`` weight), which
+            quantizes each slice exactly as a separate call with its own amax would.
+        block_size (int): Number of elements per FP4 block.
+        tile_rows (int, optional): Row tile size. Defaults to 16.
+        tile_cols (int, optional): Column tile size. Defaults to 64. Rounded up to
+            the nearest multiple of ``block_size`` internally.
+        num_warps (int | None, optional): Override for Triton warps. Autotuned when ``None``.
+        num_stages (int | None, optional): Override for pipeline stages. Autotuned when ``None``.
+
+    Returns:
+        torch.Tensor: Fake-quantized tensor matching the input shape and dtype.
+    """
+    x_shape = x.shape
+    x_dtype = x.dtype
+    x = x.reshape(-1, x_shape[-1]).contiguous()
+
+    M, N = x.shape
+    y = torch.empty_like(x)
+
+    stride_xm, stride_xn = x.stride()
+    stride_ym, stride_yn = y.stride()
+
+    tile_cols = max(tile_cols, block_size)
+    tile_cols_aligned = ((tile_cols + block_size - 1) // block_size) * block_size
+    num_fp4_blocks = tile_cols_aligned // block_size
+
+    global_scale = (global_amax.float() / (6.0 * 448.0)).to(x.device).reshape(-1)
+    if global_scale.numel() == 1:
+        rows_per_scale = max(M, 1)
+    elif len(x_shape) > 1 and global_scale.numel() == x_shape[0]:
+        rows_per_scale = M // x_shape[0]
+    else:
+        raise ValueError(
+            f"global_amax must hold 1 value or one per index of dim 0 ({x_shape[0]}), "
+            f"got {global_scale.numel()}."
+        )
+
+    grid = lambda *_: (triton.cdiv(M, tile_rows), triton.cdiv(N, tile_cols_aligned))
+
+    launch_kwargs = {
+        "BLOCK_SIZE": block_size,
+        "TILE_M": tile_rows,
+        "TILE_N": tile_cols_aligned,
+        "NUM_FP4_BLOCKS": num_fp4_blocks,
+        "OUT_DTYPE": _torch_dtype_to_tl(x_dtype),
+    }
+    if num_warps is not None:
+        launch_kwargs["num_warps"] = num_warps
+    if num_stages is not None:
+        launch_kwargs["num_stages"] = num_stages
+    with torch.cuda.device(x.device):
+        fp4_fake_quant_kernel[grid](
+            x,
+            y,
+            M,
+            N,
+            global_scale,
+            rows_per_scale,
+            stride_xm,
+            stride_xn,
+            stride_ym,
+            stride_yn,
+            **launch_kwargs,
+        )
+
+    y = y.view(*x_shape)
+    return y

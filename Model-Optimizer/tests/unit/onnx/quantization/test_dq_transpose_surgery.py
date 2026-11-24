@@ -1,0 +1,288 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for DQ transpose surgery (transpose_dequantize_linear_weights)."""
+
+import os
+import tempfile
+
+import numpy as np
+import onnx
+import onnxruntime as ort
+import pytest
+from onnx import TensorProto, helper, numpy_helper
+
+from modelopt.onnx.graph_surgery.dq_transpose import transpose_dequantize_linear_weights
+
+IN_FEATURES = 16
+OUT_FEATURES = 32
+BATCH = 2
+SEQ = 4
+
+
+def _build_dq_matmul_model(axis: int | None = 0, per_tensor: bool = False):
+    """Build minimal model: input -> MatMul(input, DQ(weight, scale, zp)) -> output.
+
+    Uses per-channel INT8 quantization on the given (possibly negative) axis of the weight
+    [IN, OUT]. Defaults to axis 0, matching the ONNX export this surgery targets. Pass
+    axis=None to omit the attribute entirely and rely on the ONNX-spec default of 1. Pass
+    per_tensor=True for a scalar scale/zero-point instead, as in opset < 13 DQ nodes
+    (which do not have an axis attribute at all, since per-axis quantization is opset 13+).
+    """
+    rng = np.random.RandomState(123)
+
+    effective_axis = 1 if axis is None else axis
+
+    # Quantized weight [IN_FEATURES, OUT_FEATURES] int8
+    w_int8 = rng.randint(-127, 127, size=(IN_FEATURES, OUT_FEATURES)).astype(np.int8)
+    if per_tensor:
+        scale = np.array(rng.rand() * 0.01 + 0.001, dtype=np.float32)
+        zp = np.array(0, dtype=np.int8)
+    else:
+        # Per-channel scale along `axis` -> one value per channel on that axis
+        channels = IN_FEATURES if effective_axis % 2 == 0 else OUT_FEATURES
+        scale = rng.rand(channels).astype(np.float32) * 0.01 + 0.001
+        # Per-channel zero point
+        zp = np.zeros(channels, dtype=np.int8)
+
+    w_init = numpy_helper.from_array(w_int8, name="weight_quantized")
+    s_init = numpy_helper.from_array(scale, name="weight_scale")
+    zp_init = numpy_helper.from_array(zp, name="weight_zp")
+
+    dq_kwargs = {} if axis is None else {"axis": axis}
+    dq_node = helper.make_node(
+        "DequantizeLinear",
+        inputs=["weight_quantized", "weight_scale", "weight_zp"],
+        outputs=["weight_dequantized"],
+        name="dq_weight",
+        **dq_kwargs,
+    )
+
+    matmul_node = helper.make_node(
+        "MatMul",
+        inputs=["input", "weight_dequantized"],
+        outputs=["output"],
+        name="matmul_0",
+    )
+
+    graph = helper.make_graph(
+        [dq_node, matmul_node],
+        "test_dq_transpose",
+        inputs=[
+            helper.make_tensor_value_info("input", TensorProto.FLOAT, [BATCH, SEQ, IN_FEATURES]),
+        ],
+        outputs=[
+            helper.make_tensor_value_info("output", TensorProto.FLOAT, [BATCH, SEQ, OUT_FEATURES]),
+        ],
+        initializer=[w_init, s_init, zp_init],
+    )
+
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    return model
+
+
+def _run_session(model_proto, feeds):
+    """Run inference on in-memory model."""
+    opts = ort.SessionOptions()
+    opts.log_severity_level = 3
+    sess = ort.InferenceSession(
+        model_proto.SerializeToString(), opts, providers=["CPUExecutionProvider"]
+    )
+    output_names = [o.name for o in sess.get_outputs()]
+    return sess.run(output_names, feeds)
+
+
+@pytest.fixture(scope="class")
+def models():
+    """Build original model, apply DQ transpose surgery, return both."""
+    orig = _build_dq_matmul_model()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orig_path = os.path.join(tmp, "original.onnx")
+        out_path = os.path.join(tmp, "transposed.onnx")
+
+        onnx.save(orig, orig_path)
+        transpose_dequantize_linear_weights(
+            model_path=orig_path,
+            output_path=out_path,
+            use_external_data=False,
+            verbose=True,
+        )
+        modified = onnx.load(out_path)
+
+    return orig, modified
+
+
+class TestDqTransposeSurgery:
+    def test_transpose_node_added(self, models):
+        _, modified = models
+        transpose_nodes = [n for n in modified.graph.node if n.op_type == "Transpose"]
+        assert len(transpose_nodes) == 1, f"Expected 1 Transpose node, got {len(transpose_nodes)}"
+
+    def test_dq_node_preserved(self, models):
+        _, modified = models
+        dq_nodes = [n for n in modified.graph.node if n.op_type == "DequantizeLinear"]
+        assert len(dq_nodes) == 1, f"Expected 1 DQ node, got {len(dq_nodes)}"
+
+    def test_weight_transposed(self, models):
+        orig, modified = models
+
+        orig_w = None
+        for init in orig.graph.initializer:
+            if init.name == "weight_quantized":
+                orig_w = numpy_helper.to_array(init)
+
+        mod_w = None
+        for init in modified.graph.initializer:
+            if "weight_quantized" in init.name:
+                mod_w = numpy_helper.to_array(init)
+
+        assert orig_w is not None and mod_w is not None
+        assert mod_w.shape == (OUT_FEATURES, IN_FEATURES), (
+            f"Expected transposed shape, got {mod_w.shape}"
+        )
+        np.testing.assert_array_equal(mod_w, orig_w.T)
+
+    def test_axis_updated(self, models):
+        _, modified = models
+        dq_node = next(n for n in modified.graph.node if n.op_type == "DequantizeLinear")
+        axis_val = None
+        for attr in dq_node.attribute:
+            if attr.name == "axis":
+                axis_val = attr.i
+        assert axis_val == 1, f"Expected axis=1 after transpose, got {axis_val}"
+
+    def test_output_matches(self, models):
+        orig, modified = models
+        rng = np.random.RandomState(999)
+        x = rng.randn(BATCH, SEQ, IN_FEATURES).astype(np.float32)
+        feeds = {"input": x}
+
+        orig_out = _run_session(orig, feeds)[0]
+        mod_out = _run_session(modified, feeds)[0]
+
+        diff = np.abs(orig_out - mod_out)
+
+        print(f"\n  Original shape:  {orig_out.shape}")
+        print(f"  Original[0,:4]:  {orig_out[0, 0, :4]}")
+        print(f"  Modified[0,:4]:  {mod_out[0, 0, :4]}")
+        print(f"  Max  abs diff:   {diff.max():.6f}")
+        print(f"  Mean abs diff:   {diff.mean():.6f}")
+
+        np.testing.assert_allclose(orig_out, mod_out, atol=1e-5, rtol=1e-5)
+
+
+def _run_unoptimized(model_proto, feeds):
+    """Run with graph optimization off.
+
+    onnxruntime's optimizer does not treat a negative DequantizeLinear axis the same as its
+    non-negative equivalent, so leaving optimization on would compare against a wrong baseline.
+    """
+    opts = ort.SessionOptions()
+    opts.log_severity_level = 3
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sess = ort.InferenceSession(
+        model_proto.SerializeToString(), opts, providers=["CPUExecutionProvider"]
+    )
+    return sess.run([o.name for o in sess.get_outputs()], feeds)
+
+
+@pytest.mark.parametrize(("axis", "expected_axis"), [(0, 1), (1, 0), (-1, 0), (-2, 1)])
+def test_negative_axis_is_swapped(axis, expected_axis, tmp_path):
+    """ONNX allows a negative axis; it still has to move when the weight is transposed."""
+    original = _build_dq_matmul_model(axis)
+    orig_path = str(tmp_path / "original.onnx")
+    out_path = str(tmp_path / "transposed.onnx")
+    onnx.save(original, orig_path)
+
+    modified = transpose_dequantize_linear_weights(
+        model_path=orig_path, output_path=out_path, use_external_data=False, verbose=False
+    )
+
+    axis_val = next(
+        attr.i
+        for node in modified.graph.node
+        if node.op_type == "DequantizeLinear"
+        for attr in node.attribute
+        if attr.name == "axis"
+    )
+    assert axis_val == expected_axis, f"axis {axis} should become {expected_axis}, got {axis_val}"
+
+    feeds = {"input": np.random.RandomState(999).randn(BATCH, SEQ, IN_FEATURES).astype(np.float32)}
+    np.testing.assert_allclose(
+        _run_unoptimized(modified, feeds)[0],
+        _run_unoptimized(original, feeds)[0],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_per_tensor_dq_axis_is_not_added(tmp_path):
+    """A per-tensor DQ node (scalar scale) must not gain an axis attribute.
+
+    Per-tensor quantization predates the axis attribute (opset < 13) and ignores axis
+    entirely, so adding one unconditionally -- as a DQ node with an explicit per-axis
+    scale needs -- would make an opset < 13 node invalid for its own opset.
+    """
+    original = _build_dq_matmul_model(axis=None, per_tensor=True)
+    orig_path = str(tmp_path / "original.onnx")
+    out_path = str(tmp_path / "transposed.onnx")
+    onnx.save(original, orig_path)
+
+    modified = transpose_dequantize_linear_weights(
+        model_path=orig_path, output_path=out_path, use_external_data=False, verbose=False
+    )
+
+    dq_node = next(n for n in modified.graph.node if n.op_type == "DequantizeLinear")
+    axis_attrs = [attr.i for attr in dq_node.attribute if attr.name == "axis"]
+    assert axis_attrs == [], f"expected no axis attribute on a per-tensor DQ, got {axis_attrs}"
+
+    feeds = {"input": np.random.RandomState(999).randn(BATCH, SEQ, IN_FEATURES).astype(np.float32)}
+    np.testing.assert_allclose(
+        _run_unoptimized(modified, feeds)[0],
+        _run_unoptimized(original, feeds)[0],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_default_axis_is_corrected(tmp_path):
+    """A DQ node that never set "axis" relies on the ONNX-spec default of 1.
+
+    The surgery must correct that implicit axis after transposing the weight, the same
+    as it would for an explicit axis=1, instead of silently leaving it unset.
+    """
+    original = _build_dq_matmul_model(axis=None)
+    orig_path = str(tmp_path / "original.onnx")
+    out_path = str(tmp_path / "transposed.onnx")
+    onnx.save(original, orig_path)
+
+    modified = transpose_dequantize_linear_weights(
+        model_path=orig_path, output_path=out_path, use_external_data=False, verbose=False
+    )
+
+    dq_node = next(n for n in modified.graph.node if n.op_type == "DequantizeLinear")
+    axis_attrs = [attr.i for attr in dq_node.attribute if attr.name == "axis"]
+    assert axis_attrs == [0], f"expected a single axis=0 attribute, got {axis_attrs}"
+
+    feeds = {"input": np.random.RandomState(999).randn(BATCH, SEQ, IN_FEATURES).astype(np.float32)}
+    np.testing.assert_allclose(
+        _run_unoptimized(modified, feeds)[0],
+        _run_unoptimized(original, feeds)[0],
+        atol=1e-5,
+        rtol=1e-5,
+    )

@@ -1,0 +1,1023 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""High-level tests for quantization."""
+
+import copy
+import os
+from unittest import mock
+
+import pytest
+import torch
+from _test_utils.torch.distributed.utils import bounded_collectives
+from _test_utils.torch.quantization.models import SimpleConv, SimpleConvLinear, SimpleLinear
+from _test_utils.torch.quantization.quantize_common import (
+    INT4_AWQ_CLIP_CFG,
+    INT4_AWQ_FULL_CFG,
+    INT4_SVDQUANT_CFG,
+    quantize_model_and_forward,
+    save_restore_test,
+)
+from pydantic import ValidationError
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
+
+import modelopt.torch.opt as mto
+import modelopt.torch.quantization as mtq
+from modelopt.torch.quantization.calib import MaxCalibrator
+from modelopt.torch.quantization.config import QuantizerAttributeConfig
+from modelopt.torch.quantization.conversion import set_quantizer_attributes_full
+from modelopt.torch.quantization.nn.modules.tensor_quantizer import (
+    SequentialQuantizer,
+    TensorQuantizer,
+    register_quant_backend,
+    unregister_quant_backend,
+)
+from modelopt.torch.quantization.utils import is_quantized
+from modelopt.torch.utils.distributed import ParallelState
+
+# A test config with double-quant (using `SequentialQuantizers`)
+WINT4INT8_CFG = {
+    "quant_cfg": [
+        {
+            "quantizer_name": "*weight_quantizer",
+            "cfg": [
+                {"num_bits": 4, "block_sizes": {-1: 128, "type": "static"}},
+                {"num_bits": 8, "axis": 0},
+            ],
+            "enable": True,
+        },
+        {
+            "quantizer_name": "*input_quantizer",
+            "cfg": {"num_bits": 8, "axis": None},
+            "enable": True,
+        },
+    ],
+    "algorithm": "awq_lite",
+}
+
+# Test configs for per channel MSE calibration
+INT8_MSE_CFG = {
+    "quant_cfg": [
+        {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+        {"quantizer_name": "*input_quantizer", "cfg": {"num_bits": 8, "axis": None}},
+    ],
+    "algorithm": "mse",
+}
+
+STATIC_WEIGHT_DYNAMIC_ACTIVATION_CFG = {
+    "quant_cfg": [
+        {"quantizer_name": "*", "enable": False},
+        {
+            "quantizer_name": "*weight_quantizer",
+            "cfg": {"num_bits": 8, "axis": 0},
+        },  # Per-channel quantization
+        {
+            "quantizer_name": "*input_quantizer",
+            "cfg": {"num_bits": 8, "axis": (0, 1), "type": "dynamic"},
+        },  # Dynamic per-token quantization
+    ],
+    "algorithm": "max",
+}
+
+
+class NewMaxCalibrator(MaxCalibrator):
+    def compute_amax(self):
+        return 2 * self._calib_amax
+
+
+quant_cfg_custom_calib = {
+    "quant_cfg": [
+        {
+            "quantizer_name": "*",
+            "cfg": {
+                "num_bits": 4,
+                "axis": None,
+                "calibrator": (NewMaxCalibrator, (4, None, False)),
+            },
+            "enable": True,
+        }
+    ],
+    "algorithm": "max",
+}
+
+
+@pytest.mark.parametrize("model_cls", [SimpleLinear, SimpleConv, SimpleConvLinear])
+@pytest.mark.parametrize(
+    "config",
+    [
+        mtq.INT8_DEFAULT_CFG,
+        mtq.INT8_SMOOTHQUANT_CFG,
+        mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
+        mtq.INT4_AWQ_CFG,
+        INT4_SVDQUANT_CFG,
+        INT4_AWQ_CLIP_CFG,
+        INT4_AWQ_FULL_CFG,
+        WINT4INT8_CFG,
+        INT8_MSE_CFG,
+    ],
+)
+def test_quantize(model_cls, config):
+    """Test quantize function can run without problems."""
+    model = model_cls()
+    calib_data = [model.get_input() for _ in range(2)]
+    quantize_model_and_forward(model, config, calib_data)
+
+    # For fast testing, lets just test one config
+    if config == mtq.INT8_DEFAULT_CFG:
+        mtq.print_quant_summary(model)
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "quant_config"),
+    [
+        (SimpleLinear, mtq.INT8_SMOOTHQUANT_CFG),
+        (SimpleConvLinear, quant_cfg_custom_calib),
+        (SimpleConvLinear, mtq.INT8_DEFAULT_CFG),
+        (SimpleLinear, INT4_SVDQUANT_CFG),
+    ],
+)
+def test_save_restore(skip_on_windows, model_cls, quant_config):  # Flaky on Windows
+    save_restore_test(model_cls, "cpu", quant_config)
+
+
+def test_quantize_invalid_cfg():
+    model = SimpleLinear()
+    config_invalid = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "cfg": {"num_bits": 4, "axis": 0, "block_sizes": {-1: 128}}}
+        ],
+        "algorithm": "max",
+    }
+    with pytest.raises(ValidationError, match=r"axis must be None when block_sizes is not None."):
+        model = mtq.quantize(model, config_invalid)
+
+
+def test_inplace_backward_compatibility():
+    model = SimpleLinear()
+    calib_data = [model.get_input() for _ in range(2)]
+
+    def forward_loop():
+        for batch in calib_data:
+            model(batch)
+
+    mtq.quantize(model, mtq.INT8_DEFAULT_CFG, forward_loop=forward_loop)
+
+
+def test_custom_calib_config():
+    model_ref = SimpleLinear()
+    model_ref = mtq.quantize(
+        model_ref, quant_cfg_custom_calib, lambda model: model(model.get_input())
+    )
+
+    model_quant = SimpleLinear()
+    model_quant = mto.restore_from_modelopt_state(model_quant, mto.modelopt_state(model_ref))
+    model_quant.load_state_dict(model_ref.state_dict())
+
+    inputs = model_ref.get_input()
+    assert torch.allclose(model_ref(inputs), model_quant(inputs))
+
+    for name, module in model_quant.named_modules():
+        if name.endswith("quantizer"):
+            assert module._calibrator.__class__ == NewMaxCalibrator
+
+
+def test_class_wise_config():
+    model = SimpleConvLinear()
+    config = {
+        "quant_cfg": [
+            {
+                "parent_class": "nn.Linear",
+                "quantizer_name": "*",
+                "cfg": {"num_bits": 4, "axis": -1},
+                "enable": True,
+            },
+            {
+                "parent_class": "nn.Conv2d",
+                "quantizer_name": "*",
+                "cfg": {"num_bits": 8},
+                "enable": True,
+            },
+            {"parent_class": "nn.BatchNorm2d", "quantizer_name": "*", "enable": False},
+            {"quantizer_name": "*output_quantizer", "cfg": {"num_bits": 8}, "enable": True},
+        ],
+        "algorithm": "max",
+    }
+
+    model = mtq.quantize(model, config, lambda model: model(model.get_input()))
+
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            for sub_quantizer in (module.weight_quantizer, module.input_quantizer):
+                assert sub_quantizer.num_bits == 4
+                assert sub_quantizer.axis == -1
+                assert sub_quantizer.is_enabled
+        elif isinstance(module, torch.nn.Conv2d):
+            for sub_quantizer in (module.weight_quantizer, module.input_quantizer):
+                assert sub_quantizer.num_bits == 8
+                assert sub_quantizer.is_enabled
+        elif isinstance(module, torch.nn.BatchNorm2d):
+            assert module.input_quantizer.is_enabled is False
+
+        if name.endswith("output_quantizer"):
+            assert module.is_enabled
+            assert module.num_bits == 8
+
+
+def test_static_weight_dynamic_activations():
+    model = SimpleLinear()
+    inputs = model.get_input()
+
+    model = mtq.quantize(
+        model, STATIC_WEIGHT_DYNAMIC_ACTIVATION_CFG, lambda model: model(model.get_input())
+    )
+    for name, module in model.named_modules():
+        if name.endswith("weight_quantizer"):
+            assert module.amax is not None
+    # Test that model forward works
+    model(inputs)
+
+    # Lets test mtq.quantize without forward_loop
+    model = SimpleLinear()
+    model = mtq.quantize(model, STATIC_WEIGHT_DYNAMIC_ACTIVATION_CFG)
+    for name, module in model.named_modules():
+        if name.endswith("weight_quantizer"):
+            assert module.amax is not None
+
+
+def test_block_sizes_axis_model():
+    REF_QUANT_CFG = {  # noqa: N806
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+            {
+                "quantizer_name": "*input_quantizer",
+                "cfg": {"num_bits": 8, "axis": None, "type": "dynamic"},
+            },
+        ],
+        "algorithm": "max",
+    }
+    QUANT_CFG = {  # noqa: N806
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {
+                "quantizer_name": "*weight_quantizer",
+                "cfg": {"num_bits": 8, "block_sizes": {1: None}},
+            },
+            {
+                "quantizer_name": "*input_quantizer",
+                "cfg": {"num_bits": 8, "block_sizes": {0: None, 1: None}, "type": "dynamic"},
+            },
+        ],
+        "algorithm": "max",
+    }
+    model_ref = SimpleLinear()
+    model = copy.deepcopy(model_ref)
+    inputs = model_ref.get_input()
+
+    mtq.quantize(model_ref, REF_QUANT_CFG, lambda model: model(inputs))
+    mtq.quantize(model, QUANT_CFG, lambda model: model(inputs))
+
+    assert torch.allclose(model_ref(inputs), model(inputs))
+
+    # compare the calibrated amax of all quantizers
+    for (name_ref, module_ref), (name, module) in zip(
+        model_ref.named_modules(), model.named_modules()
+    ):
+        if hasattr(module, "weight_quantizer"):
+            assert name_ref == name
+            assert torch.allclose(module_ref.weight_quantizer.amax, module.weight_quantizer.amax)
+
+
+def test_quantize_twice():
+    """Test that calling mtq.quantize twice on the same model works."""
+    model = SimpleLinear()
+    inputs = model.get_input()
+
+    def forward_loop(model):
+        return model(inputs)
+
+    model = mtq.quantize(model, mtq.INT8_DEFAULT_CFG, forward_loop=forward_loop)
+    out1 = model(inputs)
+    model = mtq.quantize(model, mtq.INT8_DEFAULT_CFG, forward_loop=forward_loop)
+    out2 = model(inputs)
+
+    assert torch.allclose(out1, out2), "Re-quantization with same config should be idempotent"
+
+
+class TestSetQuantizerAttributesFull:
+    """Tests for set_quantizer_attributes_full and its atomicity semantics."""
+
+    def _quantize(self, model):
+        return mtq.quantize(model, mtq.INT8_DEFAULT_CFG, lambda m: m(m.get_input()))
+
+    def test_basic_full_replacement(self):
+        """set_quantizer_attributes_full replaces all attributes on matched quantizers."""
+        model = self._quantize(SimpleLinear())
+        attrs = QuantizerAttributeConfig(num_bits=4, axis=0)
+        set_quantizer_attributes_full(model, "*weight_quantizer", attrs)
+        for name, module in model.named_modules():
+            if name.endswith("weight_quantizer"):
+                assert isinstance(module, TensorQuantizer)
+                assert module.num_bits == 4
+                assert module.axis == 0
+
+    def test_atomicity_unset_fields_revert_to_defaults(self):
+        """A full replacement reverts unspecified fields to QuantizerAttributeConfig defaults."""
+        model = self._quantize(SimpleLinear())
+        # First configure with axis=0 (non-default)
+        set_quantizer_attributes_full(
+            model, "*weight_quantizer", QuantizerAttributeConfig(num_bits=8, axis=0)
+        )
+        for name, module in model.named_modules():
+            if name.endswith("weight_quantizer"):
+                assert module.axis == 0
+
+        # Now replace with only num_bits=4; axis should revert to default (None)
+        set_quantizer_attributes_full(
+            model, "*weight_quantizer", QuantizerAttributeConfig(num_bits=4)
+        )
+        default_axis = QuantizerAttributeConfig().axis
+        for name, module in model.named_modules():
+            if name.endswith("weight_quantizer"):
+                assert module.num_bits == 4
+                assert module.axis == default_axis
+
+    def test_parent_class_filter(self):
+        """parent_class restricts which quantizers are affected."""
+        model = self._quantize(SimpleConvLinear())
+        # Only set num_bits=4 for quantizers inside nn.Linear modules
+        set_quantizer_attributes_full(
+            model,
+            "*weight_quantizer",
+            QuantizerAttributeConfig(num_bits=4),
+            parent_class=torch.nn.Linear,
+        )
+        for name, module in model.named_modules():
+            if not name.endswith("weight_quantizer"):
+                continue
+            parent_name = name.rpartition(".")[0]
+            parent = model.get_submodule(parent_name)
+            if isinstance(parent, torch.nn.Linear):
+                assert module.num_bits == 4
+            else:
+                # Conv2d weight_quantizers should be unchanged (still 8-bit from INT8_DEFAULT_CFG)
+                assert module.num_bits == 8
+
+    def test_wildcard_no_match_is_noop(self):
+        """A wildcard that matches nothing silently does nothing."""
+        model = self._quantize(SimpleLinear())
+        # Record state before
+        bits_before = {
+            n: m.num_bits for n, m in model.named_modules() if isinstance(m, TensorQuantizer)
+        }
+        set_quantizer_attributes_full(
+            model, "*nonexistent_quantizer*", QuantizerAttributeConfig(num_bits=4)
+        )
+        bits_after = {
+            n: m.num_bits for n, m in model.named_modules() if isinstance(m, TensorQuantizer)
+        }
+        assert bits_before == bits_after
+
+    def test_invalid_attributes_type_raises(self):
+        """Passing a plain dict instead of QuantizerAttributeConfig raises ValueError."""
+        model = self._quantize(SimpleLinear())
+        with pytest.raises((ValueError, AttributeError)):
+            set_quantizer_attributes_full(model, "*weight_quantizer", {"num_bits": 4})  # type: ignore[arg-type]
+
+    def test_list_attributes_creates_sequential_quantizer(self):
+        """A list of QuantizerAttributeConfig replaces TensorQuantizer with SequentialQuantizer."""
+        model = self._quantize(SimpleLinear())
+        attrs = [
+            QuantizerAttributeConfig(num_bits=4, block_sizes={-1: 128}),
+            QuantizerAttributeConfig(num_bits=8, axis=0),
+        ]
+        set_quantizer_attributes_full(model, "*weight_quantizer", attrs)
+        for name, module in model.named_modules():
+            if name.endswith("weight_quantizer"):
+                assert isinstance(module, SequentialQuantizer)
+                assert len(module) == 2
+
+
+def test_ordering_later_entry_overrides_earlier():
+    """Later entries in quant_cfg override earlier ones for the same quantizer."""
+    model = SimpleLinear()
+    config = {
+        "quant_cfg": [
+            {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+            {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 4, "axis": 0}},
+            {"quantizer_name": "*input_quantizer", "cfg": {"num_bits": 8, "axis": None}},
+        ],
+        "algorithm": "max",
+    }
+    model = mtq.quantize(model, config, lambda m: m(m.get_input()))
+    for name, module in model.named_modules():
+        if name.endswith("weight_quantizer"):
+            assert module.num_bits == 4, "Later entry (num_bits=4) should override earlier (8)"
+        if name.endswith("input_quantizer"):
+            assert module.num_bits == 8
+
+
+def test_enable_only_entry_preserves_attributes():
+    """An enable-only entry toggles the quantizer without resetting its attributes."""
+    model = SimpleLinear()
+    config = {
+        "quant_cfg": [
+            {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 4, "axis": 0}},
+            {"quantizer_name": "*input_quantizer", "cfg": {"num_bits": 8, "axis": None}},
+            # This enable-only entry should disable without resetting num_bits/axis
+            {"quantizer_name": "*weight_quantizer", "enable": False},
+        ],
+        "algorithm": "max",
+    }
+    model = mtq.quantize(model, config, lambda m: m(m.get_input()))
+    for name, module in model.named_modules():
+        if name.endswith("weight_quantizer"):
+            assert not module.is_enabled, "weight_quantizer should be disabled"
+            assert module.num_bits == 4, "num_bits should be preserved by enable-only entry"
+            assert module.axis == 0, "axis should be preserved by enable-only entry"
+
+
+def test_weight_patterns_matching_nothing_raise():
+    """A config whose weight patterns match no module must fail, not quantize nothing.
+
+    Otherwise calibration and export run to completion and produce a checkpoint that is
+    silently unquantized (``"quant_algo": null``).
+    """
+    model = SimpleLinear()
+    config = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            # No module in this model is named `experts`.
+            {"quantizer_name": "*.experts.*weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+        ],
+        "algorithm": "max",
+    }
+    with pytest.raises(RuntimeError, match="no weight quantizer is enabled"):
+        mtq.quantize(model, config, lambda m: m(m.get_input()))
+
+
+def test_config_without_weight_quantization_is_allowed():
+    """Activation-only configs quantize no weight on purpose and must still run."""
+    model = SimpleLinear()
+    config = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {"quantizer_name": "*input_quantizer", "cfg": {"num_bits": 8, "axis": None}},
+        ],
+        "algorithm": "max",
+    }
+    model = mtq.quantize(model, config, lambda m: m(m.get_input()))
+
+    for name, module in model.named_modules():
+        if name.endswith("weight_quantizer"):
+            assert not module.is_enabled
+
+
+def test_weight_quantizers_disabled_by_a_later_entry_are_allowed():
+    """Patterns that match and are then switched off are a choice, not a mismatch."""
+    model = SimpleLinear()
+    config = {
+        "quant_cfg": [
+            {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 4, "axis": 0}},
+            {"quantizer_name": "*weight_quantizer", "enable": False},
+        ],
+        "algorithm": "max",
+    }
+    model = mtq.quantize(model, config, lambda m: m(m.get_input()))
+
+    for name, module in model.named_modules():
+        if name.endswith("weight_quantizer"):
+            assert not module.is_enabled
+
+
+def test_sequential_weight_quantizers_do_not_trip_the_guard():
+    """List-valued `cfg` builds `SequentialQuantizer`s, but the guard only ever looks at
+    `TensorQuantizer` instances -- this pins that it still doesn't wrongly raise for them.
+
+    `SequentialQuantizer` (itself an `nn.Sequential`) is not special-cased: its `TensorQuantizer`
+    children are reachable directly via `named_modules()`, individually named
+    `...weight_quantizer.0` / `.1`, so the substring match already finds them.
+    """
+    model = SimpleLinear()
+    calib_data = [model.get_input() for _ in range(2)]
+    quantize_model_and_forward(model, copy.deepcopy(WINT4INT8_CFG), calib_data)
+
+    for name, module in model.named_modules():
+        if name.endswith("weight_quantizer"):
+            assert isinstance(module, SequentialQuantizer)
+
+
+def test_fused_experts_quantizer_names_do_not_trip_the_guard():
+    """Fused-experts quantizers are named `..._weight_quantizers.N`, plural and indexed, but
+    still contain `weight_quantizer` as a substring and so are still read by the guard.
+    """
+    model = SimpleLinear()
+    mtq.quantize(model, mtq.INT8_DEFAULT_CFG, lambda m: m(m.get_input()))
+
+    # Rename as the fused-experts path does; the config's `*weight_quantizer` must still match.
+    linear = model.net[0]
+    linear.add_module("gate_up_proj_weight_quantizers", torch.nn.ModuleList([TensorQuantizer()]))
+
+    config = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {"quantizer_name": "*gate_up_proj_weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+        ],
+        "algorithm": "max",
+    }
+    mtq.quantize(model, config, lambda m: m(m.get_input()))
+
+
+def test_refining_an_already_quantized_model_does_not_raise():
+    """A second config whose own patterns match nothing still sees the earlier weight
+    quantizers as enabled, so this is refining an already-quantized model, not a no-op run.
+    """
+    model = SimpleLinear()
+    model = mtq.quantize(model, mtq.INT8_DEFAULT_CFG, lambda m: m(m.get_input()))
+    assert any(m.is_enabled for n, m in model.named_modules() if n.endswith("weight_quantizer"))
+
+    refinement = {
+        "quant_cfg": [
+            {"quantizer_name": "*.experts.*weight_quantizer", "cfg": {"num_bits": 4, "axis": 0}},
+        ],
+        "algorithm": None,
+    }
+    mtq.quantize(model, refinement)
+
+    # The earlier weight quantization is untouched.
+    assert any(m.is_enabled for n, m in model.named_modules() if n.endswith("weight_quantizer"))
+
+
+def test_weight_patterns_enabled_then_retracted_do_not_raise():
+    """An unmatched pattern that a later entry disables asks for nothing by the end."""
+    model = SimpleLinear()
+    config = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {"quantizer_name": "*.missing.*weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+            {"quantizer_name": "*.missing.*weight_quantizer", "enable": False},
+        ],
+        "algorithm": "max",
+    }
+    model = mtq.quantize(model, config, lambda m: m(m.get_input()))
+
+    for name, module in model.named_modules():
+        if name.endswith("weight_quantizer"):
+            assert not module.is_enabled
+
+
+def test_bare_wildcard_pattern_matching_nothing_raises():
+    """A bare `"*"` (or another pattern never mentioning "weight") still expresses weight
+    intent if it would match a `weight_quantizer` name -- and must still raise if nothing in
+    the model actually has one, exactly like an explicit `*weight_quantizer` pattern would.
+
+    A model with zero quantizable modules (e.g. `nn.Module()`, no Linear/Conv anywhere) is
+    the degenerate case where this matters: nothing in the config's own text says "weight",
+    so a substring-only check would silently return without ever looking at the model.
+    """
+    model = torch.nn.Module()  # no quantizable submodules at all
+    config = {"quant_cfg": [{"quantizer_name": "*", "cfg": {"num_bits": 8, "axis": 0}}]}
+    with pytest.raises(RuntimeError, match="no weight quantizer is enabled"):
+        mtq.quantize(model, config)
+
+
+def test_overlapping_patterns_disabled_by_a_broader_later_one_still_raise():
+    """A narrower pattern "matching" is not enough -- the final enabled state is what counts.
+
+    `*weight_quantizer` enables real quantizers, but the later, broader `*` disables
+    everything again; the config's net effect is still "nothing quantized" and must raise.
+    A check that asked "did any weight pattern match something" instead of "is anything
+    actually enabled" would miss this, since the narrower pattern did match.
+    """
+    model = SimpleLinear()
+    config = {
+        "quant_cfg": [
+            {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+            {"quantizer_name": "*", "enable": False},
+        ],
+        "algorithm": "max",
+    }
+    with pytest.raises(RuntimeError, match="no weight quantizer is enabled"):
+        mtq.quantize(model, config, lambda m: m(m.get_input()))
+
+
+def test_skip_weight_quant_check_env_var_bypasses_the_guard():
+    """Documented escape hatch for pipeline-parallel ranks whose local stage legitimately
+    has none of the targeted modules (e.g. a pure-attention stage under an experts-only
+    recipe): raising there while other ranks proceed into calibration is a collective hang,
+    not just a wrong per-rank verdict.
+    """
+    model = SimpleLinear()
+    config = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {"quantizer_name": "*.experts.*weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+        ],
+        "algorithm": "max",
+    }
+    with mock.patch.dict(os.environ, {"MODELOPT_SKIP_WEIGHT_QUANT_CHECK": "1"}):
+        mtq.quantize(model, config, lambda m: m(m.get_input()))
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "MODELOPT_SKIP_WEIGHT_QUANT_CHECK",
+        "MODELOPT_TEGROUPED_COMPILE_WEIGHT_LOOP",
+        "MODELOPT_NVFP4_TRITON_SWEEP",
+    ],
+)
+def test_a_malformed_variable_refuses_before_the_model_changes(monkeypatch, variable):
+    """Quantizing reads it once the model has begun to change, so the entry points parse it first."""
+    model = SimpleLinear()
+    forward_loop = lambda m: m(m.get_input())  # noqa: E731
+    monkeypatch.setenv(variable, "enabled")
+    with pytest.raises(ValueError, match=variable):
+        mtq.quantize(model, mtq.INT8_DEFAULT_CFG, forward_loop)
+    with pytest.raises(ValueError, match=variable):
+        mtq.auto_quantize(
+            model,
+            constraints={"effective_bits": 8.0},
+            quantization_formats=[mtq.INT8_DEFAULT_CFG],
+            data_loader=[SimpleLinear.get_input()],
+            forward_step=lambda m, batch: m(batch),
+            loss_func=lambda output, batch: output.sum(),
+        )
+    assert not is_quantized(model)
+
+    monkeypatch.delenv(variable)
+    model = mtq.quantize(model, mtq.INT8_DEFAULT_CFG, forward_loop)
+    quantized = repr(model)
+    monkeypatch.setenv(variable, "enabled")
+    with pytest.raises(ValueError, match=variable):
+        # A config that would disable every quantizer.
+        mtq.quantize(model, {"quant_cfg": [{"quantizer_name": "*", "enable": False}]}, forward_loop)
+    with pytest.raises(ValueError, match=variable):
+        mtq.calibrate(model, "max", forward_loop)
+    assert repr(model) == quantized
+
+
+def _malformed_variable_on_one_rank_job(rank, size):
+    model = SimpleLinear()
+    malformed = {"MODELOPT_SKIP_WEIGHT_QUANT_CHECK": "enabled"} if rank == 1 else {}
+    # Rank 1 raises its own error; rank 0 one naming it.
+    error = ValueError if rank == 1 else RuntimeError
+    with (
+        bounded_collectives(),
+        mock.patch.dict(os.environ, malformed),
+        pytest.raises(error, match="MODELOPT_SKIP_WEIGHT_QUANT_CHECK='enabled'"),
+    ):
+        mtq.quantize(model, mtq.INT8_DEFAULT_CFG, lambda m: m(m.get_input()))
+    assert not is_quantized(model)
+
+
+def test_a_malformed_variable_on_one_rank_refuses_on_every_rank(cpu_dist_workers):
+    """A rank refusing alone would leave the other waiting for it in calibration."""
+    cpu_dist_workers.run(_malformed_variable_on_one_rank_job)
+
+
+class _ToyIndexer(torch.nn.Module):
+    """Stands in for a framework's sparse-attention indexer (vLLM ``Indexer``, MCore ``CSAIndexer``)."""
+
+    def __init__(self):
+        super().__init__()
+        self.wk = torch.nn.Linear(16, 8)
+
+    def forward(self, x):
+        return self.wk(x)
+
+
+class _QuantToyIndexer(_ToyIndexer):
+    def _setup(self):
+        self.indexer_k_quantizer = TensorQuantizer()
+        # Like a pipeline stage's own layer: no amax sync with the other ranks.
+        self.parallel_state = ParallelState(data_parallel_group=-1)
+
+    def forward(self, x):
+        return self.indexer_k_quantizer(super().forward(x))
+
+
+class _ToyIndexerModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(16, 16)
+        self.indexer = _ToyIndexer()
+
+    def forward(self, x):
+        return self.indexer(self.linear(x))
+
+
+INDEXER_K_ONLY_CFG = {
+    "quant_cfg": [
+        {"quantizer_name": "*", "enable": False},
+        {"quantizer_name": "*indexer_k_quantizer", "cfg": {"num_bits": 8, "axis": None}},
+    ],
+    "algorithm": "max",
+}
+
+
+def test_indexer_k_patterns_on_unconverted_indexer_raise():
+    """An indexer the plugins do not recognize must fail instead of leaving its K cache unquantized."""
+    with pytest.raises(RuntimeError, match=r"indexer_k_quantizer.*\(_ToyIndexer\)"):
+        mtq.quantize(_ToyIndexerModel(), INDEXER_K_ONLY_CFG, lambda m: m(torch.randn(2, 16)))
+
+
+def test_indexer_k_patterns_on_model_without_indexer_are_allowed():
+    """Other architectures and pipeline stages without an indexer layer have nothing to quantize."""
+    model = SimpleLinear()
+    mtq.quantize(model, INDEXER_K_ONLY_CFG, lambda m: m(m.get_input()))
+
+
+def test_indexer_k_patterns_on_converted_indexer_pass():
+    mtq.register(original_cls=_ToyIndexer, quantized_cls=_QuantToyIndexer)
+    try:
+        model = mtq.quantize(
+            _ToyIndexerModel(), INDEXER_K_ONLY_CFG, lambda m: m(torch.randn(2, 16))
+        )
+    finally:
+        mtq.unregister(_ToyIndexer)
+    assert model.indexer.indexer_k_quantizer.is_enabled
+    assert model.indexer.indexer_k_quantizer.amax is not None
+
+
+class _ToyStage(torch.nn.Module):
+    """A pipeline stage holding the indexer layers ``layer_ids``."""
+
+    def __init__(self, layer_ids):
+        super().__init__()
+        self.layers = torch.nn.ModuleDict({str(i): _ToyIndexerModel() for i in layer_ids})
+
+    def forward(self, x):
+        return [layer(x) for layer in self.layers.values()]
+
+
+def _test_indexer_check_covers_all_ranks(rank, size):
+    # Rank 0 holds no indexer and rank 1 one that no plugin converted: every rank raises.
+    model = SimpleLinear() if rank == 0 else _ToyIndexerModel()
+    with pytest.raises(RuntimeError, match=r"indexer_k_quantizer.*\(_ToyIndexer\)"):
+        mtq.quantize(model, INDEXER_K_ONLY_CFG, lambda m: None)
+
+    mtq.register(original_cls=_ToyIndexer, quantized_cls=_QuantToyIndexer)
+    try:
+        # A layer-selective recipe: the stage holding layer 0 has no selected indexer, which is fine.
+        config = copy.deepcopy(INDEXER_K_ONLY_CFG)
+        config["quant_cfg"][1]["quantizer_name"] = "*layers.1.indexer.indexer_k_quantizer"
+        model = mtq.quantize(_ToyStage([rank]), config, lambda m: m(torch.randn(2, 16)))
+        assert model.layers[str(rank)].indexer.indexer_k_quantizer.is_enabled == (rank == 1)
+
+        # A pattern that matches no stage: every rank raises.
+        config["quant_cfg"][1]["quantizer_name"] = "*layers.9.indexer.indexer_k_quantizer"
+        with pytest.raises(RuntimeError, match="no sparse-attention indexer has an enabled one"):
+            mtq.quantize(_ToyStage([rank]), config, lambda m: None)
+    finally:
+        mtq.unregister(_ToyIndexer)
+
+
+def test_indexer_k_check_covers_all_ranks(cpu_dist_workers):
+    cpu_dist_workers.run(_test_indexer_check_covers_all_ranks)
+
+
+def _awq_on_a_sharded_fsdp2_model_job(rank, size):
+    model = SimpleLinear()
+    fully_shard(model, mesh=init_device_mesh("cpu", (size,)))
+    forward_loop = lambda m: m(m.get_input())  # noqa: E731
+    with bounded_collectives():
+        for config in (mtq.W4A8_AWQ_BETA_CFG, INT4_AWQ_FULL_CFG):  # awq_lite, awq_full
+            with pytest.raises(NotImplementedError, match=f"FSDP2 model sharded over {size} ranks"):
+                mtq.quantize(model, config, forward_loop)
+        # AutoQuantize checks every candidate before it calibrates the first one.
+        with pytest.raises(NotImplementedError, match="AutoQuantize candidate 'W4A8_AWQ_BETA_CFG'"):
+            mtq.auto_quantize(
+                model,
+                constraints={"effective_bits": 6.0},
+                quantization_formats=[mtq.FP8_DEFAULT_CFG, mtq.W4A8_AWQ_BETA_CFG],
+                data_loader=[SimpleLinear.get_input()],
+                forward_step=lambda m, batch: m(batch),
+                loss_func=lambda output, batch: output.sum(),
+            )
+        assert not is_quantized(model)
+        mtq.quantize(model, mtq.INT8_DEFAULT_CFG, forward_loop)
+        with pytest.raises(NotImplementedError, match="awq_lite"):
+            mtq.calibrate(model, "awq_lite", forward_loop)
+
+
+def test_awq_on_a_sharded_fsdp2_model_is_refused(cpu_dist_workers):
+    """Each rank would fold its own AWQ scale into its shard: every rank refuses alike, before the
+    model changes, through ``mtq.quantize``, ``mtq.auto_quantize`` and ``mtq.calibrate``."""
+    cpu_dist_workers.run(_awq_on_a_sharded_fsdp2_model_job)
+
+
+@pytest.mark.parametrize(
+    ("quantizer_name", "supported"),
+    [
+        ("indexer_q_quantizer", r"configs/ptq/units/indexer_\*_nvfp4"),
+        ("indexer_scorer_kwargs_quantizer", r"scorer kernel arguments.*examples/vllm_serve"),
+    ],
+)
+def test_indexer_patterns_need_their_own_quantizer(quantizer_name, supported):
+    """Each indexer quantizer is checked on its own: a converted key quantizer does not count."""
+    config = copy.deepcopy(INDEXER_K_ONLY_CFG)
+    config["quant_cfg"].append(
+        {"quantizer_name": f"*{quantizer_name}", "cfg": {"num_bits": 8, "axis": None}}
+    )
+    mtq.register(original_cls=_ToyIndexer, quantized_cls=_QuantToyIndexer)
+    try:
+        with pytest.raises(RuntimeError, match=rf"enables {quantizer_name}, but no.*{supported}"):
+            mtq.quantize(_ToyIndexerModel(), config, lambda m: m(torch.randn(2, 16)))
+    finally:
+        mtq.unregister(_ToyIndexer)
+
+
+class _QuantToyScorerIndexer(_QuantToyIndexer):
+    def _setup(self):
+        super()._setup()
+        # Like the vLLM indexers' scorer quantizers: it carries a config and never sees a tensor.
+        self.indexer_scorer_kwargs_quantizer = TensorQuantizer()
+
+
+def _never_on_a_tensor(inputs, quantizer):
+    raise AssertionError("a quantizer that only carries a config ran on a tensor")
+
+
+def test_config_only_quantizer_survives_calibration_fold_summary_and_restore():
+    """An enabled quantizer that never sees a tensor gets no amax and keeps its config."""
+    config = copy.deepcopy(INDEXER_K_ONLY_CFG)
+    config["quant_cfg"] += [
+        {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+        {
+            "quantizer_name": "*indexer_scorer_kwargs_quantizer",
+            "cfg": {"backend": "config_only", "backend_extra_args": {"mma_accum": "fp16"}},
+        },
+    ]
+    register_quant_backend("config_only", _never_on_a_tensor)
+    mtq.register(original_cls=_ToyIndexer, quantized_cls=_QuantToyScorerIndexer)
+    try:
+        model = mtq.quantize(_ToyIndexerModel(), config, lambda m: m(torch.randn(2, 16)))
+        state, weights = mto.modelopt_state(model), copy.deepcopy(model.state_dict())
+        # The steps of vLLM fake-quant serving after quantization.
+        mtq.print_quant_summary(model)
+        mtq.fold_weight(model)
+        restored = mto.restore_from_modelopt_state(_ToyIndexerModel(), state)
+        restored.load_state_dict(weights)
+    finally:
+        mtq.unregister(_ToyIndexer)
+        unregister_quant_backend("config_only")
+    for quantizer in (
+        model.indexer.indexer_scorer_kwargs_quantizer,
+        restored.indexer.indexer_scorer_kwargs_quantizer,
+    ):
+        assert quantizer.is_enabled and quantizer._if_quant
+        assert quantizer.backend == "config_only"
+        assert quantizer.backend_extra_args == {"mma_accum": "fp16"}
+        assert not hasattr(quantizer, "_amax")
+
+
+class _ToyMegaMoEExperts(torch.nn.Module):
+    """Stands in for MoE experts no plugin converts, like vLLM's fused Mega-MoE kernels."""
+
+    def forward(self, x):
+        return x
+
+
+@pytest.mark.parametrize("quantizer_name", ["dispatch_quantizer", "combine_quantizer"])
+def test_moe_comm_patterns_on_unconverted_experts_raise(quantizer_name):
+    model = torch.nn.Sequential(torch.nn.Linear(16, 16), _ToyMegaMoEExperts())
+    config = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {"quantizer_name": f"*{quantizer_name}", "cfg": {"num_bits": 8, "axis": None}},
+        ],
+        "algorithm": "max",
+    }
+    with pytest.raises(RuntimeError, match=rf"{quantizer_name}.*\(_ToyMegaMoEExperts\)"):
+        mtq.quantize(model, config, lambda m: m(torch.randn(2, 16)))
+
+
+def test_indexer_k_sequential_cfg_on_converted_indexer_pass():
+    """A list-valued cfg makes the quantizer a SequentialQuantizer, which still counts as attached."""
+    config = copy.deepcopy(INDEXER_K_ONLY_CFG)
+    config["quant_cfg"][1]["cfg"] = [{"num_bits": 8, "axis": None}, {"num_bits": 8, "axis": None}]
+    mtq.register(original_cls=_ToyIndexer, quantized_cls=_QuantToyIndexer)
+    try:
+        model = mtq.quantize(_ToyIndexerModel(), config, lambda m: m(torch.randn(2, 16)))
+    finally:
+        mtq.unregister(_ToyIndexer)
+    assert isinstance(model.indexer.indexer_k_quantizer, SequentialQuantizer)
+
+
+def test_atomicity_later_cfg_entry_does_not_inherit_earlier():
+    """When two cfg-bearing entries match the same quantizer, the second fully replaces the first."""
+    model = SimpleLinear()
+    config = {
+        "quant_cfg": [
+            # Entry 1: set axis=0
+            {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+            # Entry 2: only set num_bits=4, no axis — axis should revert to default (None), not 0
+            {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 4}},
+            {"quantizer_name": "*input_quantizer", "cfg": {"num_bits": 8, "axis": None}},
+        ],
+        "algorithm": "max",
+    }
+    model = mtq.quantize(model, config, lambda m: m(m.get_input()))
+    default_axis = QuantizerAttributeConfig().axis
+    for name, module in model.named_modules():
+        if name.endswith("weight_quantizer"):
+            assert module.num_bits == 4
+            assert module.axis == default_axis, (
+                f"axis should revert to default ({default_axis}), not inherit 0 from earlier entry"
+            )
+
+
+@pytest.mark.parametrize("default_enabled", [False, True])
+@pytest.mark.parametrize("default_last", [False, True])
+def test_legacy_dict_format_end_to_end(default_last, default_enabled):
+    """Old dict-format quant_cfg works end-to-end through mtq.quantize via normalization."""
+    model = SimpleLinear()
+    # Old-style dict config with "default" key and wildcard keys
+    quant_cfg = {
+        "*weight_quantizer": {"num_bits": 8, "axis": 0},
+        "*input_quantizer": {"num_bits": 8, "axis": None},
+    }
+    # "default" applies first wherever it appears, as in the docs' legacy example.
+    default_cfg = {"num_bits": 4, "enable": True} if default_enabled else {"enable": False}
+    if default_last:
+        quant_cfg["default"] = default_cfg
+    else:
+        quant_cfg = {"default": default_cfg, **quant_cfg}
+    old_config = {"quant_cfg": quant_cfg, "algorithm": "max"}
+    model = mtq.quantize(model, old_config, lambda m: m(m.get_input()))
+    for name, module in model.named_modules():
+        if isinstance(module, TensorQuantizer):
+            if name.endswith(("weight_quantizer", "input_quantizer")):
+                assert module.is_enabled
+                assert module.num_bits == 8
+            elif name.endswith("output_quantizer"):
+                if default_enabled:
+                    # Only "default" matches output_quantizer, so it keeps the default's attributes.
+                    assert module.is_enabled
+                    assert module.num_bits == 4
+                else:
+                    # "default" key → quantizer_name="*" with enable=False disables everything,
+                    # but weight/input quantizers are re-enabled by subsequent entries.
+                    # output_quantizer is NOT re-enabled so it stays disabled.
+                    assert not module.is_enabled
+
+
+@pytest.mark.parametrize("config", ["INT8_DEFAULT_CFG", "W4A8_AWQ_BETA_CFG"])
+@pytest.mark.parametrize("model_mode", ["train", "eval"])
+def test_quantize_keeps_the_training_mode_of_each_module(model_mode, config):
+    # A model can hold a submodule in eval mode, for example a frozen encoder.
+    model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Sequential(torch.nn.Linear(8, 8)))
+    model.train(model_mode == "train")
+    model[1].eval()
+    modes_during_calibration = []
+
+    def forward_loop(m):
+        modes_during_calibration.extend(module.training for module in m.modules())
+        m(torch.randn(2, 8))
+
+    mtq.quantize(model, getattr(mtq, config), forward_loop)
+    assert not any(modes_during_calibration)
+    # Every module, the inserted quantizers included, is back in its own mode or its parent's.
+    assert all(module.training == (model_mode == "train") for module in model[0].modules())
+    assert model.training == (model_mode == "train")
+    assert not any(module.training for module in model[1].modules())
+
+
+def test_quantize_restores_training_modes_through_train():
+    # Modules can do work in train(), such as dropping a cache, so the mode is put back through it.
+    class Tracked(torch.nn.Sequential):
+        def train(self, mode=True):
+            self.last_mode = mode
+            return super().train(mode)
+
+    model = torch.nn.Sequential(Tracked(torch.nn.Linear(8, 8)), Tracked(torch.nn.Linear(8, 8)))
+    model.train()
+    model[1].eval()
+    mtq.quantize(model, mtq.INT8_DEFAULT_CFG, lambda m: m(torch.randn(2, 8)))
+    assert model[0].last_mode is True and model[0].training
+    assert model[1].last_mode is False and not model[1].training
+
+
+def test_calibrate_gives_quantizer_containers_the_mode_of_their_module():
+    # Some plugins keep quantizers in a plain container created during conversion, in training mode.
+    model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Sequential(torch.nn.Linear(8, 8)))
+    mtq.quantize(model, mtq.INT8_DEFAULT_CFG, lambda m: m(torch.randn(2, 8)))
+    model.eval()
+    model[1][0].quantizers = torch.nn.ModuleList([TensorQuantizer()])
+    assert model[1][0].quantizers.training
+    mtq.calibrate(model, "max", lambda m: m(torch.randn(2, 8)))
+    assert not any(module.training for module in model.modules())

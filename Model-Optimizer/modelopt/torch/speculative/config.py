@@ -1,0 +1,809 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Configurations for speculative decoding modes."""
+
+from copy import deepcopy
+from typing import Literal, Self
+
+from pydantic import model_validator
+
+from modelopt.torch.opt.config import ModeloptBaseConfig, ModeloptField
+
+from .eagle.default_config import default_eagle_config, default_kimik2_eagle_config
+
+__all__ = [
+    "DFLASH_DEFAULT_CFG",
+    "EAGLE3_DEFAULT_CFG",
+    "EAGLE_MTP_DEFAULT_CFG",
+    "DFlashConfig",
+    "EagleConfig",
+    "ExternalDraftConfig",
+    "MTPConfig",
+    "MedusaConfig",
+    "eagle3_default_config",
+    "eagle_mtp_default_config",
+    "kimik2_eagle_default_config",
+]
+
+kimik2_eagle_default_config = deepcopy(default_kimik2_eagle_config)
+
+eagle3_default_config = deepcopy(default_eagle_config)
+eagle_mtp_default_config = deepcopy(default_eagle_config)
+
+eagle3_default_config.update({"use_aux_hidden_state": True, "use_last_layernorm": True})
+eagle_mtp_default_config.update({"use_last_layernorm": True, "use_mtp_layernorm": True})
+
+
+EAGLE3_DEFAULT_CFG = {
+    "algorithm": "eagle",
+    "config": {
+        "eagle_architecture_config": eagle3_default_config,
+    },
+}
+
+EAGLE_MTP_DEFAULT_CFG = {
+    "algorithm": "eagle",
+    "config": {
+        "eagle_reuse_base_decoder": True,
+        "eagle_architecture_config": eagle_mtp_default_config,
+    },
+}
+
+
+def _get_dflash_default_config():
+    from .dflash.default_config import default_dflash_config
+
+    return default_dflash_config
+
+
+DFLASH_DEFAULT_CFG = {
+    "algorithm": "dflash",
+    "config": {
+        "dflash_architecture_config": {},  # merged with default at convert time
+    },
+}
+
+
+class DFlashConfig(ModeloptBaseConfig):
+    """DFlash config for block-wise parallel speculative decoding."""
+
+    dflash_offline: bool = ModeloptField(
+        default=False,
+        description=(
+            "Whether the DFlash module consumes pre-computed hidden states (offline from "
+            "dumped .pt files, or streaming via NIXL RDMA from a vLLM serve) instead of running "
+            "the base model. Derived by ModelOptDFlashRecipe from data.mode (True unless "
+            "online); not user-configurable."
+        ),
+    )
+
+    dflash_block_size: int = ModeloptField(
+        default=8,
+        description="Block size for parallel prediction. Draft predicts this many tokens per block.",
+    )
+
+    dflash_freeze_base_model: bool = ModeloptField(
+        default=True, description="Whether to freeze base model during DFlash module training."
+    )
+
+    dflash_self_logit_distillation: bool = ModeloptField(
+        default=True, description="Whether to use logit distillation from base model."
+    )
+
+    dflash_loss_decay_factor: float = ModeloptField(
+        default=0.0,
+        description="Gamma for exponential loss decay weighting (paper Eq.4). "
+        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. 0 disables. "
+        "Only used when dflash_loss_objective='decay'.",
+    )
+
+    dflash_loss_objective: Literal["decay", "dpace"] = ModeloptField(
+        default="dpace",
+        description="Block-position loss weighting objective. 'decay' uses the static "
+        "exponential decay of dflash_loss_decay_factor (DFlash, arXiv:2602.06036 Eq.4). "
+        "'dpace' uses dynamic, confidence-derived per-position weights "
+        "(D-PACE, arXiv:2605.18810 Eq.8).",
+    )
+
+    dflash_dpace_alpha: float = ModeloptField(
+        default=0.5,
+        description="D-PACE asymmetric smoothing factor alpha in (0, 1] (paper Eq.7). Used only "
+        "when dflash_loss_objective='dpace'. Stable in [0.3, 0.7]; alpha=0 is degenerate "
+        "(cumulative product vanishes) and alpha->1 removes the adaptive signal.",
+    )
+
+    dflash_num_anchors: int = ModeloptField(
+        default=512,
+        description="Number of random anchor positions sampled per sequence during training.",
+    )
+
+    dflash_report_acc: bool = ModeloptField(
+        default=True, description="Whether to report eval accuracy."
+    )
+
+    dflash_mask_token_id: int | None = ModeloptField(
+        default=None,
+        description=(
+            "Token ID used for masked (unknown) positions. Set explicitly in the recipe YAML, "
+            "or left unset to fall back to ``tokenizer.mask_token_id`` at training time."
+        ),
+    )
+
+    dflash_architecture_config: dict = ModeloptField(
+        default={}, description="Config for the DFlash draft module architecture."
+    )
+
+    dflash_use_torch_compile: bool = ModeloptField(
+        default=False,
+        description=(
+            "Whether to torch.compile the draft decoder stack and the DSpark TVD chunk in "
+            "training. Compiles once, on the first step, and needs a working Inductor "
+            "toolchain."
+        ),
+    )
+
+    dflash_use_flex_attention: bool = ModeloptField(
+        default=False,
+        description=(
+            "Compute the draft's attention with FlexAttention over a block-sparse BlockMask "
+            "instead of SDPA with a dense [B, 1, Q, KV] mask, skipping fully-masked tiles."
+        ),
+    )
+
+    dflash_swa_window_size: int | None = ModeloptField(
+        default=None,
+        description=(
+            "Sliding-window attention (SWA) window size for the DFlash draft. When set, ALL "
+            "draft layers use sliding-window attention: each draft query attends only to "
+            "context positions within `dflash_swa_window_size` tokens before it. None "
+            "(default) keeps full attention over all context. Must be >= dflash_block_size. "
+            "Exported to the draft config as dflash_config.use_swa/swa_window_size (+ "
+            "top-level sliding_window) so vLLM applies the same window at inference. Whether "
+            "block-internal attention is bidirectional or causal is controlled separately by "
+            "`dflash_draft_attention`."
+        ),
+    )
+
+    dflash_draft_attention: Literal["bidirectional", "causal"] = ModeloptField(
+        default="bidirectional",
+        description=(
+            "Attention pattern *inside* each draft block (context attention is always "
+            "restricted to positions before the block's anchor, and additionally windowed "
+            "when dflash_swa_window_size is set).\n"
+            "- 'bidirectional' (default): every query in a block sees all block_size draft "
+            "positions, including ones after it (MiMo-style). This is what ModelOpt has "
+            "always trained and matches drafts such as XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash "
+            "and z-lab/Qwen3.5-9B-DFlash.\n"
+            "- 'causal': a query at block position i only sees draft positions <= i, so the "
+            "block is predicted autoregressively. Required to faithfully train drafts whose "
+            "config declares dflash_config.causal=true, e.g. "
+            "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16-DSpark.\n"
+            "Exported verbatim to dflash_config.causal, which vLLM's "
+            "qwen3_dflash._dflash_layer_causal reads as a per-model override."
+        ),
+    )
+
+    dflash_attention_sink: bool = ModeloptField(
+        default=False,
+        description=(
+            "Add a learnable per-head attention sink to every draft attention layer. The "
+            "sink is one extra logit per head appended to the attention logits before the "
+            "softmax and dropped afterwards, letting a head place probability mass nowhere "
+            "instead of being forced to attend within a (possibly short) window — the "
+            "GPT-OSS/Nemotron formulation. Adds one `self_attn.attention_sink_bias` "
+            "parameter of shape [num_attention_heads] per layer. Required to load and "
+            "continue training drafts whose checkpoint carries those weights, e.g. "
+            "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16-DSpark. Exported to "
+            "dflash_config.attention_sink_bias for vLLM."
+        ),
+    )
+
+    dflash_init_checkpoint: str | None = ModeloptField(
+        default=None,
+        description=(
+            "Path to an exported draft checkpoint to warm-start from, so training continues "
+            "from published weights instead of a fresh random init. Accepts either a "
+            "directory in the deployment layout this repo exports (``model.safetensors`` "
+            "with no ``dflash_module.`` prefix, alongside ``config.json``) or the "
+            "``model.safetensors`` file itself. Weights are loaded into the draft module "
+            "after it is built, so the architecture still comes from "
+            "``dflash_architecture_config`` — the checkpoint must match it. Any mismatch "
+            "(missing, unexpected, or wrong-shaped tensors) raises rather than silently "
+            "leaving part of the draft randomly initialized. ``embed_tokens``/``lm_head`` "
+            "entries are ignored: the draft takes those from the base model. None "
+            "(default) trains from scratch."
+        ),
+    )
+
+    dflash_export_rope_scaling: dict = ModeloptField(
+        default={},
+        description=(
+            "The rope_scaling config to inject into the exported HuggingFace draft config. "
+            "The DFlash draft trains on a short window but must draft for the target at long "
+            "context, so — mirroring published Eagle3 drafts such as nvidia/Kimi-K2.6-Eagle3 — "
+            "a YaRN rope_scaling is injected at export to extend the training window to the "
+            "target's full context. Example: "
+            '{"type": "yarn", "factor": 48.0, "original_max_position_embeddings": 4096, '
+            '"beta_fast": 1.0, "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0}. '
+            "Set to empty dict {} (default) to disable rope scaling injection at export."
+        ),
+    )
+
+    dflash_lambda_base_start: float = ModeloptField(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Domino only: initial weight of the base (backbone-only) loss in the "
+            "loss = (1 - lambda)*final + lambda*base mixture; linearly decayed to 0. "
+            "Ignored unless dflash_architecture_config.projector_type == 'domino'."
+        ),
+    )
+
+    dflash_lambda_base_decay_ratio: float = ModeloptField(
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Domino only: fraction of total training steps over which lambda_base "
+            "decays from dflash_lambda_base_start to 0."
+        ),
+    )
+
+    dflash_ce_loss_alpha: float = ModeloptField(
+        default=0.1,
+        ge=0.0,
+        description=(
+            "DSpark only: weight of the cross-entropy term in the three-term loss "
+            "(ce_alpha*CE + l1_alpha*TVD + conf_alpha*BCE). "
+            "Ignored unless dflash_architecture_config.projector_type == 'dspark'."
+        ),
+    )
+
+    dflash_l1_loss_alpha: float = ModeloptField(
+        default=0.9,
+        ge=0.0,
+        description=(
+            "DSpark only: weight of the L1/total-variation distribution-matching term "
+            "between the corrected draft and the target distribution. "
+            "Ignored unless dflash_architecture_config.projector_type == 'dspark'."
+        ),
+    )
+
+    dflash_confidence_head_alpha: float = ModeloptField(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "DSpark only: weight of the confidence-head BCE term (predicts the per-position "
+            "acceptance probability). 0 disables the term; requires "
+            "dflash_architecture_config.use_confidence_head=true when > 0. "
+            "Ignored unless dflash_architecture_config.projector_type == 'dspark'."
+        ),
+    )
+
+    dflash_fp32_master_weights: bool = ModeloptField(
+        default=True,
+        description=(
+            "Keep an fp32 master copy of the draft's parameters in the OPTIMIZER, while the "
+            "draft itself stays in the frozen base model's dtype.\n\n"
+            "Without it the draft is cast to the base dtype and AdamW allocates its moments "
+            "with `zeros_like(p)`, so the moments are bf16 too -- and that is where bf16 "
+            "hurts most. Adam's second moment `v` is a running average of the squared "
+            "gradient. At beta2=0.999 a single step can change `v` by at most 0.1%, but the "
+            "smallest change bf16 can represent near `v` is about 0.4%. Every DECREASE "
+            "therefore rounds back to the same number, `v` can only grow, and since the "
+            "update is divided by `sqrt(v)` the effective step size only shrinks -- from "
+            "step 1, at any learning rate.\n\n"
+            "The model is untouched, so nothing has to reconcile dtypes at forward time and "
+            "the exported drafter is unchanged. The cost is memory in the optimizer: 12 "
+            "bytes per draft parameter resident for the master plus Adam's two moments, "
+            "instead of 4, and 16 at the peak of a step, which also holds an fp32 copy of "
+            "the gradients (torch requires the update's gradients to match its parameters). "
+            "Gradients stay in the base dtype outside the step, so unlike an fp32 model this "
+            "does not double the DDP gradient all-reduce.\n\n"
+            "Requires the training loop to build "
+            "`modelopt.torch.speculative.plugins.master_weight_adamw.MasterWeightAdamW`; "
+            "`examples/speculative_decoding` does. `VerifyMasterWeightsCallback` raises after "
+            "the first step if it did not, rather than letting the flag be silently inert.\n\n"
+            "Applies to every projector_type, and on by default: what it costs is optimizer "
+            "memory and the fused AdamW kernel -- the fused path writes through to the "
+            "parameter it is handed, so a run with this flag uses foreach instead -- against "
+            "arithmetic that otherwise loses step size from step 1. Only the draft is in the "
+            "optimizer, so the absolute cost is small. Set it to False to reclaim it when "
+            "training at the limit of a node.\n\n"
+            "NOTE: a training loop that builds its own optimizer gets plain AdamW and "
+            "therefore none of this, silently. Build MasterWeightAdamW, or install "
+            "VerifyMasterWeightsCallback, which turns that into an error at the first step."
+        ),
+    )
+
+    dflash_lilicorr_w_ce: float = ModeloptField(
+        default=-1.0,
+        allow_inf_nan=False,
+        description=(
+            "LiLiCorr only: absolute weight of the cross-entropy term on the reranker's "
+            "per-slot conditional. The objective is "
+            "loss = dflash_loss + w_ce*CE + w_margin*hinge + w_pen*penalty "
+            "(+ w_cal*calibration, see dflash_lilicorr_w_cal). The weights are "
+            "absolute — there is no outer multiplier scaling the three terms as a group — so "
+            "each is the coefficient with which its term enters the total, and "
+            "`loss == origin_loss + lilicorr_loss` holds exactly. Both halves and all three "
+            "weights are reported in the `lilicorr_metrics` dict the model attaches to its "
+            "forward output, so a consumer of those metrics can check the identity per step "
+            "and read which composition produced a checkpoint. The three weights are validated "
+            "all-or-nothing (a negative value means unset): a config that sets some but not "
+            "others is rejected rather than inheriting a default composition. Shipped "
+            "variants: 0.25 ('base') and 0.125 ('margin'). "
+            "Ignored unless dflash_architecture_config.projector_type == 'lilicorr'."
+        ),
+    )
+
+    dflash_lilicorr_w_margin: float = ModeloptField(
+        default=-1.0,
+        allow_inf_nan=False,
+        description=(
+            "LiLiCorr only: absolute weight of the per-slot max-margin (hinge) term, which "
+            "pushes the ground-truth candidate's node potential above the best competing "
+            "candidate by dflash_lilicorr_margin. 0 disables the term (the 'base' variant); "
+            "the 'margin' variant splits the cross-entropy weight convexly into 0.125/0.125. "
+            "Ignored unless dflash_architecture_config.projector_type == 'lilicorr'."
+        ),
+    )
+
+    dflash_lilicorr_margin: float = ModeloptField(
+        default=-1.0,
+        allow_inf_nan=False,
+        description=(
+            "LiLiCorr only: hinge width for the max-margin term, in units of the log-potential "
+            "(itself bounded by lilicorr_logit_scale). Required when "
+            "dflash_lilicorr_w_margin > 0 and unused otherwise; the shipped 'margin' variant "
+            "uses 2.0. Not one of the three term weights, so it is exempt from their "
+            "all-or-nothing validation. "
+            "Ignored unless dflash_architecture_config.projector_type == 'lilicorr'."
+        ),
+    )
+
+    dflash_lilicorr_w_pen: float = ModeloptField(
+        default=-1.0,
+        allow_inf_nan=False,
+        description=(
+            "LiLiCorr only: absolute weight of the target-weighted distractor penalty, the "
+            "reranker's expected target-rejection over its own candidate distribution. Each "
+            "competing candidate is weighted by the target model's logit gap to the ground "
+            "truth, so candidates the target finds plausible are penalized lightly and "
+            "confident wrong ones hard. Requires the target's logits: online training reads "
+            "them directly, offline training reconstructs them from the captured final hidden "
+            "state. Both shipped variants use 0.25. "
+            "Ignored unless dflash_architecture_config.projector_type == 'lilicorr'."
+        ),
+    )
+
+    dflash_lilicorr_w_cal: float = ModeloptField(
+        default=0.0,
+        ge=0.0,
+        allow_inf_nan=False,
+        description=(
+            "LiLiCorr only: absolute weight of the optional calibration term, a KL divergence "
+            "from the target's distribution renormalized over each slot's k candidates to "
+            "the reranker's. An alternative to w_pen whose gradient does not scale with the "
+            "target's logit gap. Requires the target's logits, like w_pen. 0.0 (default) is a "
+            "no-op, and it is not part of the three weights' all-or-nothing validation. "
+            "Ignored unless dflash_architecture_config.projector_type == 'lilicorr'."
+        ),
+    )
+
+    dflash_lk_loss_type: Literal["ce", "tv", "lambda"] = ModeloptField(
+        default="ce",
+        description=(
+            "DFlash2 only: which divergence the block objective minimizes against the "
+            "hard target. 'ce' is -log q(gold), today's behavior. 'tv' is 1 - q(gold), the "
+            "total variation to the one-hot target, which is also the per-position expected "
+            "acceptance loss. 'lambda' anneals between them: the CE share is "
+            "dflash_lk_ce_scale * exp(-dflash_lk_ce_decay * a), where a is the mean q(gold) "
+            "over supervised positions, so the objective moves from fitting the "
+            "distribution to maximizing acceptance as acceptance improves. "
+            "'lambda' and 'tv' require dflash_self_logit_distillation=false: both read "
+            "q(gold) from the per-position cross-entropy, which the KD path does not "
+            "produce. Ignored unless dflash_architecture_config.projector_type == 'dflash2'."
+        ),
+    )
+
+    dflash_lk_ce_scale: float = ModeloptField(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "DFlash2 only: scale of the CE share in the dflash_lk_loss_type='lambda' "
+            "blend. 1.0 starts the run as pure CE. Ignored for other loss types."
+        ),
+    )
+
+    dflash_lk_ce_decay: float = ModeloptField(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "DFlash2 only: how fast the CE share decays as acceptance rises in the "
+            "dflash_lk_loss_type='lambda' blend. 0 pins the blend at dflash_lk_ce_scale. "
+            "Ignored for other loss types."
+        ),
+    )
+
+    dflash_selector_loss_alpha: float = ModeloptField(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "DFlash2 only: weight of the candidate-selector cross-entropy term, added to "
+            "the backbone loss. The selector re-ranks the backbone's top-k candidates per "
+            "block position; 0 trains the backbone and convolutions only. "
+            "Ignored unless dflash_architecture_config.projector_type == 'dflash2'."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_dpace_alpha(self) -> Self:
+        # Validate at construction regardless of the active objective, so a bad alpha
+        # is rejected even if it only becomes active after a later objective override.
+        if not 0.0 < self.dflash_dpace_alpha <= 1.0:
+            raise ValueError(f"dflash_dpace_alpha must be in (0, 1], got {self.dflash_dpace_alpha}")
+        if self.dflash_swa_window_size is not None:
+            # Block-internal attention is left un-windowed, so the window must cover a full
+            # block; otherwise the effective inference window would differ.
+            if self.dflash_swa_window_size < self.dflash_block_size:
+                raise ValueError(
+                    f"dflash_swa_window_size ({self.dflash_swa_window_size}) must be >= "
+                    f"dflash_block_size ({self.dflash_block_size})."
+                )
+        return self
+
+
+class MedusaConfig(ModeloptBaseConfig):
+    """Medusa config."""
+
+    medusa_num_heads: int = ModeloptField(
+        default=2,
+        description=("The number of medusa heads added to the model."),
+    )
+
+    medusa_num_layers: int = ModeloptField(
+        default=1,
+        description=("The number of ResBlocks used in medusa head."),
+    )
+
+
+class MTPConfig(ModeloptBaseConfig):
+    """Offline training settings for a checkpoint-native MTP module."""
+
+    mtp_adapter: str = ModeloptField(
+        default="auto",
+        min_length=1,
+        description=(
+            "Native MTP checkpoint adapter. Use 'auto' to select from checkpoint metadata."
+        ),
+    )
+
+    mtp_loss_type: Literal["lk_lambda", "soft_target_ce"] = ModeloptField(
+        default="lk_lambda",
+        description=("Token distillation objective. Available options: lk_lambda, soft_target_ce."),
+    )
+
+    mtp_lk_eta: float = ModeloptField(
+        default=3.0,
+        ge=0,
+        allow_inf_nan=False,
+        description=("Decay rate for the LK-lambda blend. Zero selects pure KL."),
+    )
+
+    mtp_loss_decay_factor: float = ModeloptField(
+        default=1.0,
+        gt=0,
+        le=1,
+        allow_inf_nan=False,
+        description=("The per-round loss decay factor for native MTP training."),
+    )
+
+    mtp_use_torch_compile: bool = ModeloptField(
+        default=True,
+        description=("Whether to torch.compile the MTP loss. The native decoder stays eager."),
+    )
+
+    mtp_ttt_steps: int = ModeloptField(
+        default=1,
+        strict=True,
+        ge=1,
+        description=("The number of training-time-test steps for native MTP boosting."),
+    )
+
+    mtp_mix_hidden_states: bool = ModeloptField(
+        default=False,
+        description=("Whether to mix hidden states across rounds. Requires mtp_ttt_steps >= 2."),
+    )
+
+    mtp_mix_hidden_states_mode: Literal["uniform_layer_sample"] = ModeloptField(
+        default="uniform_layer_sample",
+        description=(
+            "Hidden state mixing variant used when mtp_mix_hidden_states=True. "
+            "Available options: uniform_layer_sample."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_mix_hidden_states_steps(self) -> Self:
+        if self.mtp_mix_hidden_states and self.mtp_ttt_steps < 2:
+            raise ValueError("mtp_mix_hidden_states requires mtp_ttt_steps >= 2")
+        return self
+
+
+class ExternalDraftConfig(ModeloptBaseConfig):
+    """External (standalone) draft model config.
+
+    The converted module is a pretrained causal LM used directly as the draft. It
+    keeps its own embeddings and lm_head; the base model contributes only cached
+    hidden states, projected by the base lm_head to obtain teacher logits.
+    """
+
+    external_loss: Literal["soft_ce", "tvd", "tvd_deploy", "tvd_ce"] = ModeloptField(
+        default="tvd",
+        description=(
+            "Training objective. ``soft_ce`` matches the Eagle offline objective. "
+            "``tvd`` is total-variation distance between the two untruncated "
+            "distributions. ``tvd_deploy`` puts both through the serving filter first "
+            "(``external_top_k`` then ``external_top_p``), making it the acceptance the "
+            "deployed pair will see: ``alpha = 1 - TVD``. ``tvd_ce`` adds a cross-entropy "
+            "term. Sparse data requires one of the TVD objectives, since the dump is "
+            "already a truncated policy and ``soft_ce`` needs full base logits."
+        ),
+    )
+
+    external_vocab_swap: bool = ModeloptField(
+        default=False,
+        description=(
+            "Re-index the draft onto the base model's vocabulary when the two tokenizers "
+            "differ, instead of raising. Rebuilds the draft's embeddings, carrying over "
+            "rows for tokens both tokenizers spell identically. The replacement matrix is "
+            "``base_vocab_size * hidden_size`` parameters, so this is a large change to a "
+            "small draft; validate with an acceptance measurement, not a loss curve."
+        ),
+    )
+
+    external_tvd_alpha: float = ModeloptField(
+        default=0.9,
+        ge=0.0,
+        description=(
+            "Weight on the TVD term when ``external_loss='tvd_ce'``. The two weights "
+            "are not normalised: they scale the loss as given, so 0.9/0.1 is a "
+            "convention rather than a constraint, and setting only one of them moves "
+            "the overall gradient magnitude as well as the ratio."
+        ),
+    )
+
+    external_ce_alpha: float = ModeloptField(
+        default=0.1,
+        ge=0.0,
+        description=(
+            "Weight on the cross-entropy term when ``external_loss='tvd_ce'``. CE is "
+            "added because TVD is bounded and so discriminates weakly between tokens "
+            "inside the base's support."
+        ),
+    )
+
+    external_top_k: int = ModeloptField(
+        default=20,
+        ge=0,
+        description=(
+            "Top-k of the serving filter, applied to *both* the base and the "
+            "draft by ``external_loss='tvd_deploy'``. 0 disables the top-k stage."
+        ),
+    )
+
+    external_top_p: float = ModeloptField(
+        default=0.95,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Top-p of the serving filter, applied to *both* the base and the "
+            "draft by ``external_loss='tvd_deploy'``. 0 or 1.0 disables the nucleus stage."
+        ),
+    )
+
+    external_report_acc: bool = ModeloptField(
+        default=True,
+        description=("Whether to report top-1 agreement with the base model during training."),
+    )
+
+
+class EagleConfig(ModeloptBaseConfig):
+    """Eagle config."""
+
+    eagle_offline: bool = ModeloptField(
+        default=False,
+        description=(
+            "Whether the Eagle module consumes pre-computed hidden states (offline or streaming) "
+            "instead of running the base model in-process. Derived by ModelOptEagleRecipe from "
+            "``data.mode``; not user-configurable."
+        ),
+    )
+
+    eagle_hidden_state_distillation: bool = ModeloptField(
+        default=False, description=("Whether to use feature hidden states distillation.")
+    )
+
+    eagle_self_logit_distillation: bool = ModeloptField(
+        default=True, description=("Whether to use logit distillation.")
+    )
+
+    eagle_freeze_base_model: bool = ModeloptField(
+        default=True, description=("Whether to freeze base model during eagle module training.")
+    )
+
+    eagle_report_acc: bool = ModeloptField(
+        default=True, description=("Whether to report eval accuracy.")
+    )
+
+    eagle_reuse_base_decoder: bool = ModeloptField(
+        default=False, description=("Whether to reuse base model decoder in eagle module.")
+    )
+
+    eagle_loss_decay_factor: float = ModeloptField(
+        default=0.9, description=("The decay factor for multiple eagle_loss.")
+    )
+
+    eagle_loss_type: Literal["soft_target_ce", "lk_lambda"] = ModeloptField(
+        default="soft_target_ce",
+        description=(
+            "Token distillation objective. Available options: soft_target_ce, lk_lambda. "
+            "LK lambda requires the Hugging Face backend and the full target vocabulary."
+        ),
+    )
+
+    eagle_lk_eta: float = ModeloptField(
+        default=3.0,
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "Decay rate for the LK-lambda blend when eagle_loss_type='lk_lambda'. "
+            "Zero selects pure KL."
+        ),
+    )
+
+    eagle_architecture_config: dict = ModeloptField(
+        default={}, description=("The config for eagle module architecture.")
+    )
+
+    eagle_decoder_type: str = ModeloptField(
+        default="llama",
+        description=("The class of eagle decoder to use. Available options: llama, kimik2"),
+    )
+
+    eagle_ttt_steps: int = ModeloptField(
+        default=3, description=("The number of train-time-test steps in training.")
+    )
+
+    eagle_mix_hidden_states: bool = ModeloptField(
+        default=False,
+        description=(
+            "Whether to mix hidden states of multiple TTT steps. It is a technique to reduce training cost."
+        ),
+    )
+
+    eagle_mix_hidden_states_mode: Literal["sparse_replace", "uniform_layer_sample"] = ModeloptField(
+        default="sparse_replace",
+        description=(
+            "Hidden state mixing variant used when eagle_mix_hidden_states=True. "
+            "Available options: sparse_replace, uniform_layer_sample."
+        ),
+    )
+
+    eagle_use_torch_compile: bool = ModeloptField(
+        default=True,
+        description="Whether to use torch.compile on eagle forward/loss methods for faster training.",
+    )
+
+    eagle_enable_nvtx: bool = ModeloptField(
+        default=False,
+        description="Whether to enable NVTX ranges for profiling eagle forward/loss methods.",
+    )
+
+    eagle_export_rope_scaling: dict = ModeloptField(
+        default={"rope_type": "yarn", "factor": 32.0, "original_max_position_embeddings": 2048},
+        description=(
+            "The rope_scaling config to inject into the exported HuggingFace model config. "
+            "Applied when the training rope_type is 'default' (no scaling). "
+            "Set to empty dict {} to disable rope scaling injection at export."
+        ),
+    )
+
+    eagle_base_lora: bool = ModeloptField(
+        default=False,
+        description=(
+            "Whether to add LoRA adapters to the base model for co-training with the EAGLE module. "
+            "Requires the `peft` library. Incompatible with eagle_offline=True."
+        ),
+    )
+
+    eagle_base_lora_rank: int = ModeloptField(
+        default=64,
+        description="LoRA rank for the base model adapters.",
+    )
+
+    eagle_base_lora_alpha: float = ModeloptField(
+        default=16.0,
+        description="LoRA alpha (scaling) for the base model adapters.",
+    )
+
+    eagle_base_lora_target_modules: list | None = ModeloptField(
+        default=None,
+        description=(
+            "List of module name patterns to apply LoRA to in the base model "
+            "(e.g. ['q_proj', 'v_proj']). None uses peft defaults."
+        ),
+    )
+
+    eagle_base_lora_preservation_loss_weight: float = ModeloptField(
+        default=0.1,
+        description=(
+            "Weight for the preservation loss that minimizes the KL divergence between "
+            "the LoRA-adapted base model output and the original base model output."
+        ),
+    )
+
+    eagle_base_lora_warmup_steps: int = ModeloptField(
+        default=0,
+        description=(
+            "Number of warmup steps where LoRA is frozen and only the EAGLE draft head trains. "
+            "After warmup, LoRA is enabled for co-training."
+        ),
+    )
+
+    eagle_base_lora_start_layer: int | None = ModeloptField(
+        default=None,
+        description=(
+            "If set, only inject LoRA into base model layers with index >= this value. "
+            "For example, setting to 17 on a 36-layer model applies LoRA to layers 17-35 only."
+        ),
+    )
+
+    eagle_base_lora_logits_detach_prob: float = ModeloptField(
+        default=0.5,
+        description=(
+            "After warmup, probability of detaching the teacher distribution from the EAGLE loss "
+            "each step. "
+            "Acts as dropout regularization on the eagle-loss-to-LoRA gradient path through "
+            "logits, preventing LoRA from degenerating to maximize EAGLE accuracy at the cost "
+            "of base model quality. 1.0 = always detach (no logits gradient), 0.0 = never detach."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_lk_lambda_base_lora(self) -> Self:
+        if self.eagle_loss_type == "lk_lambda" and self.eagle_base_lora:
+            raise ValueError(
+                "eagle_loss_type='lk_lambda' requires a frozen teacher and is incompatible "
+                "with eagle_base_lora=True. Use eagle_loss_type='soft_target_ce' for base-LoRA."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_rope_scaling_consistency(self) -> Self:
+        if not self.eagle_export_rope_scaling:
+            return self
+        rope_cfg = self.eagle_architecture_config.get("rope_scaling", {}) or {}
+        rope_type = rope_cfg.get("rope_type") or rope_cfg.get("type")
+        if rope_type is not None and rope_type != "default":
+            raise ValueError(
+                f"eagle_export_rope_scaling is set but eagle_architecture_config has "
+                f"rope_type='{rope_type}'. Export rope overwrite is only valid when the "
+                f"training rope_type is 'default' (no scaling)."
+            )
+        return self
