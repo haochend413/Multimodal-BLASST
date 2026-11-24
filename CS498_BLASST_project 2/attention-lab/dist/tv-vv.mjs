@@ -7,6 +7,8 @@ export function setupTVVVSweep(showView) {
   const variantLabel = value => active().data.variant_labels?.[value] ??
     (value === 'baseline' ? 'Standard BLASST' : `${Number(value) * 100}% relevance`);
   const fraction = (a, b) => b ? `${a} / ${b} (${(100 * a / b).toFixed(1)}%)` : '—';
+  const caseScore = run => run.rouge_l != null ? ` · ROUGE-L F1 ${run.rouge_l.toFixed(1)}/100` :
+    run.vqa_score != null ? ` · VQA score ${run.vqa_score.toFixed(1)}%` : '';
 
   function options(id, values, label = String) {
     const element = $(id);
@@ -30,7 +32,7 @@ export function setupTVVVSweep(showView) {
     $('coverage').textContent = layer.visual_query_tokens == null
       ? `V→V QK tiles bypassed in layer ${layer.layer} · ${fraction(layer.vv_tiles_bypassed, layer.pure_vv_tiles)}${source}`
       : `Visual tokens selected in layer ${layer.layer} · ${fraction(layer.visual_query_tokens_selected, layer.visual_query_tokens)} · V→V QK pairs bypassed ${fraction(layer.vv_pairs_bypassed, layer.vv_pairs)}${source}`;
-    const score = run.vqa_score == null ? '' : ` · VQA score ${run.vqa_score.toFixed(1)}%`;
+    const score = caseScore(run);
     $('answer').textContent = run.answer == null ? '' : `Generated answer · ${run.answer || '(empty)'}${score}`;
     for (const vote of layer.votes) {
       const decision = vote.mask_fallback ? 'Mask fallback' : vote.protected_first_key
@@ -47,7 +49,7 @@ export function setupTVVVSweep(showView) {
     $('layers-detail').hidden = !run.layers?.length;
     options('layer', (run.layers ?? []).map(layer => layer.layer), layer => `Layer ${layer}`);
     if (!run.layers?.length) {
-      const score = run.vqa_score == null ? '' : ` · VQA score ${run.vqa_score.toFixed(1)}%`;
+      const score = caseScore(run);
       $('answer').textContent = `Generated answer · ${run.answer || '(empty)'}${score}`;
       return;
     }
@@ -58,6 +60,7 @@ export function setupTVVVSweep(showView) {
     const {data} = active();
     const variants = Object.keys(data.variants);
     const official = data.answer_metric === 'VQA v2 consensus';
+    const rouge = data.answer_metric === 'ROUGE-L F1';
     const decodeLinks = data.decode_visual_link_study;
     const binary = data.binary_tv_pipeline;
     $('bypass-header').textContent = binary ? 'QK token pairs bypassed' : decodeLinks ? 'Decode visual QK tiles bypassed' :
@@ -79,8 +82,8 @@ export function setupTVVVSweep(showView) {
       $('budget-note').textContent = `Calibration targets from QK skip only · prefill ${(100 * targets.prefill).toFixed(1)}% skipped · decode ${(100 * targets.decode).toFixed(1)}% skipped. The table shows held-out skip rates.`;
     }
     const maxPhases = ["prefill", "decode"].filter(phase => data[`${phase}_max_policies`]);
-    $('accuracy-header').textContent = budgets ? 'VQA v2 accuracy · Δ vs QK skip' :
-      official ? 'VQA v2 accuracy' : 'Reference exact matches';
+    const scoreLabel = rouge ? 'ROUGE-L F1' : official ? 'VQA v2 accuracy' : 'Reference exact matches';
+    $('accuracy-header').textContent = budgets ? `${scoreLabel} · Δ vs QK skip` : scoreLabel;
     for (const phase of ["prefill", "decode"]) {
       const header = $(`${phase}-header`);
       header.hidden = !maxPhases.includes(phase);
@@ -92,10 +95,11 @@ export function setupTVVVSweep(showView) {
     $('summary').replaceChildren();
     for (const variant of variants) {
       const result = data.summary[variant];
-      const difference = budgets ? result.vqa_delta_vs_qk_pp : result.vqa_delta_pp;
+      const prefix = rouge ? 'rouge_l' : 'vqa';
+      const difference = result[`${prefix}_delta_${budgets ? 'vs_qk_pp' : 'pp'}`];
       const delta = difference == null ? '' :
-        ` (${difference >= 0 ? '+' : ''}${difference.toFixed(1)} pp)`;
-      const accuracy = official ? `${result.vqa_accuracy.toFixed(1)}%${delta}` :
+        ` (${difference >= 0 ? '+' : ''}${difference.toFixed(1)} ${rouge ? 'pts' : 'pp'})`;
+      const accuracy = rouge ? `${result.rouge_l.toFixed(1)}/100${delta}` : official ? `${result.vqa_accuracy.toFixed(1)}%${delta}` :
         fraction(result.reference_exact_matches ?? 0, result.answers_scored);
       const bypassed = binary && result.prefill_tv_qk_pairs != null
         ? ['prefill T→V', 'prefill V→V', 'decode T→V'].map((label, index) => {

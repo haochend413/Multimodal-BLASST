@@ -7,6 +7,7 @@ import json
 from collections import defaultdict
 from contextlib import contextmanager
 
+from answer_benchmarks import ANSWER_BENCHMARKS, VQAV2
 from binary_tv_pipeline import BINARY_TV_COUNTS
 from decode_visual_links import DECODE_LINK_COUNTS
 from tile_calibration import write_json
@@ -16,7 +17,9 @@ CHECKPOINT_INTERVAL = 25
 MAX_POLICIES = ("prefill_max_policies", "decode_max_policies")
 TILE_COUNTS = ("prefill_tiles", "prefill_tiles_skipped", "decode_tiles", "decode_tiles_skipped",
                "prefill_qk_bypassed", *DECODE_LINK_COUNTS, *TOKEN_GATE_COUNTS, *BINARY_TV_COUNTS)
-CASE_FIELDS = ("answer", "vqa_score", "pure_vv_tiles", "vv_tiles_bypassed", "answer_changed", *TILE_COUNTS)
+CASE_FIELDS = ("answer", "vqa_score", "rouge_l", "generated_tokens", "pure_vv_tiles", "vv_tiles_bypassed",
+               "answer_changed", *TILE_COUNTS)
+PROTOCOLS_BY_METRIC = {protocol.metric: protocol for protocol in ANSWER_BENCHMARKS.values()}
 
 
 @contextmanager
@@ -63,29 +66,38 @@ def resume(report, output, samples, start):
     report["cases"] = cases
 
 
-def accumulate(totals, case, *, reference="baseline"):
-    baseline = case["results"][reference]["vqa_score"]
+def accumulate(totals, case, *, reference="baseline", protocol=VQAV2):
+    baseline = case["results"][reference][protocol.case_score]
     for name, result in case["results"].items():
         counts = totals[name]
-        counts["vqa_score_sum"] += result["vqa_score"]
+        score = result[protocol.case_score]
+        counts[f"{protocol.prefix}_score_sum"] += score
         counts["answers_scored"] += 1
         for key in ("pure_vv_tiles", "vv_tiles_bypassed", *TILE_COUNTS):
             if key in result:
                 counts[key] += result[key]
+        if "generated_tokens" in result:
+            counts["generated_tokens"] += result["generated_tokens"]
+            counts["generation_lengths_recorded"] += 1
+            counts["decode_steps"] += max(result["generated_tokens"] - 1, 0)
         if name != reference:
             counts["answers_changed"] += result["answer_changed"]
-            counts["vqa_better"] += result["vqa_score"] > baseline
-            counts["vqa_worse"] += result["vqa_score"] < baseline
+            counts[f"{protocol.prefix}_better"] += score > baseline
+            counts[f"{protocol.prefix}_worse"] += score < baseline
 
 
-def summarize(totals, *, reference="baseline"):
+def summarize(totals, *, reference="baseline", protocol=VQAV2):
     summary = {}
-    baseline = totals[reference]["vqa_score_sum"] / totals[reference]["answers_scored"]
+    score_field = f"{protocol.prefix}_score_sum"
+    baseline = totals[reference][score_field] / totals[reference]["answers_scored"]
     for name, totals_for_variant in totals.items():
-        score = totals_for_variant["vqa_score_sum"] / totals_for_variant["answers_scored"]
-        summary[name] = dict(totals_for_variant, vqa_accuracy=score)
+        score = totals_for_variant[score_field] / totals_for_variant["answers_scored"]
+        summary[name] = dict(totals_for_variant, **{protocol.summary_score: score})
+        if observed := totals_for_variant.get("generation_lengths_recorded"):
+            summary[name]["mean_generated_tokens"] = totals_for_variant["generated_tokens"] / observed
+            summary[name]["mean_decode_steps"] = totals_for_variant["decode_steps"] / observed
         if name != reference:
-            summary[name]["vqa_delta_pp"] = score - baseline
+            summary[name][f"{protocol.prefix}_delta_pp"] = score - baseline
     return summary
 
 
@@ -108,7 +120,7 @@ def merge(paths, output):
         if not shard:
             raise ValueError(f"{path} is not a VQA shard report")
         expected_config = {key: report[key] for key in config_keys}
-        for key in (*MAX_POLICIES, "variant_labels", "decode_visual_link_study", "token_top_k", "binary_tv_pipeline"):
+        for key in (*MAX_POLICIES, "benchmark", "variant_labels", "decode_visual_link_study", "token_top_k", "binary_tv_pipeline"):
             if key in report:
                 expected_config[key] = report[key]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}
@@ -131,7 +143,7 @@ def merge(paths, output):
             if qid in question_ids or case["results"].keys() != config["variants"].keys():
                 raise ValueError(f"{path} has a duplicate question ID or incomplete pair")
             question_ids.add(qid)
-            accumulate(totals, case)
+            accumulate(totals, case, protocol=PROTOCOLS_BY_METRIC[config["answer_metric"]])
             for name, result in case["results"].items():
                 predictions[name].append({"question_id": qid, "answer": result["answer"]})
         seen_shards.add(shard["index"])
@@ -140,7 +152,7 @@ def merge(paths, output):
         raise ValueError(f"{len(missing)} missing shards; first missing shard is {min(missing)}")
     total = manifest.get("selection_count", manifest["manifest_questions"])
     merged = dict(config, pairs_requested=total, pairs_completed=len(question_ids), cases=[],
-                  summary=summarize(totals), vqa_merged=manifest)
+                  summary=summarize(totals, protocol=PROTOCOLS_BY_METRIC[config["answer_metric"]]), vqa_merged=manifest)
     for pairs in predictions.values():
         pairs.sort(key=lambda row: row["question_id"])
     save_predictions(output, predictions)
@@ -159,8 +171,9 @@ def main():
         report = merge(args.shards, args.output)
     except (ValueError, KeyError, OSError) as error:
         parser.error(str(error))
+    protocol = PROTOCOLS_BY_METRIC[report["answer_metric"]]
     for policy, values in report["summary"].items():
-        print(f"{policy}: {values['vqa_accuracy']:.2f}% on {values['answers_scored']} questions")
+        print(f"{policy}: {protocol.format_score(values)} on {values['answers_scored']} questions")
     print(f"Wrote merged VQA report to {args.output}")
 
 

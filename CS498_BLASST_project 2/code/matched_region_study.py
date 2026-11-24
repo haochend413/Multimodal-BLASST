@@ -7,9 +7,9 @@ import math
 from collections import defaultdict
 
 import vqa_shards
+from answer_benchmarks import VQAV2
 from tile_calibration import write_json
 from tv_guided_vv import SWEEP_SCHEMA, TOKEN_GATE_COUNTS
-from vqav2_accuracy import SHORT_ANSWER_INSTRUCTION, score_answer
 
 BUDGET_SCHEMA = "blasst-matched-region-budget-v2"
 REFERENCE = "qk_skip"
@@ -84,6 +84,7 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
     if getattr(args, "gate_distribution", False):
         return run_gate_distribution(args, parser, samples, collect, select_sample, tile_size)
     calibration, evaluation = samples[:args.calibration_count], samples[args.calibration_count:]
+    protocol = getattr(args, "answer_protocol", VQAV2)
     top_percent = getattr(args, "tv_vv_top_percent", None)
     token_percent = getattr(args, "tv_vv_token_percent", None)
     threshold = args.tv_vv_threshold
@@ -95,6 +96,8 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
                     requested_keep_rate=args.budget_keep_percent / 100, decode_tokens=args.decode_tokens,
                     image_max_pixels=args.image_max_pixels, max_prompt_tokens=args.max_tokens,
                     probes=args.budget_probes, tolerance_pp=args.budget_tolerance_pp)
+    if protocol is not VQAV2:
+        settings["benchmark"] = protocol.name
     if top_percent is not None:
         settings["gate_top_percent"] = top_percent
     if token_percent is not None:
@@ -112,12 +115,14 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
                                             decode_tokens=1 if prefill_only else args.decode_tokens))
         select_sample(options, parser, sample)
         benchmark = sample["benchmark"]
-        options.question = f"{benchmark['question_text']}\n{SHORT_ANSWER_INSTRUCTION}"
+        options.question = f"{benchmark['question_text']}\n{protocol.instruction}"
         before = {phase: state["phase_stats"].get(phase, {}).copy() for phase in PHASES}
         metadata = collect(options, parser, benchmark, sample["id"])
         trace = metadata["tv_guided_vv"]
         result = dict(answer=metadata["answer"], pure_vv_tiles=trace["pure_vv_tiles"],
                       vv_tiles_bypassed=trace["vv_tiles_bypassed"])
+        if "generated_tokens" in metadata:
+            result["generated_tokens"] = metadata["generated_tokens"]
         if token_percent is not None:
             result.update({key: trace[key] for key in TOKEN_GATE_COUNTS})
         for phase in PHASES:
@@ -161,11 +166,13 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
     report = dict(schema=SWEEP_SCHEMA, model=args.model, synthetic=False, tile_size=tile_size,
                   blasst_lambda=config["lambdas"][REFERENCE]["prefill"],
                   decode_lambda=config["lambdas"][REFERENCE]["decode"], pairs_requested=len(evaluation),
-                  answer_metric="VQA v2 consensus",
+                  answer_metric=protocol.metric,
                   variants=dict.fromkeys(POLICIES, threshold if top_percent is None else top_percent),
                   variant_labels=LABELS, budget_calibration=config, cases=[],
-                  answer_protocol=dict(instruction=SHORT_ANSWER_INSTRUCTION, max_new_tokens=args.decode_tokens,
+                  answer_protocol=dict(instruction=protocol.instruction, max_new_tokens=args.decode_tokens,
                                        min_new_tokens=0))
+    if protocol is not VQAV2:
+        report["benchmark"] = protocol.name
     if token_percent is not None:
         report["token_top_k"] = True
         report["variants"] = dict.fromkeys(POLICIES, token_percent)
@@ -175,7 +182,7 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
     vqa_shards.resume(report, args.output, evaluation, eval_start)
     totals = defaultdict(lambda: defaultdict(int))
     for case in report["cases"]:
-        vqa_shards.accumulate(totals, case, reference=REFERENCE)
+        vqa_shards.accumulate(totals, case, reference=REFERENCE, protocol=protocol)
     completed = len(report["cases"])
     for index, sample in enumerate(evaluation[completed:], start=eval_start + completed):
         benchmark = sample["benchmark"]
@@ -184,28 +191,28 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
         for policy in POLICIES:
             result, observed_gate = forward(sample, policy, config["lambdas"][policy], gate)
             check_gate(result, ref, gate, observed_gate)
-            result["vqa_score"] = score_answer(result["answer"], benchmark["reference_answers"])
+            result[protocol.case_score] = protocol.score(result["answer"], benchmark["reference_answers"])
             if policy != REFERENCE:
                 result["answer_changed"] = result["answer"] != case["results"][REFERENCE]["answer"]
             case["results"][policy] = result
         report["cases"].append(case)
-        vqa_shards.accumulate(totals, case, reference=REFERENCE)
+        vqa_shards.accumulate(totals, case, reference=REFERENCE, protocol=protocol)
         done = len(report["cases"])
         if done % vqa_shards.CHECKPOINT_INTERVAL == 0 or done == len(evaluation):
-            report["summary"] = summarize(totals)
+            report["summary"] = summarize(totals, protocol=protocol)
             report["evaluation_budget"] = evaluation_budget(report["summary"], config)
             write_json(args.output, report)
             print(f"Evaluated {done}/{len(evaluation)} held-out questions across four policies", flush=True)
     predictions = {name: [{"question_id": case["question_id"], "answer": case["results"][name]["answer"]}
                           for case in report["cases"]] for name in POLICIES}
     vqa_shards.save_predictions(args.output, predictions)
-    summary = summarize(totals)
+    summary = summarize(totals, protocol=protocol)
     for name, result in summary.items():
         keeps = " · ".join(
             f"{phase} kept after QK {result[f'{phase}_kept_after_qk']}/{result[f'{phase}_tiles_after_qk']} "
             f"({value:.2%})" for phase in PHASES if (value := result[f"{phase}_keep_rate_after_qk"]) is not None
         )
-        print(f"{name}: VQA {result['vqa_accuracy']:.2f}% · {keeps}")
+        print(f"{name}: {protocol.format_score(result)} · {keeps}")
     for phase, budget in evaluation_budget(summary, config).items():
         spread = budget["spread_pp"]
         detail = f" · between-policy spread {spread:.2f} pp" if spread is not None else ""
@@ -222,6 +229,7 @@ def run_gate_distribution(args, parser, samples, collect, select_sample, tile_si
     top_percent = args.tv_vv_top_percent
     token_percent = args.tv_vv_token_percent
     threshold = args.tv_vv_threshold
+    protocol = getattr(args, "answer_protocol", VQAV2)
     if all(value is None for value in (threshold, top_percent, token_percent)):
         threshold = .5
     cases = []
@@ -231,7 +239,7 @@ def run_gate_distribution(args, parser, samples, collect, select_sample, tile_si
                                             tv_vv_threshold=threshold, decode_tokens=1))
         select_sample(options, parser, sample)
         benchmark = sample["benchmark"]
-        options.question = f"{benchmark['question_text']}\n{SHORT_ANSWER_INSTRUCTION}"
+        options.question = f"{benchmark['question_text']}\n{protocol.instruction}"
         result = collect(options, parser, benchmark, sample["id"])["gate_distribution"]
         cases.append(dict(sample_id=sample["id"], question_id=benchmark["question_id"], **result))
         for field, counts in totals.items():
@@ -275,11 +283,11 @@ def calibrate(probe, reference, settings):
                 calibration=calibration, common_keep_targets=targets, keep_rates_at_lambda_one=minimums)
 
 
-def summarize(totals):
-    summary = vqa_shards.summarize(totals, reference=REFERENCE)
+def summarize(totals, *, protocol=VQAV2):
+    summary = vqa_shards.summarize(totals, reference=REFERENCE, protocol=protocol)
     reference = summary[REFERENCE]
     for result in summary.values():
-        result["vqa_delta_vs_qk_pp"] = result["vqa_accuracy"] - reference["vqa_accuracy"]
+        result[f"{protocol.prefix}_delta_vs_qk_pp"] = result[protocol.summary_score] - reference[protocol.summary_score]
         for phase in PHASES:
             kept, total = post_qk_counts(result, phase)
             result[f"{phase}_kept_after_qk"] = kept

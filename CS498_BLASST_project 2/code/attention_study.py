@@ -16,6 +16,7 @@ from uuid import uuid4
 import torch
 
 import blasst_attn as ba
+from answer_benchmarks import ANSWER_BENCHMARKS, VQAV2
 from binary_tv_pipeline import BinaryTVPipeline
 from decode_visual_links import DecodeVisualLinks
 from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy, VISUAL_KEY_QUERY_SPLIT
@@ -24,7 +25,6 @@ from jl_region_study import JLRegionStudy, merge_region_audits
 from tile_layer_study import LayerReport, TileLayerRecorder
 from tile_calibration import add_threshold_arguments, selected_calibration, write_json
 from tv_guided_vv import SWEEP_SCHEMA as TV_VV_SCHEMA, TOKEN_GATE_COUNTS, TVGuidedVV
-from vqav2_accuracy import SHORT_ANSWER_INSTRUCTION, score_answer, validate_cases
 from region_max import RegionMax
 import vqa_shards
 
@@ -236,7 +236,7 @@ def main() -> None:
     parser.add_argument("--question", default="Describe what is shown.")
     parser.add_argument("--layers", default="0,7,14,21,27")
     parser.add_argument("--heads", default="0,4")
-    parser.add_argument("--decode-tokens", type=int, default=16)
+    parser.add_argument("--decode-tokens", type=int, help="maximum new tokens (default: 16 for VQA v2, 128 for VizWiz-LF)")
     parser.add_argument("--lambda", dest="lam", type=float, default=0)
     parser.add_argument("--decode-lambda", type=float)
     parser.add_argument("--prefill-region-max", action=argparse.BooleanOptionalAction, default=False,
@@ -266,8 +266,8 @@ def main() -> None:
                        help="compare BLASST, binary T→T-guided T→V, and the full T→V-guided V→V pipeline")
     tv_vv.add_argument("--binary-tv-phase-study", action="store_true",
                        help="compare BLASST with prefill-only and decode-only binary T→T-guided T→V")
-    parser.add_argument("--vqa-accuracy", action="store_true",
-                        help="use short-answer generation and the official VQA score in a VQA v2 sweep")
+    parser.add_argument("--vqa-accuracy", "--score-answers", action="store_true",
+                        help="score paired predictions using the selected benchmark's metric")
     parser.add_argument("--matched-region-study", action="store_true",
                         help="compare four running-max policies at matched post-QK keep rates")
     parser.add_argument("--calibration-count", type=int, default=20,
@@ -309,18 +309,25 @@ def main() -> None:
                         help="audit modality splits; query-on-visual-keys only splits mixed query "
                              "rows against entirely visual keys")
     parser.add_argument("--demo", action="store_true", help="synthetic CPU Q/K; no model downloads")
-    parser.add_argument("--manifest", type=Path, help="Video-MME or VQA v2 benchmark manifest")
+    parser.add_argument("--manifest", type=Path, help="benchmark manifest")
+    parser.add_argument("--benchmark", choices=tuple(ANSWER_BENCHMARKS), default="vqav2",
+                        help="answer-evaluation protocol for paired runs")
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--sample-count", type=int,
                         help="number of manifest cases to test, before splitting into shards")
     args = parser.parse_args()
+    args.answer_protocol = ANSWER_BENCHMARKS[args.benchmark]
+    if args.decode_tokens is None:
+        args.decode_tokens = args.answer_protocol.decode_tokens
+    if args.answer_protocol is not VQAV2:
+        args.vqa_accuracy = True
     binary_study = args.binary_tv_pipeline or args.binary_tv_phase_study
     if args.decode_visual_links or binary_study:
         flag = "--decode-visual-links"
         if binary_study:
             flag = "--binary-tv-phase-study" if args.binary_tv_phase_study else "--binary-tv-pipeline"
         if not args.manifest or args.demo or args.decode_tokens < 2:
-            parser.error(f"{flag} requires a VQA v2 manifest and at least two generated tokens")
+            parser.error(f"{flag} requires a benchmark manifest and at least two generated tokens")
         if (args.matched_region_study or args.gate_distribution or args.prefill_region_max
                 or args.decode_region_max or args.vv_prefix_attention or args.jl_dim is not None
                 or args.jl_sweep or args.jl_region_audit or args.tile_layer_study
@@ -354,7 +361,7 @@ def main() -> None:
     if args.vqa_accuracy and not (args.manifest and (args.tv_vv_sweep is not None or args.tv_vv_top_accuracy
                                                     or args.decode_visual_links or binary_study
                                                     or args.matched_region_study or args.gate_distribution)):
-        parser.error("--vqa-accuracy requires a VQA v2 manifest and a paired study")
+        parser.error("Answer scoring requires a compatible benchmark manifest and a paired study")
     args.vqa_shard = None
     if args.vqa_shards is not None or args.vqa_shard_index is not None:
         if not args.vqa_accuracy or args.vqa_shards is None or args.vqa_shard_index is None:
@@ -443,6 +450,11 @@ def main() -> None:
         if manifest.get("schema") != "blasst-benchmark-manifest-v1":
             parser.error("unsupported benchmark manifest schema")
         samples = manifest["samples"]
+        if args.answer_protocol is not VQAV2 and requested_sample_count is None:
+            reserved = args.calibration_count if args.matched_region_study else 0
+            args.sample_count = len(samples) - args.sample_index - reserved
+            if args.sample_count < 1:
+                parser.error("No questions remain after the selected offset and calibration range")
         if args.matched_region_study:
             args.budget_manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
         if args.vqa_shards is not None:
@@ -463,7 +475,7 @@ def main() -> None:
         samples = samples[args.sample_index:end]
         if args.vqa_accuracy:
             try:
-                validate_cases(samples)
+                args.answer_protocol.validate(samples)
             except ValueError as error:
                 parser.error(str(error))
         sample = samples[0]
@@ -578,6 +590,7 @@ def _collect_tv_vv_sweep(args, parser, samples):
 
 
 def _run_tv_vv_sweep(args, parser, samples):
+    protocol = getattr(args, "answer_protocol", VQAV2)
     top_percent = getattr(args, "tv_vv_top_percent", None)
     token_percent = getattr(args, "tv_vv_token_percent", None)
     has_top_k = top_percent is not None or token_percent is not None
@@ -626,8 +639,10 @@ def _run_tv_vv_sweep(args, parser, samples):
             report[f"{phase}_max_policies"] = dict.fromkeys(dict(variants), "shared")
     measured_phases = ("prefill", "decode") if has_top_k or decode_links or binary else region_phases
     if args.vqa_accuracy:
-        report["answer_metric"] = "VQA v2 consensus"
-        report["answer_protocol"] = dict(instruction=SHORT_ANSWER_INSTRUCTION,
+        report["answer_metric"] = protocol.metric
+        if protocol is not VQAV2:
+            report["benchmark"] = protocol.name
+        report["answer_protocol"] = dict(instruction=protocol.instruction,
                                          max_new_tokens=args.decode_tokens, min_new_tokens=0)
     shard = getattr(args, "vqa_shard", None)
     if shard:
@@ -638,7 +653,7 @@ def _run_tv_vv_sweep(args, parser, samples):
             parser.error(f"{args.output}: {error}")
     totals = {name: defaultdict(int) for name, _ in variants}
     for case in report["cases"]:
-        vqa_shards.accumulate(totals, case)
+        vqa_shards.accumulate(totals, case, protocol=protocol)
     completed = len(report["cases"])
     for index, sample in enumerate(samples[completed:], start=args.sample_index + completed):
         benchmark, sample_id = (sample["benchmark"], sample["id"]) if sample else ({}, str(index))
@@ -664,7 +679,7 @@ def _run_tv_vv_sweep(args, parser, samples):
             if sample:
                 _select_sample(run, parser, sample)
             if args.vqa_accuracy:
-                run.question = f"{benchmark['question_text']}\n{SHORT_ANSWER_INSTRUCTION}"
+                run.question = f"{benchmark['question_text']}\n{protocol.instruction}"
             before = {phase: ba.STATE["phase_stats"].get(phase, {}).copy() for phase in measured_phases}
             metadata = collect(run, parser, benchmark, sample_id)
             if binary:
@@ -676,6 +691,8 @@ def _run_tv_vv_sweep(args, parser, samples):
             answer = metadata.get("answer")
             normalized = _normalized_answer(answer) if answer is not None else None
             result = dict(answer=answer, **trace)
+            if "generated_tokens" in metadata:
+                result["generated_tokens"] = metadata["generated_tokens"]
             for phase in measured_phases:
                 after = ba.STATE["phase_stats"].get(phase, {})
                 result[f"{phase}_tiles"] = after.get("causal", 0) - before[phase].get("causal", 0)
@@ -683,7 +700,7 @@ def _run_tv_vv_sweep(args, parser, samples):
                 if phase == "prefill" and has_top_k:
                     result["prefill_qk_bypassed"] = after.get("qk_bypassed", 0) - before[phase].get("qk_bypassed", 0)
             if args.vqa_accuracy:
-                result["vqa_score"] = score_answer(answer, references)
+                result[protocol.case_score] = protocol.score(answer, references)
             else:
                 match = normalized in answers if answers and normalized is not None else None
                 result["reference_exact_match"] = match
@@ -706,11 +723,11 @@ def _run_tv_vv_sweep(args, parser, samples):
                         key = f"{phase}_{suffix}"
                         totals[name][key] += result[key]
         if args.vqa_accuracy:
-            vqa_shards.accumulate(totals, case)
+            vqa_shards.accumulate(totals, case, protocol=protocol)
         report["cases"].append(case)
         done = len(report["cases"])
         if not shard or done % vqa_shards.CHECKPOINT_INTERVAL == 0 or done == len(samples):
-            report["summary"] = vqa_shards.summarize(totals) if args.vqa_accuracy else totals
+            report["summary"] = vqa_shards.summarize(totals, protocol=protocol) if args.vqa_accuracy else totals
             write_json(args.output, report)
             policy = "binary pipeline" if binary else "decode visual links" if decode_links else "T→V-guided V→V"
             print(f"Compared {policy} for {done}/{len(samples)} cases", flush=True)
@@ -723,8 +740,8 @@ def _run_tv_vv_sweep(args, parser, samples):
                 for name, _ in variants
             }
             vqa_shards.save_predictions(args.output, predictions)
-        for name, result in vqa_shards.summarize(totals).items():
-            print(f"{name}: VQA v2 accuracy {result['vqa_accuracy']:.2f}% on {result['answers_scored']} questions")
+        for name, result in vqa_shards.summarize(totals, protocol=protocol).items():
+            print(f"{name}: {protocol.format_score(result)} on {result['answers_scored']} questions")
 
 
 def _collect_layer_study(args, parser, samples, calibration):
@@ -1002,6 +1019,7 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
                 generated = model.generate(**inputs, max_new_tokens=args.decode_tokens + 1,
                                            min_new_tokens=args.decode_tokens + 1, do_sample=False)
         metadata = {"model": args.model, "synthetic": False, "prompt_tokens": length,
+                    "generated_tokens": generated.shape[-1] - length,
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
     if args.score_distributions:

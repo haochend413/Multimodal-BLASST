@@ -243,6 +243,34 @@ a zero attention contribution. The report counts causal V→V token pairs
 bypassed before QK. The separate `--gate-lambda` applies to the pass that
 records the gate in a matched study or gate distribution audit.
 
+#### VizWiz-LF long-answer benchmark
+
+```bash
+python code/prepare_vizwiz_lf_study.py \
+  --data-root "$HOME/vizwiz-lf" --download \
+  --output "$HOME/blasst-results/vizwiz-lf-600.json"
+
+python code/attention_study.py \
+  --benchmark vizwiz-lf --manifest "$HOME/blasst-results/vizwiz-lf-600.json" \
+  --decode-visual-links --lambda 0.1 --decode-lambda 0.1 \
+  --output "$HOME/blasst-results/vizwiz-lf-600-decode-links.json"
+```
+
+The manifest builder uses all 600 questions and the images and expert answers
+from the [VizWiz-LF release](https://github.com/UT-CS-HCI/lfvqa). Paired runs with
+`--benchmark vizwiz-lf` default to all available questions and a maximum of
+128 generated tokens, with greedy decoding and natural EOS. They use a
+long-answer prompt and score against the human expert paragraph with
+ROUGE-L F1 on a 0–100 scale. This local metric measures word-sequence overlap.
+The paper also studies other automatic metrics and human judgments. The report
+includes the generated answers, actual generation lengths, and the attention
+policy's QK counters. Generated-token counts include EOS when present.
+
+Use the same benchmark selector with `--tv-vv-top-percent`,
+`--binary-tv-phase-study`, or `--binary-tv-pipeline` for other paired
+experiments. Select `--benchmark vqav2` with a VQA v2 manifest for the
+short-answer consensus scoring protocol.
+
 #### Decode with prefill text-to-vision links
 
 ```bash
