@@ -295,6 +295,13 @@ at each generated position. The report counts causal QK pairs and bypasses
 for prefill T→V, prefill V→V, and decode T→V. These counts measure selection
 in the PyTorch reference, with latency measured separately.
 
+To isolate which phase drives the accuracy difference, replace
+`--binary-tv-pipeline` with `--binary-tv-phase-study` and use a fresh
+output path. This compares original BLASST, prefill-only binary T→T-guided
+T→V, and decode-only binary T→T-guided T→V. V→V gating is off in all three.
+The decode-only variant uses standard BLASST throughout prefill and records
+the T→V links in every layer for later use during decode.
+
 #### Measure the token and attention mix after the V→V gate
 
 Run one prefill per question with the same gate settings and sample range as the

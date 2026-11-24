@@ -264,6 +264,8 @@ def main() -> None:
                        help="compare BLASST with decode that selects visual keys using prefill T→V links")
     tv_vv.add_argument("--binary-tv-pipeline", action="store_true",
                        help="compare BLASST, binary T→T-guided T→V, and the full T→V-guided V→V pipeline")
+    tv_vv.add_argument("--binary-tv-phase-study", action="store_true",
+                       help="compare BLASST with prefill-only and decode-only binary T→T-guided T→V")
     parser.add_argument("--vqa-accuracy", action="store_true",
                         help="use short-answer generation and the official VQA score in a VQA v2 sweep")
     parser.add_argument("--matched-region-study", action="store_true",
@@ -312,8 +314,11 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int,
                         help="number of manifest cases to test, before splitting into shards")
     args = parser.parse_args()
-    if args.decode_visual_links or args.binary_tv_pipeline:
-        flag = "--binary-tv-pipeline" if args.binary_tv_pipeline else "--decode-visual-links"
+    binary_study = args.binary_tv_pipeline or args.binary_tv_phase_study
+    if args.decode_visual_links or binary_study:
+        flag = "--decode-visual-links"
+        if binary_study:
+            flag = "--binary-tv-phase-study" if args.binary_tv_phase_study else "--binary-tv-pipeline"
         if not args.manifest or args.demo or args.decode_tokens < 2:
             parser.error(f"{flag} requires a VQA v2 manifest and at least two generated tokens")
         if (args.matched_region_study or args.gate_distribution or args.prefill_region_max
@@ -347,7 +352,7 @@ def main() -> None:
     ):
         parser.error("The live region-max switches cannot be used with audits that compute their own running max")
     if args.vqa_accuracy and not (args.manifest and (args.tv_vv_sweep is not None or args.tv_vv_top_accuracy
-                                                    or args.decode_visual_links or args.binary_tv_pipeline
+                                                    or args.decode_visual_links or binary_study
                                                     or args.matched_region_study or args.gate_distribution)):
         parser.error("--vqa-accuracy requires a VQA v2 manifest and a paired study")
     args.vqa_shard = None
@@ -418,7 +423,7 @@ def main() -> None:
     paired_audit = (
         args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions
         or args.tv_vv_sweep or args.tv_vv_top_accuracy or args.matched_region_study or args.gate_distribution
-        or args.decode_visual_links or args.binary_tv_pipeline
+        or args.decode_visual_links or binary_study
     )
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
@@ -507,7 +512,7 @@ def main() -> None:
                 run(args, parser, samples, collect, _select_sample, ba.STATE, ba.TILE)
         except (ValueError, KeyError, OSError) as error:
             parser.error(str(error))
-    elif args.tv_vv_sweep or args.tv_vv_top_accuracy or args.decode_visual_links or args.binary_tv_pipeline:
+    elif args.tv_vv_sweep or args.tv_vv_top_accuracy or args.decode_visual_links or binary_study:
         _collect_tv_vv_sweep(args, parser, samples if args.manifest else [None] * args.sample_count)
     elif args.score_distributions:
         _collect_score_distributions(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
@@ -577,9 +582,12 @@ def _run_tv_vv_sweep(args, parser, samples):
     token_percent = getattr(args, "tv_vv_token_percent", None)
     has_top_k = top_percent is not None or token_percent is not None
     decode_links = getattr(args, "decode_visual_links", False)
-    binary = getattr(args, "binary_tv_pipeline", False)
+    phase_study = getattr(args, "binary_tv_phase_study", False)
+    binary = getattr(args, "binary_tv_pipeline", False) or phase_study
     variants = [("baseline", None)]
-    if binary:
+    if phase_study:
+        variants.extend((("binary_tv_prefill", "prefill"), ("binary_tv_decode", "decode")))
+    elif binary:
         variants.extend((("binary_tv", "tv"), ("binary_tv_vv", "tv_vv")))
     elif decode_links:
         variants.append(("decode_links", True))
@@ -598,7 +606,11 @@ def _run_tv_vv_sweep(args, parser, samples):
         report[f"{phase}_max_policies"] = {
             name: "shared" if threshold is None else "per_region" for name, threshold in variants
         }
-    if binary:
+    if phase_study:
+        report["binary_tv_pipeline"] = True
+        report["variant_labels"] = {"baseline": "Original BLASST", "binary_tv_prefill": "T→T-guided T→V in prefill",
+                                    "binary_tv_decode": "T→T-guided T→V in decode"}
+    elif binary:
         report["binary_tv_pipeline"] = True
         report["variant_labels"] = {"baseline": "Original BLASST", "binary_tv": "T→T-guided T→V",
                                     "binary_tv_vv": "T→T-guided T→V + T→V-guided V→V"}
@@ -645,6 +657,7 @@ def _run_tv_vv_sweep(args, parser, samples):
                                             tv_vv_token_percent=value if token_percent is not None else None,
                                             decode_visual_links=decode_links and name != "baseline",
                                             decode_visual_link_study=decode_links,
+                                            binary_tv_pipeline=binary,
                                             binary_tv_mode=value if binary else None))
             for phase in region_phases:
                 setattr(run, f"{phase}_region_max", threshold is not None)
@@ -830,7 +843,9 @@ def _attach_study(args, recorder):
     if getattr(args, "binary_tv_pipeline", False):
         if args.binary_tv_mode is not None:
             ba.STATE["binary_tv_pipeline"] = BinaryTVPipeline(recorder.visual, ba.TILE,
-                                                               gate_vv=args.binary_tv_mode == "tv_vv")
+                                                               gate_vv=args.binary_tv_mode == "tv_vv",
+                                                               guide_prefill=args.binary_tv_mode != "decode",
+                                                               guide_decode=args.binary_tv_mode != "prefill")
         ba.STATE["observer"] = ba.STATE["qkv_hook"] = None
         return None
     if getattr(args, "decode_visual_link_study", False):

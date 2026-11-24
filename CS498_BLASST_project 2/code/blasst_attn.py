@@ -255,10 +255,12 @@ def blasst_attention_forward(
     offset = Skv - Sq                 # queries are the LAST Sq positions of the key axis
     n_kt = math.ceil(Skv / TILE)
     binary = STATE["binary_tv_pipeline"]
+    if binary is not None and phase == "decode" and not binary.guide_decode:
+        binary = None
     if binary is not None:
         if B != 1 or layer_idx < 0 or (phase == "prefill" and (Sq != Skv or Sq != len(binary.visual))):
             raise ValueError("The binary T→V pipeline requires one unpadded prompt, indexed layers, and a full prefill")
-        if layer_idx:
+        if layer_idx and (phase == "decode" or binary.guide_prefill):
             mask = mask_chunk(attention_mask, 0, Sq, Sq, Skv)
             output, kept = binary.forward(layer_idx, query, key, value, mask, scaling, ln_lam, phase)
             if STATE["collect_stats"]:
@@ -352,7 +354,7 @@ def blasst_attention_forward(
         if links is not None:
             links.record(layer_idx, r0, s_t, ln_lam, mask)
         if binary is not None:
-            binary.record_warmup(r0 + offset, s_t, mask, ln_lam, phase)
+            binary.record_standard_links(layer_idx, r0 + offset, s_t, mask, ln_lam, phase)
         margin = row_margins.amax(-2)
         skip = margin < ln_lam                                              # all rows far below running max
         fully_bypassed = bypass

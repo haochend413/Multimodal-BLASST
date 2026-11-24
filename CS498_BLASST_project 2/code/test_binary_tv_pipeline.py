@@ -2,6 +2,7 @@
 import math
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import blasst_attn as ba
@@ -71,3 +72,37 @@ def test_binary_pipeline_distinguishes_empty_history_from_no_history(monkeypatch
     ba.blasst_attention_forward(layer, q, q, v, None, scaling=1.)
     assert pipeline.counts["prefill_tv_fallback_rows"] == 1
     assert pipeline.layers[1][0][0, 2, 0]
+
+
+@pytest.mark.parametrize("guided_phase", ["prefill", "decode"])
+def test_binary_phase_study_uses_ordinary_blasst_in_the_other_phase(monkeypatch, guided_phase):
+    monkeypatch.setattr(ba, "TILE", 2)
+    monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.1))
+    monkeypatch.setitem(ba.STATE, "decode_override", False)
+    monkeypatch.setitem(ba.STATE, "collect_stats", False)
+    visual = torch.tensor([False, False, True, True, True, True, False, False])
+    q = torch.ones(1, 1, 8, 1)
+    k = torch.tensor([1., 1., 8., 8., 1., 1., 1., 1., 1.]).view(1, 1, 9, 1)
+    v = torch.arange(9.).view_as(k)
+    layer = SimpleNamespace(layer_idx=2)
+    expected_prefill, _ = ba.blasst_attention_forward(layer, q, k[:, :, :8], v[:, :, :8], None, scaling=1.)
+    expected_decode, _ = ba.blasst_attention_forward(layer, q[:, :, :1], k, v, None, scaling=1.)
+    pipeline = BinaryTVPipeline(visual, 2, gate_vv=False,
+                                guide_prefill=guided_phase == "prefill", guide_decode=guided_phase == "decode")
+    monkeypatch.setitem(ba.STATE, "binary_tv_pipeline", pipeline)
+    for index in range(3):
+        module = SimpleNamespace(layer_idx=index)
+        prefill, _ = ba.blasst_attention_forward(module, q, k[:, :, :8], v[:, :, :8], None, scaling=1.)
+        assert pipeline.layers[index][0][0, 7].tolist() == [True, False]
+    for index in range(3):
+        module = SimpleNamespace(layer_idx=index)
+        decode, _ = ba.blasst_attention_forward(module, q[:, :, :1], k, v, None, scaling=1.)
+    if guided_phase == "prefill":
+        torch.testing.assert_close(decode, expected_decode, rtol=0, atol=0)
+        assert pipeline.counts["decode_tv_qk_pairs_bypassed"] == 0
+        assert pipeline.counts["prefill_tv_qk_pairs_bypassed"] > 0
+    else:
+        torch.testing.assert_close(prefill, expected_prefill, rtol=0, atol=0)
+        assert pipeline.counts["prefill_tv_qk_pairs_bypassed"] == 0
+        assert pipeline.counts["decode_tv_qk_pairs_bypassed"] > 0
+    assert pipeline.counts["prefill_vv_qk_pairs_bypassed"] == 0

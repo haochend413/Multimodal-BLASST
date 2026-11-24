@@ -37,10 +37,12 @@ def visible_keys(mask, rows, length, heads):
 class BinaryTVPipeline:
     """Run staged BLASST and keep device-local masks for cached text positions."""
 
-    def __init__(self, visual, tile_size, *, gate_vv):
+    def __init__(self, visual, tile_size, *, gate_vv, guide_prefill=True, guide_decode=True):
         self.visual = visual.bool().cpu()
         self.tile_size = tile_size
         self.gate_vv = gate_vv
+        self.guide_prefill = guide_prefill
+        self.guide_decode = guide_decode
         self.visual_groups = [(start // tile_size, tile.nonzero().flatten() + start)
                               for start, tile in zip(range(0, len(visual), tile_size), self.visual.split(tile_size))
                               if tile.any()]
@@ -66,9 +68,9 @@ class BinaryTVPipeline:
         visual_groups = [(tile, columns.to(device)) for tile, columns in self.visual_groups]
         return visual, visual_groups
 
-    def record_warmup(self, q_start, tiles, mask, cutoff, phase):
-        """Record the row-level visual decisions without changing layer 0 output."""
-        links, history = self.layers[0]
+    def record_standard_links(self, layer, q_start, tiles, mask, cutoff, phase):
+        """Record row-level T→V links from a standard BLASST forward."""
+        links, history = self.layers[layer]
         heads, rows = tiles.shape[1:3]
         length = links.shape[1]
         visual, groups = self.key_layout(length, tiles.device)
