@@ -4,7 +4,8 @@ export function setupTVVVSweep(showView) {
   const $ = id => document.getElementById(`tv-vv-${id}`);
   const reports = [];
   const active = () => reports[Number($('report').value)];
-  const variantLabel = value => value === 'baseline' ? 'Standard BLASST' : `${Number(value) * 100}% relevance`;
+  const variantLabel = value => active().data.variant_labels?.[value] ??
+    (value === 'baseline' ? 'Standard BLASST' : `${Number(value) * 100}% relevance`);
   const fraction = (a, b) => b ? `${a} / ${b} (${(100 * a / b).toFixed(1)}%)` : '—';
 
   function options(id, values, label = String) {
@@ -55,8 +56,15 @@ export function setupTVVVSweep(showView) {
     const {data} = active();
     const variants = Object.keys(data.variants);
     const official = data.answer_metric === 'VQA v2 consensus';
+    const budgets = data.budget_calibration;
+    $('budget-note').hidden = !budgets;
+    if (budgets) {
+      const targets = budgets.qk_skip_targets;
+      $('budget-note').textContent = `Calibration targets from QK skip only · prefill ${(100 * targets.prefill).toFixed(1)}% skipped · decode ${(100 * targets.decode).toFixed(1)}% skipped. The table shows held-out skip rates.`;
+    }
     const maxPhases = ["prefill", "decode"].filter(phase => data[`${phase}_max_policies`]);
-    $('accuracy-header').textContent = official ? 'VQA v2 accuracy' : 'Reference exact matches';
+    $('accuracy-header').textContent = budgets ? 'VQA v2 accuracy · Δ vs QK skip' :
+      official ? 'VQA v2 accuracy' : 'Reference exact matches';
     for (const phase of ["prefill", "decode"]) {
       $(`${phase}-header`).hidden = !maxPhases.includes(phase);
     }
@@ -64,14 +72,16 @@ export function setupTVVVSweep(showView) {
     $('summary').replaceChildren();
     for (const variant of variants) {
       const result = data.summary[variant];
-      const delta = result.vqa_delta_pp == null ? '' :
-        ` (${result.vqa_delta_pp >= 0 ? '+' : ''}${result.vqa_delta_pp.toFixed(1)} pp)`;
+      const difference = budgets ? result.vqa_delta_vs_qk_pp : result.vqa_delta_pp;
+      const delta = difference == null ? '' :
+        ` (${difference >= 0 ? '+' : ''}${difference.toFixed(1)} pp)`;
       const accuracy = official ? `${result.vqa_accuracy.toFixed(1)}%${delta}` :
         fraction(result.reference_exact_matches ?? 0, result.answers_scored);
       const cells = [variantLabel(variant), fraction(result.vv_tiles_bypassed, result.pure_vv_tiles)];
       for (const phase of maxPhases) {
         const policy = data[`${phase}_max_policies`][variant] === 'per_region' ? 'Per region' : 'Shared';
-        cells.push(`${policy} · ${fraction(result[`${phase}_tiles_skipped`], result[`${phase}_tiles`])}`);
+        const lam = budgets ? ` · λ ${Number(budgets.lambdas[variant][phase].toPrecision(4))}` : '';
+        cells.push(`${policy}${lam} · ${fraction(result[`${phase}_tiles_skipped`], result[`${phase}_tiles`])}`);
       }
       row($('summary'), [...cells, accuracy, result.answers_changed]);
     }

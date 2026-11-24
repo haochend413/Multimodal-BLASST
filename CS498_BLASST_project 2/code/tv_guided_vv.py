@@ -10,10 +10,11 @@ SWEEP_SCHEMA = "blasst-tv-guided-vv-v1"
 class TVGuidedVV:
     """Own the votes for one prompt so each layer reads only its predecessor."""
 
-    def __init__(self, visual, tile_size, threshold):
+    def __init__(self, visual, tile_size, threshold, *, replay=None):
         self.visual = visual.cpu().bool()
         self.tile_size = tile_size
         self.threshold = threshold
+        self.replay = replay
         self.text_rows = [~tile for tile in self.visual.split(tile_size)]
         self.pure_visual = [index for index, text in enumerate(self.text_rows) if not text.any()]
         self.visual_set = set(self.pure_visual)
@@ -39,7 +40,13 @@ class TVLayer:
         self.protected = set()
         self.mask_fallback = set()
         self.dropped = set()
-        if previous is not None and policy.threshold is not None:
+        if policy.replay is not None:
+            if layer not in policy.replay:
+                raise ValueError(f"V→V gate replay has no entry for layer {layer}")
+            self.dropped = set(policy.replay[layer])
+            if not self.dropped <= policy.visual_set or (previous is None and self.dropped):
+                raise ValueError(f"Invalid V→V gate replay for layer {layer}")
+        elif previous is not None and policy.threshold is not None:
             self.dropped = {vote["tile"] for vote in previous["votes"]
                             if vote["eligible"] and vote["kept"] / vote["eligible"] < policy.threshold}
 

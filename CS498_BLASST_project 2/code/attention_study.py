@@ -256,6 +256,14 @@ def main() -> None:
                        help="compare standard BLASST and comma-separated T→V relevance thresholds")
     parser.add_argument("--vqa-accuracy", action="store_true",
                         help="use short-answer generation and the official VQA score in a VQA v2 sweep")
+    parser.add_argument("--matched-region-study", action="store_true",
+                        help="compare five VQA policies at calibrated per-phase skip rates")
+    parser.add_argument("--calibration-count", type=int, default=20,
+                        help="number of questions before the matched-study evaluation range")
+    parser.add_argument("--budget-probes", type=int, default=8, help="maximum live calibration probes per stage")
+    parser.add_argument("--budget-tolerance-pp", type=float, default=1.,
+                        help="allowed calibration skip-rate error in percentage points")
+    parser.add_argument("--budget-config", type=Path, help="save or reuse matched-study calibration settings")
     parser.add_argument("--vqa-shards", type=int, help="split the whole VQA manifest into this many shards")
     parser.add_argument("--vqa-shard-index", type=int, help="zero-based index of this restartable shard")
     parser.add_argument("--jl-dim", type=int, help="audit a JL precheck at this sketch dimension")
@@ -288,6 +296,13 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int,
                         help="number of manifest cases to test, before splitting into shards")
     args = parser.parse_args()
+    if args.matched_region_study:
+        from matched_region_study import validate_args
+
+        validate_args(args, parser)
+        args.vqa_accuracy = True
+    elif args.budget_config is not None:
+        parser.error("--budget-config requires --matched-region-study")
     requested_sample_count = args.sample_count
     if args.sample_count is None:
         args.sample_count = 1
@@ -296,8 +311,8 @@ def main() -> None:
         or args.tile_layer_study or args.score_distributions
     ):
         parser.error("The live region-max switches cannot be used with audits that compute their own running max")
-    if args.vqa_accuracy and not (args.tv_vv_sweep is not None and args.manifest):
-        parser.error("--vqa-accuracy requires --tv-vv-sweep and a VQA v2 manifest")
+    if args.vqa_accuracy and not (args.manifest and (args.tv_vv_sweep is not None or args.matched_region_study)):
+        parser.error("--vqa-accuracy requires a VQA v2 manifest and a paired study")
     args.vqa_shard = None
     if args.vqa_shards is not None or args.vqa_shard_index is not None:
         if not args.vqa_accuracy or args.vqa_shards is None or args.vqa_shard_index is None:
@@ -316,7 +331,7 @@ def main() -> None:
         if (args.vv_prefix_attention or args.jl_dim is not None or args.jl_sweep
                 or args.tile_layer_study or args.score_distributions):
             parser.error("T→V-guided V→V compares live causal BLASST masks; omit separate mask audits")
-        if not 0 < args.lam <= 1:
+        if not args.matched_region_study and not 0 < args.lam <= 1:
             parser.error("set the BLASST vote threshold with --lambda in (0, 1]")
     if args.tv_vv_sweep and (args.score_data or args.raw_dir):
         parser.error("--tv-vv-sweep collects a paired answer and tile-count report")
@@ -361,7 +376,8 @@ def main() -> None:
                 args.jl_split_tiles or args.score_data or args.raw_dir or args.lam or args.decode_lambda):
             parser.error("--jl-region-audit uses a dense trajectory and its own report; set --jl-lambda")
     paired_audit = (
-        args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions or args.tv_vv_sweep
+        args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions
+        or args.tv_vv_sweep or args.matched_region_study
     )
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
@@ -381,6 +397,8 @@ def main() -> None:
         if manifest.get("schema") != "blasst-benchmark-manifest-v1":
             parser.error("unsupported benchmark manifest schema")
         samples = manifest["samples"]
+        if args.matched_region_study:
+            args.budget_manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
         if args.vqa_shards is not None:
             args.vqa_shard = dict(index=args.vqa_shard_index, count=args.vqa_shards, manifest_questions=len(samples),
                                   manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest())
@@ -393,7 +411,7 @@ def main() -> None:
                 parser.error(str(error))
             args.sample_index, args.sample_count = start, stop - start
         del manifest_bytes, manifest
-        end = args.sample_index + args.sample_count
+        end = args.sample_index + args.sample_count + (args.calibration_count if args.matched_region_study else 0)
         if not 0 <= args.sample_index < end <= len(samples):
             parser.error(f"requested sample range is outside the {len(samples)} manifest pairs")
         samples = samples[args.sample_index:end]
@@ -440,7 +458,15 @@ def main() -> None:
                 parser.error(f"Missing input media: {media_path}")
         if not torch.cuda.is_available():
             parser.error("Real model collection requires CUDA; use --demo for CPU verification")
-    if args.tv_vv_sweep:
+    if args.matched_region_study:
+        from matched_region_study import run
+
+        try:
+            with vqa_shards.claim(args.output):
+                run(args, parser, samples, collect, _select_sample, ba.STATE, ba.TILE)
+        except (ValueError, KeyError, OSError) as error:
+            parser.error(str(error))
+    elif args.tv_vv_sweep:
         _collect_tv_vv_sweep(args, parser, samples if args.manifest else [None] * args.sample_count)
     elif args.score_distributions:
         _collect_score_distributions(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
@@ -716,10 +742,11 @@ def _attach_study(args, recorder):
         regions = RegionMax(recorder.visual, ba.TILE)
         ba.STATE["prefill_region_max"] = regions if args.prefill_region_max else None
         ba.STATE["decode_region_max"] = regions if args.decode_region_max else None
-    if args.tv_vv_threshold is not None or args.tv_vv_sweep:
-        ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold)
+    if args.tv_vv_threshold is not None or args.tv_vv_sweep or args.matched_region_study:
+        ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold,
+                                            replay=getattr(args, "gate_replay", None))
         ba.STATE["qkv_hook"] = None
-        if args.tv_vv_sweep:
+        if args.tv_vv_sweep or args.matched_region_study:
             ba.STATE["observer"] = None
         return None
     if args.score_distributions:
@@ -864,7 +891,7 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         metadata["tv_guided_vv"] = dict(threshold=policy.threshold, layers=policy.layers,
                                         pure_vv_tiles=sum(layer["pure_vv_tiles"] for layer in policy.layers),
                                         vv_tiles_bypassed=sum(layer["vv_tiles_bypassed"] for layer in policy.layers))
-        if args.tv_vv_sweep:
+        if args.tv_vv_sweep or args.matched_region_study:
             return metadata
     if args.vv_prefix_attention:
         metadata["attention_mask_policy"] = "vv_prefix"

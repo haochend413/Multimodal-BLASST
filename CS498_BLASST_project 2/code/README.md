@@ -155,6 +155,37 @@ BLASST skip decisions and its T→V votes for the next layer. The regular BLASST
 baseline uses a shared max. The prefill and decode switches are independent.
 Use different output paths for the on and off runs to preserve both checkpoints.
 
+#### Five-policy comparison at matched skip rates
+
+From `CS498_BLASST_project 2`, select 20 calibration questions followed by
+100 held-out questions:
+
+```bash
+python code/attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-1000.json" \
+  --matched-region-study --calibration-count 20 --sample-count 100 \
+  --tv-vv-threshold 0.5 --decode-tokens 16 \
+  --budget-config "$HOME/blasst-results/vqav2-matched-region-budget.json" \
+  --output "$HOME/blasst-results/vqav2-matched-region-100.json"
+```
+
+The study fits prefill and decode lambdas for a 50% skip target under original
+BLASST, then runs QK skip only at those same lambdas. Its measured prefill and
+decode skip rates become the targets for the three variants with region-local
+maxima in prefill, decode, or both. Each variant replays the QK-skip-only
+policy's gate for the same prompt and checks that its bypass count matches.
+The prefill count includes gated V→V tile skips. Decode counts cover the
+actual generated steps and may have different denominators.
+
+Calibration probes live generation and saves the closest measured lambda for
+each phase. The config records every probe and whether it reached the requested
+rate within tolerance. Some rates are unreachable at `lambda <= 1`. Tune
+`--budget-probes` or `--budget-tolerance-pp` for a different search budget or
+tolerance. Reuse the budget config with the same calibration window and settings,
+and a fresh output filename for a different evaluation size. The held-out report
+checkpoints and shows achieved skip rates and VQA score differences from QK skip
+only. Load it in Attention Lab under **T→V-guided V→V**.
+
 #### Full VQA v2 validation
 
 The full validation split contains 214,354 questions. The same paired comparison
