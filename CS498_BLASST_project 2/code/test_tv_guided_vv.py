@@ -108,6 +108,35 @@ def test_top_percent_selected_rows_still_use_blasst(monkeypatch):
     assert policy.layers[1]["vv_tiles_bypassed"] == 0
 
 
+def test_top_token_percent_gates_individual_rows_even_in_mixed_tiles(monkeypatch):
+    monkeypatch.setitem(ba.STATE, "collect_stats", False)
+    monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.1))
+    visual = torch.tensor([False, *([True] * 128), False])
+    policy = TVGuidedVV(visual, 128, None, token_percent=2)
+    monkeypatch.setitem(ba.STATE, "tv_guided_vv", policy)
+    q = torch.ones(1, 1, len(visual), 1)
+    k = torch.zeros_like(q)
+    k[..., 126:129, :] = 10
+    chunks = {}
+
+    def observe(layer, q_start, scores, **_):
+        chunks[layer, q_start] = scores
+
+    monkeypatch.setitem(ba.STATE, "observer", observe)
+    for layer in range(2):
+        out, _ = ba.blasst_attention_forward(SimpleNamespace(layer_idx=layer), q, k, q, None)
+        assert out.isfinite().all()
+    warmup, gated = policy.layers
+    assert warmup["visual_query_tokens_selected"] == 128
+    assert gated["visual_query_tokens_selected"] == 3
+    assert gated["dropped_token_positions"] == list(range(1, 126))
+    assert gated["vv_pairs_bypassed"] == sum(range(1, 126))
+    assert chunks[1, 0][..., 1:126, 1:129].isneginf().all()
+    assert chunks[1, 0][..., 1:126, 0].isfinite().all()
+    assert chunks[1, 128][..., 0, 1:129].isfinite().all()
+    assert chunks[1, 128][..., 1, 1:129].isfinite().all()
+
+
 def test_counting_votes_leaves_the_baseline_unchanged(monkeypatch):
     monkeypatch.setattr(ba, "TILE", 2)
     monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.5))

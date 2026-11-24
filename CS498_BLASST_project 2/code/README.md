@@ -197,14 +197,19 @@ python code/attention_study.py \
   --manifest "$HOME/blasst-results/vqav2-1000.json" \
   --sample-index 20 --sample-count 100 --decode-tokens 16 \
   --lambda 0.1 --decode-lambda 0.1 \
-  --tv-vv-top-percent 50 --vqa-accuracy \
-  --output "$HOME/blasst-results/vqav2-100-top50-vs-blasst.json"
+  --tv-vv-top-percent 2 --vqa-accuracy \
+  --output "$HOME/blasst-results/vqav2-100-top2-tokens-vs-blasst.json"
 ```
 
 Each question runs once with original BLASST and once with the top-k V→V
 gate. Both variants use the same prefill and decode lambdas and shared running
-maxima. The top-k gate ranks live T→V votes from the previous layer using the
-prefill `--lambda`. The separate `--gate-lambda` applies to the pass that
+maxima. After layer 0, the top-k gate ranks individual visual tokens using
+the previous layer's T→V score votes at the prefill `--lambda` and selects
+`ceil(visual_tokens * percent / 100)`. Unselected visual query tokens compute
+QK against text keys only, including when a tile contains both modalities.
+Selected rows use BLASST for V→V. A dropped row with no visible text receives
+a zero attention contribution. The report counts causal V→V token pairs
+bypassed before QK. The separate `--gate-lambda` applies to the pass that
 records the gate in a matched study or gate distribution audit.
 
 #### Decode with prefill text-to-vision links
@@ -252,13 +257,11 @@ token pairs by query and key modality, summed over layers and counted once
 across heads. The post-gate counts exclude the actual bypasses before QK and
 include pairs in mixed tiles. They precede BLASST's score-based skipping.
 
-For a percentage quota, replace `--tv-vv-threshold 0.5` with
-`--tv-vv-top-percent 50` in this audit or the matched study. Each prefill layer
-after layer 0 ranks pure visual query tiles by the previous layer's T→V keep
-fraction and selects the requested percentage, rounded up. Earlier tiles win
-ties, and tiles without eligible votes rank last. Selected rows use standard
-BLASST for their V→V tiles. The audit records the selected query-tile count
-per layer. Use new output and budget-config paths when changing gate policies.
+For a token quota, replace `--tv-vv-threshold 0.5` with
+`--tv-vv-top-percent 2`. The audit reports the number of individual visual
+query tokens selected per layer. Use `--tv-vv-top-tile-percent` to reproduce
+the earlier ablation that ranked entire pure visual query tiles. Use new
+output and budget-config paths when changing gate policies.
 
 #### Full VQA v2 validation
 

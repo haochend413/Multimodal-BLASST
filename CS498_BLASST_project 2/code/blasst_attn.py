@@ -184,6 +184,19 @@ def mask_chunk(mask, start, end, query_len, key_len):
     return mask if mask.shape[-2] == 1 else mask[..., start:end, :]
 
 
+def token_gated_scores(query, key, dropped, visual_keys, scaling):
+    """Compute every key for ordinary rows and only text keys for dropped visual rows."""
+    scores = query.new_full((*query.shape[:-1], key.shape[-2]), NEG_INF)
+    kept_rows = (~dropped).nonzero().flatten()
+    dropped_rows = dropped.nonzero().flatten()
+    text_columns = (~visual_keys).nonzero().flatten()
+    scores[..., kept_rows, :] = query[..., kept_rows, :] @ key.transpose(-1, -2) * scaling
+    scores[..., dropped_rows[:, None], text_columns] = (
+        query[..., dropped_rows, :] @ key[..., text_columns, :].transpose(-1, -2) * scaling
+    )
+    return scores
+
+
 # ----------------------------------------------------------------------------- the kernel
 def blasst_attention_forward(
     module,
@@ -293,6 +306,8 @@ def blasst_attention_forward(
             allowed = allowed | full_vv.repeat_interleave(TILE)[:Skv]
         query_tile = r0 // TILE
         mask = mask_chunk(attention_mask, r0, r1, Sq, Skv)
+        token_drops = tv_layer.token_drops[r0:r1] if tv_layer is not None and tv_layer.token_drops is not None else None
+        token_bypass = token_drops is not None and bool(token_drops.any())
         bypass = tv_layer.bypass_keys(query_tile) if tv_layer is not None else []
         if bypass:
             omitted = set(bypass)
@@ -309,7 +324,12 @@ def blasst_attention_forward(
                 tv_layer.mask_fallback.add(query_tile)
             else:
                 tv_layer.bypassed[query_tile] = len(bypass)
-        if not bypass:
+        if token_bypass:
+            s = token_gated_scores(q32, key32, token_drops.to(query.device), policy.visual.to(query.device), scaling)
+            if mask is not None and mask.dtype != torch.bool:
+                s = s.masked_fill(mask <= torch.finfo(mask.dtype).min, NEG_INF)
+            s_t = score_tiles(s, allowed, mask)
+        elif not bypass:
             s = torch.matmul(q32, key32.transpose(-1, -2)) * scaling      # [B, H, r, Skv] fp32
             s_t = score_tiles(s, allowed, mask)
         row_margins = (regions.row_margins(s_t, Skv) if regions is not None
@@ -318,8 +338,15 @@ def blasst_attention_forward(
             links.record(layer_idx, r0, s_t, ln_lam, mask)
         margin = row_margins.amax(-2)
         skip = margin < ln_lam                                              # all rows far below running max
+        fully_bypassed = bypass
+        if token_bypass and bool(token_drops.all()):
+            fully_bypassed = [tile for tile in policy.pure_visual if tile <= query_tile]
+            skip[..., fully_bypassed] = True
         if tv_layer is not None:
-            tv_layer.observe_text(query_tile, row_margins, ln_lam)
+            if token_drops is None:
+                tv_layer.observe_text(query_tile, row_margins, ln_lam)
+            else:
+                tv_layer.observe_tokens(r0, s_t, ln_lam, mask)
             if bypass:
                 skip[..., bypass] = True
             if (policy.threshold is not None and policy.top_percent is None and tv_layer.previous is not None
@@ -351,13 +378,15 @@ def blasst_attention_forward(
                     phase, {"skipped": 0, "causal": 0})
                 phase_stats["skipped"] += int(sk.sum())
                 phase_stats["causal"] += int(causal.sum()) * B * Hq
-                if bypass:
-                    phase_stats["qk_bypassed"] = phase_stats.get("qk_bypassed", 0) + len(bypass) * B * Hq
+                if fully_bypassed:
+                    phase_stats["qk_bypassed"] = phase_stats.get("qk_bypassed", 0) + len(fully_bypassed) * B * Hq
             if rec is not None:
                 rec.append(margin.detach().float().cpu())
 
         s_t = s_t.masked_fill(skip[:, :, None, :, None], NEG_INF)
         p = torch.softmax(s_t.view(B, Hq, r1 - r0, n_kt * TILE)[..., :Skv], dim=-1)
+        if token_bypass:
+            p = p.nan_to_num()
         out[:, :, r0:r1] = torch.matmul(p.to(value.dtype), value)
 
     if tv_layer is not None:

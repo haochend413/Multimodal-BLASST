@@ -27,7 +27,9 @@ export function setupTVVVSweep(showView) {
     $('votes').replaceChildren();
     if (!layer) return;
     const source = layer.vote_layer == null ? '' : ` · votes from layer ${layer.vote_layer}`;
-    $('coverage').textContent = `V→V QK tiles bypassed in layer ${layer.layer} · ${fraction(layer.vv_tiles_bypassed, layer.pure_vv_tiles)}${source}`;
+    $('coverage').textContent = layer.visual_query_tokens == null
+      ? `V→V QK tiles bypassed in layer ${layer.layer} · ${fraction(layer.vv_tiles_bypassed, layer.pure_vv_tiles)}${source}`
+      : `Visual tokens selected in layer ${layer.layer} · ${fraction(layer.visual_query_tokens_selected, layer.visual_query_tokens)} · V→V QK pairs bypassed ${fraction(layer.vv_pairs_bypassed, layer.vv_pairs)}${source}`;
     const score = run.vqa_score == null ? '' : ` · VQA score ${run.vqa_score.toFixed(1)}%`;
     $('answer').textContent = run.answer == null ? '' : `Generated answer · ${run.answer || '(empty)'}${score}`;
     for (const vote of layer.votes) {
@@ -57,7 +59,8 @@ export function setupTVVVSweep(showView) {
     const variants = Object.keys(data.variants);
     const official = data.answer_metric === 'VQA v2 consensus';
     const decodeLinks = data.decode_visual_link_study;
-    $('bypass-header').textContent = decodeLinks ? 'Decode visual QK tiles bypassed' : 'Pure V→V QK tiles bypassed';
+    $('bypass-header').textContent = decodeLinks ? 'Decode visual QK tiles bypassed' :
+      data.token_top_k ? 'V→V QK token pairs bypassed' : 'Pure V→V QK tiles bypassed';
     const budgets = data.budget_calibration;
     $('budget-note').hidden = !budgets;
     const keepTargets = budgets?.common_keep_targets;
@@ -95,7 +98,8 @@ export function setupTVVVSweep(showView) {
         fraction(result.reference_exact_matches ?? 0, result.answers_scored);
       const bypassed = decodeLinks
         ? fraction(result.decode_visual_tiles_bypassed, result.decode_visual_tiles)
-        : fraction(result.vv_tiles_bypassed, result.pure_vv_tiles);
+        : data.token_top_k ? fraction(result.vv_pairs_bypassed, result.vv_pairs)
+          : fraction(result.vv_tiles_bypassed, result.pure_vv_tiles);
       const cells = [variantLabel(variant), bypassed];
       for (const phase of maxPhases) {
         const policy = data[`${phase}_max_policies`][variant] === 'per_region' ? 'Per region' : 'Shared';

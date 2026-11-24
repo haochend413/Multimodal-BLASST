@@ -8,7 +8,7 @@ from collections import defaultdict
 
 import vqa_shards
 from tile_calibration import write_json
-from tv_guided_vv import SWEEP_SCHEMA
+from tv_guided_vv import SWEEP_SCHEMA, TOKEN_GATE_COUNTS
 from vqav2_accuracy import SHORT_ANSWER_INSTRUCTION, score_answer
 
 BUDGET_SCHEMA = "blasst-matched-region-budget-v2"
@@ -74,6 +74,8 @@ def fit(probe, target, minimum, max_probes, tolerance):
 
 
 def gate_from(trace):
+    if "top_token_percent" in trace:
+        return {layer["layer"]: layer["dropped_token_positions"] for layer in trace["layers"]}
     return {layer["layer"]: [vote["tile"] for vote in layer["votes"] if vote["decision"] == "skip"]
             for layer in trace["layers"]}
 
@@ -83,7 +85,10 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
         return run_gate_distribution(args, parser, samples, collect, select_sample, tile_size)
     calibration, evaluation = samples[:args.calibration_count], samples[args.calibration_count:]
     top_percent = getattr(args, "tv_vv_top_percent", None)
-    threshold = args.tv_vv_threshold if top_percent is not None or args.tv_vv_threshold is not None else .5
+    token_percent = getattr(args, "tv_vv_token_percent", None)
+    threshold = args.tv_vv_threshold
+    if all(value is None for value in (threshold, top_percent, token_percent)):
+        threshold = .5
     settings = dict(model=args.model, manifest_sha256=args.budget_manifest_sha, tile_size=tile_size,
                     calibration_ids=[sample["id"] for sample in calibration],
                     gate_threshold=threshold, gate_lambda=args.gate_lambda,
@@ -92,6 +97,8 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
                     probes=args.budget_probes, tolerance_pp=args.budget_tolerance_pp)
     if top_percent is not None:
         settings["gate_top_percent"] = top_percent
+    if token_percent is not None:
+        settings["gate_top_token_percent"] = token_percent
     config_path = args.budget_config or args.output.with_suffix(".budget.json")
     if config_path.resolve() == args.output.resolve():
         raise ValueError("Use separate output and budget-config files")
@@ -111,6 +118,8 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
         trace = metadata["tv_guided_vv"]
         result = dict(answer=metadata["answer"], pure_vv_tiles=trace["pure_vv_tiles"],
                       vv_tiles_bypassed=trace["vv_tiles_bypassed"])
+        if token_percent is not None:
+            result.update({key: trace[key] for key in TOKEN_GATE_COUNTS})
         for phase in PHASES:
             after = state["phase_stats"].get(phase, {})
             result[f"{phase}_tiles"] = after.get("causal", 0) - before[phase].get("causal", 0)
@@ -157,6 +166,9 @@ def run(args, parser, samples, collect, select_sample, state, tile_size):
                   variant_labels=LABELS, budget_calibration=config, cases=[],
                   answer_protocol=dict(instruction=SHORT_ANSWER_INSTRUCTION, max_new_tokens=args.decode_tokens,
                                        min_new_tokens=0))
+    if token_percent is not None:
+        report["token_top_k"] = True
+        report["variants"] = dict.fromkeys(POLICIES, token_percent)
     for index, phase in enumerate(PHASES):
         report[f"{phase}_max_policies"] = {name: "per_region" if mode[index] else "shared"
                                          for name, mode in POLICIES.items()}
@@ -208,7 +220,10 @@ def check_gate(result, reference, expected_gate, observed_gate):
 
 def run_gate_distribution(args, parser, samples, collect, select_sample, tile_size):
     top_percent = args.tv_vv_top_percent
-    threshold = args.tv_vv_threshold if top_percent is not None or args.tv_vv_threshold is not None else .5
+    token_percent = args.tv_vv_token_percent
+    threshold = args.tv_vv_threshold
+    if all(value is None for value in (threshold, top_percent, token_percent)):
+        threshold = .5
     cases = []
     totals = {field: defaultdict(int) for field in ("prompt_tokens", "pairs_before", "pairs_after")}
     for sample in samples:
@@ -226,7 +241,8 @@ def run_gate_distribution(args, parser, samples, collect, select_sample, tile_si
             print(f"Measured V→V QK distribution on {len(cases)}/{len(samples)} questions", flush=True)
     write_json(args.output, dict(schema="blasst-gate-distribution-v1", model=args.model, tile_size=tile_size,
                                  gate_lambda=args.gate_lambda, gate_threshold=threshold,
-                                 gate_top_percent=top_percent, totals=totals, cases=cases))
+                                 gate_top_percent=top_percent, gate_top_token_percent=token_percent,
+                                 totals=totals, cases=cases))
     print(f"Wrote V→V QK distribution to {args.output}", flush=True)
 
 

@@ -7,16 +7,19 @@ import torch
 
 
 SWEEP_SCHEMA = "blasst-tv-guided-vv-v1"
+TOKEN_GATE_COUNTS = ("vv_pairs", "vv_pairs_bypassed", "visual_query_tokens", "visual_query_tokens_selected")
 
 
 class TVGuidedVV:
     """Own the votes for one prompt so each layer reads only its predecessor."""
 
-    def __init__(self, visual, tile_size, threshold, *, replay=None, top_percent=None):
+    def __init__(self, visual, tile_size, threshold, *, replay=None, top_percent=None, token_percent=None):
         self.visual = visual.cpu().bool()
         self.tile_size = tile_size
         self.threshold = threshold
         self.top_percent = top_percent
+        self.token_percent = token_percent
+        self.visual_prefix = self.visual.cumsum(0)
         self.replay = replay
         self.text_rows = [~tile for tile in self.visual.split(tile_size)]
         self.pure_visual = [index for index, text in enumerate(self.text_rows) if not text.any()]
@@ -26,7 +29,7 @@ class TVGuidedVV:
 
     @property
     def enabled(self):
-        return self.threshold is not None or self.top_percent is not None
+        return self.threshold is not None or self.top_percent is not None or self.token_percent is not None
 
     def start_layer(self, layer, device):
         if layer == 0:
@@ -53,6 +56,9 @@ class TVGuidedVV:
         pure_rank = {tile: rank for rank, tile in enumerate(self.pure_visual)}
         layers = []
         for layer in self.layers:
+            if "vv_pairs_bypassed" in layer:
+                layers.append({key: layer[key] for key in ("layer", *TOKEN_GATE_COUNTS)})
+                continue
             bypassed = 0
             for vote in layer["votes"]:
                 count = vote["vv_tiles_bypassed"]
@@ -84,7 +90,19 @@ class TVLayer:
         self.protected = set()
         self.mask_fallback = set()
         self.dropped = set()
-        if policy.replay is not None:
+        self.token_drops = None
+        if policy.token_percent is not None:
+            self.token_kept = torch.zeros(len(policy.visual), dtype=torch.long, device=device)
+            self.token_eligible = torch.zeros_like(self.token_kept)
+            self.token_drops = torch.zeros_like(policy.visual)
+            if policy.replay is not None:
+                self.token_drops[policy.replay[layer]] = True
+            elif previous is not None:
+                quota = math.ceil(int(policy.visual.sum()) * policy.token_percent / 100)
+                ranked = sorted(policy.visual.nonzero().flatten().tolist(),
+                                key=lambda pos: (-previous["token_relevance"][pos], pos))
+                self.token_drops[ranked[quota:]] = True
+        elif policy.replay is not None:
             if layer not in policy.replay:
                 raise ValueError(f"V→V gate replay has no entry for layer {layer}")
             self.dropped = set(policy.replay[layer])
@@ -122,7 +140,40 @@ class TVLayer:
         self.eligible += eligible[0].sum(0)
         self.kept += vote[0].sum(0)
 
+    def observe_tokens(self, start, score_tiles, cutoff, mask):
+        length = len(self.policy.visual)
+        text = ~self.policy.visual[start:start + score_tiles.shape[-3]]
+        if not text.any():
+            return
+        scores = score_tiles[0, :, text.to(score_tiles.device)]
+        running = scores.amax(-1).cummax(-1).values
+        valid = torch.isfinite(scores)
+        if mask is not None and mask.dtype != torch.bool:
+            present = (mask[0] > torch.finfo(mask.dtype).min).expand_as(score_tiles[0].flatten(-2))
+            present = present[:, text.to(scores.device)]
+            pad = -length % self.policy.tile_size
+            valid &= torch.nn.functional.pad(present, (0, pad)).unflatten(-1, (-1, self.policy.tile_size))
+        eligible = valid.flatten(-2)[..., :length]
+        kept = (valid & (scores - running.unsqueeze(-1) >= cutoff)).flatten(-2)[..., :length]
+        self.token_eligible += eligible.sum(dim=(0, 1))
+        self.token_kept += kept.sum(dim=(0, 1))
+
     def finish(self):
+        if self.token_drops is not None:
+            policy = self.policy
+            visual_tokens = int(policy.visual.sum())
+            relevance = torch.where(self.token_eligible > 0,
+                                    self.token_kept / self.token_eligible, -1.).tolist()
+            record = dict(layer=self.layer, vote_layer=self.previous["layer"] if self.previous else None,
+                          visual_query_tokens=visual_tokens,
+                          visual_query_tokens_selected=visual_tokens - int(self.token_drops.sum()),
+                          vv_pairs=visual_tokens * (visual_tokens + 1) // 2,
+                          vv_pairs_bypassed=int(policy.visual_prefix[self.token_drops].sum()),
+                          pure_vv_tiles=0, vv_tiles_bypassed=0, votes=[],
+                          dropped_token_positions=self.token_drops.nonzero().flatten().tolist())
+            policy.layers.append(record)
+            policy.previous = dict(record, token_relevance=relevance)
+            return
         kept, eligible = self.kept.tolist(), self.eligible.tolist()
         previous_votes = {vote["tile"]: vote for vote in self.previous["votes"]} if self.previous else {}
         votes = []

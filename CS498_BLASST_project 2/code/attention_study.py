@@ -22,7 +22,7 @@ from jl_gap_study import JLGapStudy, merge_sweeps
 from jl_region_study import JLRegionStudy, merge_region_audits
 from tile_layer_study import LayerReport, TileLayerRecorder
 from tile_calibration import add_threshold_arguments, selected_calibration, write_json
-from tv_guided_vv import SWEEP_SCHEMA as TV_VV_SCHEMA, TVGuidedVV
+from tv_guided_vv import SWEEP_SCHEMA as TV_VV_SCHEMA, TOKEN_GATE_COUNTS, TVGuidedVV
 from vqav2_accuracy import SHORT_ANSWER_INSTRUCTION, score_answer, validate_cases
 from region_max import RegionMax
 import vqa_shards
@@ -253,7 +253,9 @@ def main() -> None:
     tv_vv = parser.add_mutually_exclusive_group()
     tv_vv.add_argument("--tv-vv-threshold", type=float,
                        help="gate causal V→V query tiles using the preceding layer's T→V keep fraction")
-    tv_vv.add_argument("--tv-vv-top-percent", type=float, metavar="PERCENT",
+    tv_vv.add_argument("--tv-vv-top-percent", dest="tv_vv_token_percent", type=float, metavar="PERCENT",
+                       help="select the top percentage of individual visual query tokens")
+    tv_vv.add_argument("--tv-vv-top-tile-percent", dest="tv_vv_top_percent", type=float, metavar="PERCENT",
                        help="select the top percentage of visual query tiles by previous-layer T→V votes")
     tv_vv.add_argument("--tv-vv-sweep", metavar="FRACTIONS",
                        help="compare standard BLASST and comma-separated T→V relevance thresholds")
@@ -316,7 +318,8 @@ def main() -> None:
                 or args.score_distributions or args.score_data or args.raw_dir):
             parser.error("--decode-visual-links compares against causal BLASST with shared running maxima")
         args.vqa_accuracy = True
-    args.tv_vv_top_accuracy = (args.vqa_accuracy and args.tv_vv_top_percent is not None
+    has_top_k = args.tv_vv_token_percent is not None or args.tv_vv_top_percent is not None
+    args.tv_vv_top_accuracy = (args.vqa_accuracy and has_top_k
                                and not (args.matched_region_study or args.gate_distribution))
     if args.tv_vv_top_accuracy and (args.prefill_region_max or args.decode_region_max):
         parser.error("The paired top-k accuracy run uses shared running maxima in both variants")
@@ -355,9 +358,10 @@ def main() -> None:
     tv_vv_thresholds = args.tv_vv_sweep or (
         [args.tv_vv_threshold] if args.tv_vv_threshold is not None else []
     )
-    if args.tv_vv_top_percent is not None and not 0 <= args.tv_vv_top_percent <= 100:
-        parser.error("--tv-vv-top-percent must be in [0, 100]")
-    if tv_vv_thresholds or args.tv_vv_top_percent is not None:
+    if any(value is not None and not 0 <= value <= 100
+           for value in (args.tv_vv_token_percent, args.tv_vv_top_percent)):
+        parser.error("Top-k percentages must be in [0, 100]")
+    if tv_vv_thresholds or has_top_k:
         if any(not 0 <= threshold <= 1 for threshold in tv_vv_thresholds):
             parser.error("T→V relevance thresholds must be in [0, 1]")
         if (args.vv_prefix_attention or args.jl_dim is not None or args.jl_sweep
@@ -566,10 +570,14 @@ def _collect_tv_vv_sweep(args, parser, samples):
 
 def _run_tv_vv_sweep(args, parser, samples):
     top_percent = getattr(args, "tv_vv_top_percent", None)
+    token_percent = getattr(args, "tv_vv_token_percent", None)
+    has_top_k = top_percent is not None or token_percent is not None
     decode_links = getattr(args, "decode_visual_links", False)
     variants = [("baseline", None)]
     if decode_links:
         variants.append(("decode_links", True))
+    elif token_percent is not None:
+        variants.append((f"top_token_{token_percent:g}", token_percent))
     elif top_percent is None:
         variants.extend((str(value), value) for value in args.tv_vv_sweep)
     else:
@@ -586,11 +594,14 @@ def _run_tv_vv_sweep(args, parser, samples):
     if decode_links:
         report["decode_visual_link_study"] = True
         report["variant_labels"] = {"baseline": "Original BLASST", "decode_links": "Decode with prefill T→V links"}
-    elif top_percent is not None:
-        report["variant_labels"] = {"baseline": "Original BLASST", variants[1][0]: f"Top {top_percent:g}% visual rows"}
+    elif has_top_k:
+        amount, unit = ((token_percent, "tokens") if token_percent is not None else (top_percent, "tile rows"))
+        report["variant_labels"] = {"baseline": "Original BLASST", variants[1][0]: f"Top {amount:g}% visual {unit}"}
+        if token_percent is not None:
+            report["token_top_k"] = True
         for phase in ("prefill", "decode"):
             report[f"{phase}_max_policies"] = dict.fromkeys(dict(variants), "shared")
-    measured_phases = ("prefill", "decode") if top_percent is not None or decode_links else region_phases
+    measured_phases = ("prefill", "decode") if has_top_k or decode_links else region_phases
     if args.vqa_accuracy:
         report["answer_metric"] = "VQA v2 consensus"
         report["answer_protocol"] = dict(instruction=SHORT_ANSWER_INSTRUCTION,
@@ -617,9 +628,10 @@ def _run_tv_vv_sweep(args, parser, samples):
                 case.update(question=benchmark["question_text"], reference_answers=references)
         for name, value in variants:
             # An ungated vote trace provides the baseline's causal V→V denominator.
-            threshold = value if top_percent is None and not decode_links else None
+            threshold = value if not has_top_k and not decode_links else None
             run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold,
                                             tv_vv_top_percent=value if top_percent is not None else None,
+                                            tv_vv_token_percent=value if token_percent is not None else None,
                                             decode_visual_links=decode_links and name != "baseline",
                                             decode_visual_link_study=decode_links))
             for phase in region_phases:
@@ -638,7 +650,7 @@ def _run_tv_vv_sweep(args, parser, samples):
                 after = ba.STATE["phase_stats"].get(phase, {})
                 result[f"{phase}_tiles"] = after.get("causal", 0) - before[phase].get("causal", 0)
                 result[f"{phase}_tiles_skipped"] = after.get("skipped", 0) - before[phase].get("skipped", 0)
-                if phase == "prefill" and top_percent is not None:
+                if phase == "prefill" and has_top_k:
                     result["prefill_qk_bypassed"] = after.get("qk_bypassed", 0) - before[phase].get("qk_bypassed", 0)
             if args.vqa_accuracy:
                 result["vqa_score"] = score_answer(answer, references)
@@ -806,11 +818,13 @@ def _attach_study(args, recorder):
         ba.STATE["prefill_region_max"] = regions if args.prefill_region_max else None
         ba.STATE["decode_region_max"] = regions if args.decode_region_max else None
     top_percent = getattr(args, "tv_vv_top_percent", None)
+    token_percent = getattr(args, "tv_vv_token_percent", None)
     paired = args.tv_vv_sweep or getattr(args, "tv_vv_top_accuracy", False)
-    if (args.tv_vv_threshold is not None or top_percent is not None or paired
+    if (args.tv_vv_threshold is not None or top_percent is not None or token_percent is not None or paired
             or args.matched_region_study or args.gate_distribution):
         ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold,
-                                            replay=getattr(args, "gate_replay", None), top_percent=top_percent)
+                                            replay=getattr(args, "gate_replay", None), top_percent=top_percent,
+                                            token_percent=token_percent)
         ba.STATE["qkv_hook"] = None
         if paired or args.matched_region_study or args.gate_distribution:
             ba.STATE["observer"] = None
@@ -879,7 +893,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
         torch.manual_seed(98 + args.sample_index if sweep else 98)
         length = 640
         visual = torch.zeros(length, dtype=torch.bool)
-        tv_demo = args.tv_vv_sweep or args.tv_vv_threshold is not None or args.tv_vv_top_percent is not None
+        tv_demo = (args.tv_vv_sweep or args.tv_vv_threshold is not None or args.tv_vv_top_percent is not None
+                   or getattr(args, "tv_vv_token_percent", None) is not None)
         if args.jl_region_audit:
             visual[15:544] = True
         elif tv_demo:
@@ -964,6 +979,10 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
                                         vv_tiles_bypassed=sum(layer["vv_tiles_bypassed"] for layer in policy.layers))
         if policy.top_percent is not None:
             metadata["tv_guided_vv"]["top_percent"] = policy.top_percent
+        if policy.token_percent is not None:
+            metadata["tv_guided_vv"]["top_token_percent"] = policy.token_percent
+            metadata["tv_guided_vv"].update({key: sum(layer[key] for layer in policy.layers)
+                                              for key in TOKEN_GATE_COUNTS})
         if args.gate_distribution:
             metadata["gate_distribution"] = policy.distribution()
         if (args.tv_vv_sweep or getattr(args, "tv_vv_top_accuracy", False)

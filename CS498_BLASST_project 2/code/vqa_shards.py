@@ -9,11 +9,12 @@ from contextlib import contextmanager
 
 from decode_visual_links import DECODE_LINK_COUNTS
 from tile_calibration import write_json
+from tv_guided_vv import TOKEN_GATE_COUNTS
 
 CHECKPOINT_INTERVAL = 25
 MAX_POLICIES = ("prefill_max_policies", "decode_max_policies")
 TILE_COUNTS = ("prefill_tiles", "prefill_tiles_skipped", "decode_tiles", "decode_tiles_skipped",
-               "prefill_qk_bypassed", *DECODE_LINK_COUNTS)
+               "prefill_qk_bypassed", *DECODE_LINK_COUNTS, *TOKEN_GATE_COUNTS)
 CASE_FIELDS = ("answer", "vqa_score", "pure_vv_tiles", "vv_tiles_bypassed", "answer_changed", *TILE_COUNTS)
 
 
@@ -106,7 +107,7 @@ def merge(paths, output):
         if not shard:
             raise ValueError(f"{path} is not a VQA shard report")
         expected_config = {key: report[key] for key in config_keys}
-        for key in (*MAX_POLICIES, "variant_labels", "decode_visual_link_study"):
+        for key in (*MAX_POLICIES, "variant_labels", "decode_visual_link_study", "token_top_k"):
             if key in report:
                 expected_config[key] = report[key]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}
