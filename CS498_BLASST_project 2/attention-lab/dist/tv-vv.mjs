@@ -41,7 +41,13 @@ export function setupTVVVSweep(showView) {
   function drawLayers() {
     const data = active().data;
     const run = data.cases[Number($('case').value)].results[$('variant').value];
-    options('layer', run.layers.map(layer => layer.layer), layer => `Layer ${layer}`);
+    $('layers-detail').hidden = !run.layers?.length;
+    options('layer', (run.layers ?? []).map(layer => layer.layer), layer => `Layer ${layer}`);
+    if (!run.layers?.length) {
+      const score = run.vqa_score == null ? '' : ` · VQA score ${run.vqa_score.toFixed(1)}%`;
+      $('answer').textContent = `Generated answer · ${run.answer || '(empty)'}${score}`;
+      return;
+    }
     drawVotes();
   }
 
@@ -50,7 +56,7 @@ export function setupTVVVSweep(showView) {
     const variants = Object.keys(data.variants);
     const official = data.answer_metric === 'VQA v2 consensus';
     $('accuracy-header').textContent = official ? 'VQA v2 accuracy' : 'Reference exact matches';
-    $('status').textContent = `${data.synthetic ? 'Synthetic · ' : ''}${data.cases.length}/${data.pairs_requested} cases · BLASST λ = ${data.blasst_lambda}`;
+    $('status').textContent = `${data.synthetic ? 'Synthetic · ' : ''}${data.pairs_completed ?? data.cases.length}/${data.pairs_requested} cases · BLASST λ = ${data.blasst_lambda}`;
     $('summary').replaceChildren();
     for (const variant of variants) {
       const result = data.summary[variant];
@@ -62,6 +68,8 @@ export function setupTVVVSweep(showView) {
         accuracy, result.answers_changed]);
     }
     $('content').hidden = false;
+    $('case-detail').hidden = !data.cases.length;
+    if (!data.cases.length) return;
     options('case', data.cases.map((_, index) => index), index => data.cases[index].sample_id ?? `Case ${index + 1}`);
     options('variant', variants, variantLabel);
     drawLayers();
@@ -72,7 +80,7 @@ export function setupTVVVSweep(showView) {
   for (const id of ['case', 'variant']) $(id).addEventListener('change', drawLayers);
   return {
     add(name, data) {
-      if (!isTVVVSweep(data) || !data.cases?.length || !data.summary) {
+      if (!isTVVVSweep(data) || (!data.cases?.length && !data.vqa_merged) || !data.summary) {
         throw new Error('Invalid T→V-guided V→V report.');
       }
       reports.push({name, data});

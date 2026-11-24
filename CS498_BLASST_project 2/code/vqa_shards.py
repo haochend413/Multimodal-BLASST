@@ -1,0 +1,145 @@
+"""Checkpoint paired VQA shards and merge their predictions and accuracy."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+from collections import defaultdict
+from contextlib import contextmanager
+
+from tile_calibration import write_json
+
+CHECKPOINT_INTERVAL = 25
+CASE_FIELDS = ("answer", "vqa_score", "pure_vv_tiles", "vv_tiles_bypassed", "answer_changed")
+
+
+@contextmanager
+def claim(output):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.with_suffix(output.suffix + ".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError(f"another worker is writing {output}") from error
+        yield
+
+
+def partition(total, count, index):
+    if not 1 <= count <= total or not 0 <= index < count:
+        raise ValueError("shard count must fit the manifest and shard index must be in [0, count)")
+    return total * index // count, total * (index + 1) // count
+
+
+def resume(report, output, samples, start):
+    if not output.exists():
+        return
+    saved = json.loads(output.read_text())
+    expected = {key: value for key, value in report.items() if key != "cases"}
+    if any(saved.get(key) != value for key, value in expected.items()):
+        raise ValueError("checkpoint settings differ from this run")
+    cases = saved["cases"]
+    if len(cases) > len(samples) or any(
+        case["sample_index"] != start + index
+        or case["question_id"] != samples[index]["benchmark"]["question_id"]
+        for index, case in enumerate(cases)
+    ):
+        raise ValueError("checkpoint questions do not match the beginning of this shard")
+    report["cases"] = cases
+
+
+def accumulate(totals, case):
+    baseline = case["results"]["baseline"]["vqa_score"]
+    for name, result in case["results"].items():
+        counts = totals[name]
+        counts["vqa_score_sum"] += result["vqa_score"]
+        counts["answers_scored"] += 1
+        counts["pure_vv_tiles"] += result["pure_vv_tiles"]
+        counts["vv_tiles_bypassed"] += result["vv_tiles_bypassed"]
+        if name != "baseline":
+            counts["answers_changed"] += result["answer_changed"]
+            counts["vqa_better"] += result["vqa_score"] > baseline
+            counts["vqa_worse"] += result["vqa_score"] < baseline
+
+
+def summarize(totals):
+    summary = {}
+    baseline = totals["baseline"]["vqa_score_sum"] / totals["baseline"]["answers_scored"]
+    for name, totals_for_variant in totals.items():
+        score = totals_for_variant["vqa_score_sum"] / totals_for_variant["answers_scored"]
+        summary[name] = dict(totals_for_variant, vqa_accuracy=score)
+        if name != "baseline":
+            summary[name]["vqa_delta_pp"] = score - baseline
+    return summary
+
+
+def save_predictions(output, predictions):
+    for name, rows in predictions.items():
+        write_json(output.with_name(f"{output.stem}-{name}-predictions.json"), rows)
+
+
+def merge(paths, output):
+    config_keys = ("schema", "model", "synthetic", "tile_size", "blasst_lambda", "decode_lambda",
+                   "answer_metric", "variants", "answer_protocol", "image_max_pixels", "max_prompt_tokens")
+    totals = defaultdict(lambda: defaultdict(int))
+    predictions = defaultdict(list)
+    seen_shards = set()
+    question_ids = set()
+    config, manifest = None, None
+    for path in paths:
+        report = json.loads(path.read_text())
+        shard = report.get("vqa_shard")
+        if not shard:
+            raise ValueError(f"{path} is not a VQA shard report")
+        expected_config = {key: report[key] for key in config_keys}
+        expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}
+        if config is None:
+            config, manifest = expected_config, expected_manifest
+        elif config != expected_config or manifest != expected_manifest:
+            raise ValueError(f"{path} uses different run or manifest settings")
+        if shard["index"] in seen_shards:
+            raise ValueError(f"duplicate shard index {shard['index']}")
+        start, stop = partition(shard["manifest_questions"], shard["count"], shard["index"])
+        cases = report["cases"]
+        if (len(cases) != stop - start or report["pairs_requested"] != stop - start
+                or any(case["sample_index"] != index for index, case in enumerate(cases, start=start))):
+            raise ValueError(f"{path} is incomplete or has an invalid case range")
+        for case in cases:
+            qid = case["question_id"]
+            if qid in question_ids or case["results"].keys() != config["variants"].keys():
+                raise ValueError(f"{path} has a duplicate question ID or incomplete pair")
+            question_ids.add(qid)
+            accumulate(totals, case)
+            for name, result in case["results"].items():
+                predictions[name].append({"question_id": qid, "answer": result["answer"]})
+        seen_shards.add(shard["index"])
+    missing = set(range(manifest["count"])) - seen_shards
+    if missing:
+        raise ValueError(f"{len(missing)} missing shards; first missing shard is {min(missing)}")
+    total = manifest["manifest_questions"]
+    merged = dict(config, pairs_requested=total, pairs_completed=len(question_ids), cases=[],
+                  summary=summarize(totals), vqa_merged=manifest)
+    for pairs in predictions.values():
+        pairs.sort(key=lambda row: row["question_id"])
+    save_predictions(output, predictions)
+    write_json(output, merged)
+    return merged
+
+
+def main():
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("shards", nargs="+", type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    try:
+        report = merge(args.shards, args.output)
+    except (ValueError, KeyError, OSError) as error:
+        parser.error(str(error))
+    for policy, values in report["summary"].items():
+        print(f"{policy}: {values['vqa_accuracy']:.2f}% on {values['answers_scored']} questions")
+    print(f"Wrote merged VQA report to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

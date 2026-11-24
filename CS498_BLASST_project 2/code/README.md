@@ -123,6 +123,55 @@ aggregate accuracy, and the paired change from standard BLASST. Each policy also
 writes a sibling `*-predictions.json` in the official question-ID/answer format.
 The score covers the selected validation subset.
 
+#### Full VQA v2 validation
+
+The full validation split contains 214,354 questions. The same paired comparison
+runs 428,708 generations. From `CS498_BLASST_project 2`, prepare the manifest
+with a shared data root accessible to the GPU workers:
+
+```bash
+VQA_ROOT="$HOME/vqav2"
+RESULTS="$HOME/blasst-results"
+mkdir -p "$VQA_ROOT"
+# Skip these two commands if "$VQA_ROOT/val2014" already contains the COCO images.
+curl -fL --retry 3 -o "$VQA_ROOT/val2014.zip" \
+  https://s3.amazonaws.com/images.cocodataset.org/zips/val2014.zip
+unzip -n "$VQA_ROOT/val2014.zip" -d "$VQA_ROOT"
+
+python code/prepare_vqav2_study.py --data-root "$VQA_ROOT" --all-validation --download \
+  --output "$RESULTS/vqav2-full-val.json"
+```
+
+For a measured throughput pilot use the VQA accuracy command above with the
+full manifest and `--vqa-shards 215 --vqa-shard-index 0` in place of the sample count.
+That runs about 1,000 paired questions. Multiply seconds per paired question
+by 214,354 and divide by 3,600 to estimate GPU-hours. Submit one GPU per shard.
+Set `DELTAAI_ACCOUNT` and `DELTAAI_PARTITION` for your allocation and choose
+time and concurrency from the pilot. This example uses 430 shards and up to
+eight concurrent workers, with the Python environment already activated:
+
+```bash
+mkdir -p "$RESULTS/vqa-full-shards"
+sbatch --account="$DELTAAI_ACCOUNT" --partition="$DELTAAI_PARTITION" \
+  --gpus=1 --cpus-per-task=8 --mem=32G --time=02:00:00 --array=0-429%8 \
+  code/vqa_full_shard.sh "$RESULTS/vqav2-full-val.json" "$RESULTS/vqa-full-shards" 430
+```
+
+The wrapper runs standard BLASST and relevance 0.5 at lambda 0.1. Each shard
+checkpoints every 25 complete pairs and automatically resumes when submitted again
+with the same arguments and output path. Give concurrent workers distinct shard IDs.
+Once all shards finish, merge the results:
+
+```bash
+python code/vqa_shards.py "$RESULTS"/vqa-full-shards/shard-*.json \
+  --output "$RESULTS/vqav2-full-accuracy.json"
+```
+
+The merge checks for missing or duplicate shards, duplicate questions, and
+consistent settings. It writes the aggregate accuracy and bypass report plus
+one official-format predictions file per policy. Load the merged summary or a
+compact individual shard report in **T→V-guided V→V**.
+
 ### Bidirectional masking for pure V→V tiles
 
 To test bidirectional V→V attention on one manifest case:

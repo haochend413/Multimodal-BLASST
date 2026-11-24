@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from collections import defaultdict
@@ -22,6 +23,7 @@ from tile_layer_study import LayerReport, TileLayerRecorder
 from tile_calibration import add_threshold_arguments, selected_calibration, write_json
 from tv_guided_vv import SWEEP_SCHEMA as TV_VV_SCHEMA, TVGuidedVV
 from vqav2_accuracy import SHORT_ANSWER_INSTRUCTION, score_answer, validate_cases
+import vqa_shards
 
 if TYPE_CHECKING:
     from transformers import Qwen2_5_VLProcessor
@@ -249,6 +251,8 @@ def main() -> None:
                        help="compare standard BLASST and comma-separated T→V relevance thresholds")
     parser.add_argument("--vqa-accuracy", action="store_true",
                         help="use short-answer generation and the official VQA score in a VQA v2 sweep")
+    parser.add_argument("--vqa-shards", type=int, help="split the whole VQA manifest into this many shards")
+    parser.add_argument("--vqa-shard-index", type=int, help="zero-based index of this restartable shard")
     parser.add_argument("--jl-dim", type=int, help="audit a JL precheck at this sketch dimension")
     parser.add_argument("--jl-sweep", metavar="DIMS",
                         help="comma-separated JL widths for a paired skip-rate and gap histogram study")
@@ -281,6 +285,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.vqa_accuracy and not (args.tv_vv_sweep is not None and args.manifest):
         parser.error("--vqa-accuracy requires --tv-vv-sweep and a VQA v2 manifest")
+    args.vqa_shard = None
+    if args.vqa_shards is not None or args.vqa_shard_index is not None:
+        if (not args.vqa_accuracy or args.vqa_shards is None or args.vqa_shard_index is None
+                or args.sample_index != 0 or args.sample_count != 1):
+            parser.error("use both VQA shard flags with --vqa-accuracy in place of sample range flags")
     if args.tv_vv_sweep is not None:
         try:
             args.tv_vv_sweep = sorted({float(value) for value in args.tv_vv_sweep.split(",")})
@@ -355,10 +364,20 @@ def main() -> None:
     if args.manifest is not None:
         if args.demo or args.video is not None or args.image is not None:
             parser.error("--manifest cannot be combined with --demo, --video or --image")
-        manifest = json.loads(args.manifest.read_text())
+        manifest_bytes = args.manifest.read_bytes()
+        manifest = json.loads(manifest_bytes)
         if manifest.get("schema") != "blasst-benchmark-manifest-v1":
             parser.error("unsupported benchmark manifest schema")
         samples = manifest["samples"]
+        if args.vqa_shards is not None:
+            try:
+                start, stop = vqa_shards.partition(len(samples), args.vqa_shards, args.vqa_shard_index)
+            except ValueError as error:
+                parser.error(str(error))
+            args.vqa_shard = dict(index=args.vqa_shard_index, count=args.vqa_shards, manifest_questions=len(samples),
+                                  manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest())
+            args.sample_index, args.sample_count = start, stop - start
+        del manifest_bytes, manifest
         end = args.sample_index + args.sample_count
         if not 0 <= args.sample_index < end <= len(samples):
             parser.error(f"requested sample range is outside the {len(samples)} manifest pairs")
@@ -461,6 +480,17 @@ def _normalized_answer(answer):
 
 
 def _collect_tv_vv_sweep(args, parser, samples):
+    if getattr(args, "vqa_shard", None):
+        try:
+            with vqa_shards.claim(args.output):
+                _run_tv_vv_sweep(args, parser, samples)
+        except ValueError as error:
+            parser.error(str(error))
+    else:
+        _run_tv_vv_sweep(args, parser, samples)
+
+
+def _run_tv_vv_sweep(args, parser, samples):
     variants = [("baseline", None), *((str(value), value) for value in args.tv_vv_sweep)]
     report = dict(schema=TV_VV_SCHEMA, model=args.model, synthetic=args.demo, tile_size=ba.TILE,
                   blasst_lambda=args.lam, decode_lambda=args.decode_lambda, pairs_requested=len(samples),
@@ -470,15 +500,26 @@ def _collect_tv_vv_sweep(args, parser, samples):
         report["answer_metric"] = "VQA v2 consensus"
         report["answer_protocol"] = dict(instruction=SHORT_ANSWER_INSTRUCTION,
                                          max_new_tokens=args.decode_tokens, min_new_tokens=0)
+    shard = getattr(args, "vqa_shard", None)
+    if shard:
+        report.update(vqa_shard=shard, image_max_pixels=args.image_max_pixels, max_prompt_tokens=args.max_tokens)
+        try:
+            vqa_shards.resume(report, args.output, samples, args.sample_index)
+        except (ValueError, KeyError, OSError) as error:
+            parser.error(f"{args.output}: {error}")
     totals = {name: defaultdict(int) for name, _ in variants}
-    for index, sample in enumerate(samples, start=args.sample_index):
+    for case in report["cases"]:
+        vqa_shards.accumulate(totals, case)
+    completed = len(report["cases"])
+    for index, sample in enumerate(samples[completed:], start=args.sample_index + completed):
         benchmark, sample_id = (sample["benchmark"], sample["id"]) if sample else ({}, str(index))
         case = dict(sample_index=index, sample_id=sample_id, results={})
         references = benchmark.get("reference_answers") or [benchmark.get("ground_truth", "")]
         answers = {normalized for answer in references if (normalized := _normalized_answer(answer))}
         if args.vqa_accuracy:
-            case.update(question_id=benchmark["question_id"], question=benchmark["question_text"],
-                        reference_answers=references)
+            case["question_id"] = benchmark["question_id"]
+            if not shard:
+                case.update(question=benchmark["question_text"], reference_answers=references)
         for name, threshold in variants:
             # An ungated vote trace provides the baseline's causal V→V denominator.
             run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold))
@@ -492,11 +533,7 @@ def _collect_tv_vv_sweep(args, parser, samples):
             normalized = _normalized_answer(answer) if answer is not None else None
             result = dict(answer=answer, **trace)
             if args.vqa_accuracy:
-                score = score_answer(answer, references)
-                result["vqa_score"] = score
-                totals[name]["vqa_score_sum"] += score
-                totals[name]["answers_scored"] += 1
-                totals[name]["vqa_accuracy"] = totals[name]["vqa_score_sum"] / totals[name]["answers_scored"]
+                result["vqa_score"] = score_answer(answer, references)
             else:
                 match = normalized in answers if answers and normalized is not None else None
                 result["reference_exact_match"] = match
@@ -506,28 +543,33 @@ def _collect_tv_vv_sweep(args, parser, samples):
             if name != "baseline" and answer is not None:
                 base = case["results"]["baseline"]
                 result["answer_changed"] = normalized != _normalized_answer(base["answer"])
-                if args.vqa_accuracy:
-                    delta = result["vqa_score"] - base["vqa_score"]
-                    totals[name]["vqa_better"] += delta > 0
-                    totals[name]["vqa_worse"] += delta < 0
-                    totals[name]["vqa_delta_pp"] = totals[name]["vqa_accuracy"] - totals["baseline"]["vqa_accuracy"]
-            case["results"][name] = result
-            totals[name]["pure_vv_tiles"] += trace["pure_vv_tiles"]
-            totals[name]["vv_tiles_bypassed"] += trace["vv_tiles_bypassed"]
-            if "answer_changed" in result:
-                totals[name]["answers_changed"] += result["answer_changed"]
+            case["results"][name] = (
+                {key: result[key] for key in vqa_shards.CASE_FIELDS if key in result} if shard else result
+            )
+            if not args.vqa_accuracy:
+                totals[name]["pure_vv_tiles"] += trace["pure_vv_tiles"]
+                totals[name]["vv_tiles_bypassed"] += trace["vv_tiles_bypassed"]
+                if "answer_changed" in result:
+                    totals[name]["answers_changed"] += result["answer_changed"]
+        if args.vqa_accuracy:
+            vqa_shards.accumulate(totals, case)
         report["cases"].append(case)
-        report["summary"] = totals
-        write_json(args.output, report)
-        print(f"Compared T→V-guided V→V for {len(report['cases'])}/{len(samples)} cases", flush=True)
+        done = len(report["cases"])
+        if not shard or done % vqa_shards.CHECKPOINT_INTERVAL == 0 or done == len(samples):
+            report["summary"] = vqa_shards.summarize(totals) if args.vqa_accuracy else totals
+            write_json(args.output, report)
+            print(f"Compared T→V-guided V→V for {done}/{len(samples)} cases", flush=True)
     print(f"Wrote paired T→V-guided V→V report to {args.output}")
     if args.vqa_accuracy:
-        for name, _ in variants:
-            predictions = [{"question_id": case["question_id"], "answer": case["results"][name]["answer"]}
-                           for case in report["cases"]]
-            write_json(args.output.with_name(f"{args.output.stem}-{name}-predictions.json"), predictions)
-            score = totals[name]["vqa_accuracy"]
-            print(f"{name}: VQA v2 accuracy {score:.2f}% on {totals[name]['answers_scored']} questions")
+        if not shard:
+            predictions = {
+                name: [{"question_id": case["question_id"], "answer": case["results"][name]["answer"]}
+                       for case in report["cases"]]
+                for name, _ in variants
+            }
+            vqa_shards.save_predictions(args.output, predictions)
+        for name, result in vqa_shards.summarize(totals).items():
+            print(f"{name}: VQA v2 accuracy {result['vqa_accuracy']:.2f}% on {result['answers_scored']} questions")
 
 
 def _collect_layer_study(args, parser, samples, calibration):
