@@ -268,6 +268,33 @@ layer/head/decode-step observations that used fallback. Compare
 avoided by the reference implementation. Load the report in Attention Lab
 under **T→V-guided V→V** to compare accuracy and bypass counts.
 
+#### Binary T→T → T→V → V→V pipeline
+
+```bash
+python code/attention_study.py \
+  --manifest "$HOME/blasst-results/vqav2-random-val-1000-seed20261124.json" \
+  --sample-count 1000 --decode-tokens 16 --lambda 0.1 --decode-lambda 0.1 \
+  --binary-tv-pipeline \
+  --output "$HOME/blasst-results/vqav2-random1000-binary-tv-pipeline.json"
+```
+
+The paired study evaluates original BLASST, binary T→T-guided T→V in
+prefill and decode, and the same T→V policy plus the prefill V→V gate.
+Layer 0 uses ordinary BLASST and records row-level T→V links. At later layers,
+each text query uses the union of the previous layer's links for text keys
+retained by text-only BLASST. Visual candidates are filtered by the usual
+score cutoff, and that result becomes the next layer's link mask. Text queries
+without usable history compute all visible visual candidates. Retained text
+and visual scores share one softmax.
+
+The full pipeline uses the current T→V mask to update V→V query rows for
+each head. This prefill gate can use the full supplied question. Every QK
+operation still honors causal key visibility, and reference answers are used
+only during scoring. Decode has only text queries and extends the link history
+at each generated position. The report counts causal QK pairs and bypasses
+for prefill T→V, prefill V→V, and decode T→V. These counts measure selection
+in the PyTorch reference, with latency measured separately.
+
 #### Measure the token and attention mix after the V→V gate
 
 Run one prefill per question with the same gate settings and sample range as the

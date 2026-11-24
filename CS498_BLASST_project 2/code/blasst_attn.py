@@ -82,6 +82,7 @@ STATE: Dict = {
     "vv_prefix_visual": None, # opt-in prompt mask for bidirectional V→V tiles
     "tv_guided_vv": None,    # prompt-local previous-layer text vote policy
     "decode_visual_links": None,  # prompt-local prefill text-to-vision links
+    "binary_tv_pipeline": None,  # optional cross-layer T→V masks and V→V row gate
     "decode_records": {},    # layer -> list of [B,H,1,key_tiles], one tensor per step
 }
 
@@ -253,6 +254,20 @@ def blasst_attention_forward(
     ln_lam = min(ln_lam, 0.0)
     offset = Skv - Sq                 # queries are the LAST Sq positions of the key axis
     n_kt = math.ceil(Skv / TILE)
+    binary = STATE["binary_tv_pipeline"]
+    if binary is not None:
+        if B != 1 or layer_idx < 0 or (phase == "prefill" and (Sq != Skv or Sq != len(binary.visual))):
+            raise ValueError("The binary T→V pipeline requires one unpadded prompt, indexed layers, and a full prefill")
+        if layer_idx:
+            mask = mask_chunk(attention_mask, 0, Sq, Sq, Skv)
+            output, kept = binary.forward(layer_idx, query, key, value, mask, scaling, ln_lam, phase)
+            if STATE["collect_stats"]:
+                eligible = causal_tiles(Sq, Skv, offset).to(query.device).unsqueeze(0)
+                phase_stats = STATE["phase_stats"].setdefault(phase, {"skipped": 0, "causal": 0})
+                phase_stats["skipped"] += int((eligible & ~kept).sum())
+                phase_stats["causal"] += int(eligible.sum()) * Hq
+            return output, None
+        binary.start(layer_idx, Hq, Skv, query.device)
     links = STATE["decode_visual_links"]
     if links is not None:
         if B != 1 or layer_idx < 0:
@@ -336,6 +351,8 @@ def blasst_attention_forward(
                        else row_tile_margins(s_t.amax(-1)))
         if links is not None:
             links.record(layer_idx, r0, s_t, ln_lam, mask)
+        if binary is not None:
+            binary.record_warmup(r0 + offset, s_t, mask, ln_lam, phase)
         margin = row_margins.amax(-2)
         skip = margin < ln_lam                                              # all rows far below running max
         fully_bypassed = bypass

@@ -16,6 +16,7 @@ from uuid import uuid4
 import torch
 
 import blasst_attn as ba
+from binary_tv_pipeline import BinaryTVPipeline
 from decode_visual_links import DecodeVisualLinks
 from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy, VISUAL_KEY_QUERY_SPLIT
 from jl_gap_study import JLGapStudy, merge_sweeps
@@ -261,6 +262,8 @@ def main() -> None:
                        help="compare standard BLASST and comma-separated T→V relevance thresholds")
     tv_vv.add_argument("--decode-visual-links", action="store_true",
                        help="compare BLASST with decode that selects visual keys using prefill T→V links")
+    tv_vv.add_argument("--binary-tv-pipeline", action="store_true",
+                       help="compare BLASST, binary T→T-guided T→V, and the full T→V-guided V→V pipeline")
     parser.add_argument("--vqa-accuracy", action="store_true",
                         help="use short-answer generation and the official VQA score in a VQA v2 sweep")
     parser.add_argument("--matched-region-study", action="store_true",
@@ -309,14 +312,15 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int,
                         help="number of manifest cases to test, before splitting into shards")
     args = parser.parse_args()
-    if args.decode_visual_links:
+    if args.decode_visual_links or args.binary_tv_pipeline:
+        flag = "--binary-tv-pipeline" if args.binary_tv_pipeline else "--decode-visual-links"
         if not args.manifest or args.demo or args.decode_tokens < 2:
-            parser.error("--decode-visual-links requires a VQA v2 manifest and at least two generated tokens")
+            parser.error(f"{flag} requires a VQA v2 manifest and at least two generated tokens")
         if (args.matched_region_study or args.gate_distribution or args.prefill_region_max
                 or args.decode_region_max or args.vv_prefix_attention or args.jl_dim is not None
                 or args.jl_sweep or args.jl_region_audit or args.tile_layer_study
                 or args.score_distributions or args.score_data or args.raw_dir):
-            parser.error("--decode-visual-links compares against causal BLASST with shared running maxima")
+            parser.error(f"{flag} compares against causal BLASST with shared running maxima")
         args.vqa_accuracy = True
     has_top_k = args.tv_vv_token_percent is not None or args.tv_vv_top_percent is not None
     args.tv_vv_top_accuracy = (args.vqa_accuracy and has_top_k
@@ -343,7 +347,7 @@ def main() -> None:
     ):
         parser.error("The live region-max switches cannot be used with audits that compute their own running max")
     if args.vqa_accuracy and not (args.manifest and (args.tv_vv_sweep is not None or args.tv_vv_top_accuracy
-                                                    or args.decode_visual_links
+                                                    or args.decode_visual_links or args.binary_tv_pipeline
                                                     or args.matched_region_study or args.gate_distribution)):
         parser.error("--vqa-accuracy requires a VQA v2 manifest and a paired study")
     args.vqa_shard = None
@@ -414,7 +418,7 @@ def main() -> None:
     paired_audit = (
         args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions
         or args.tv_vv_sweep or args.tv_vv_top_accuracy or args.matched_region_study or args.gate_distribution
-        or args.decode_visual_links
+        or args.decode_visual_links or args.binary_tv_pipeline
     )
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
@@ -503,7 +507,7 @@ def main() -> None:
                 run(args, parser, samples, collect, _select_sample, ba.STATE, ba.TILE)
         except (ValueError, KeyError, OSError) as error:
             parser.error(str(error))
-    elif args.tv_vv_sweep or args.tv_vv_top_accuracy or args.decode_visual_links:
+    elif args.tv_vv_sweep or args.tv_vv_top_accuracy or args.decode_visual_links or args.binary_tv_pipeline:
         _collect_tv_vv_sweep(args, parser, samples if args.manifest else [None] * args.sample_count)
     elif args.score_distributions:
         _collect_score_distributions(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
@@ -573,8 +577,11 @@ def _run_tv_vv_sweep(args, parser, samples):
     token_percent = getattr(args, "tv_vv_token_percent", None)
     has_top_k = top_percent is not None or token_percent is not None
     decode_links = getattr(args, "decode_visual_links", False)
+    binary = getattr(args, "binary_tv_pipeline", False)
     variants = [("baseline", None)]
-    if decode_links:
+    if binary:
+        variants.extend((("binary_tv", "tv"), ("binary_tv_vv", "tv_vv")))
+    elif decode_links:
         variants.append(("decode_links", True))
     elif token_percent is not None:
         variants.append((f"top_token_{token_percent:g}", token_percent))
@@ -591,7 +598,11 @@ def _run_tv_vv_sweep(args, parser, samples):
         report[f"{phase}_max_policies"] = {
             name: "shared" if threshold is None else "per_region" for name, threshold in variants
         }
-    if decode_links:
+    if binary:
+        report["binary_tv_pipeline"] = True
+        report["variant_labels"] = {"baseline": "Original BLASST", "binary_tv": "T→T-guided T→V",
+                                    "binary_tv_vv": "T→T-guided T→V + T→V-guided V→V"}
+    elif decode_links:
         report["decode_visual_link_study"] = True
         report["variant_labels"] = {"baseline": "Original BLASST", "decode_links": "Decode with prefill T→V links"}
     elif has_top_k:
@@ -601,7 +612,7 @@ def _run_tv_vv_sweep(args, parser, samples):
             report["token_top_k"] = True
         for phase in ("prefill", "decode"):
             report[f"{phase}_max_policies"] = dict.fromkeys(dict(variants), "shared")
-    measured_phases = ("prefill", "decode") if has_top_k or decode_links else region_phases
+    measured_phases = ("prefill", "decode") if has_top_k or decode_links or binary else region_phases
     if args.vqa_accuracy:
         report["answer_metric"] = "VQA v2 consensus"
         report["answer_protocol"] = dict(instruction=SHORT_ANSWER_INSTRUCTION,
@@ -628,12 +639,13 @@ def _run_tv_vv_sweep(args, parser, samples):
                 case.update(question=benchmark["question_text"], reference_answers=references)
         for name, value in variants:
             # An ungated vote trace provides the baseline's causal V→V denominator.
-            threshold = value if not has_top_k and not decode_links else None
+            threshold = value if not (has_top_k or decode_links or binary) else None
             run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold,
                                             tv_vv_top_percent=value if top_percent is not None else None,
                                             tv_vv_token_percent=value if token_percent is not None else None,
                                             decode_visual_links=decode_links and name != "baseline",
-                                            decode_visual_link_study=decode_links))
+                                            decode_visual_link_study=decode_links,
+                                            binary_tv_mode=value if binary else None))
             for phase in region_phases:
                 setattr(run, f"{phase}_region_max", threshold is not None)
             if sample:
@@ -642,7 +654,12 @@ def _run_tv_vv_sweep(args, parser, samples):
                 run.question = f"{benchmark['question_text']}\n{SHORT_ANSWER_INSTRUCTION}"
             before = {phase: ba.STATE["phase_stats"].get(phase, {}).copy() for phase in measured_phases}
             metadata = collect(run, parser, benchmark, sample_id)
-            trace = metadata.get("decode_visual_links", {}) if decode_links else metadata["tv_guided_vv"]
+            if binary:
+                trace = metadata.get("binary_tv_pipeline", {})
+            elif decode_links:
+                trace = metadata.get("decode_visual_links", {})
+            else:
+                trace = metadata["tv_guided_vv"]
             answer = metadata.get("answer")
             normalized = _normalized_answer(answer) if answer is not None else None
             result = dict(answer=answer, **trace)
@@ -682,7 +699,7 @@ def _run_tv_vv_sweep(args, parser, samples):
         if not shard or done % vqa_shards.CHECKPOINT_INTERVAL == 0 or done == len(samples):
             report["summary"] = vqa_shards.summarize(totals) if args.vqa_accuracy else totals
             write_json(args.output, report)
-            policy = "decode visual links" if decode_links else "T→V-guided V→V"
+            policy = "binary pipeline" if binary else "decode visual links" if decode_links else "T→V-guided V→V"
             print(f"Compared {policy} for {done}/{len(samples)} cases", flush=True)
     print(f"Wrote paired attention report to {args.output}")
     if args.vqa_accuracy:
@@ -791,6 +808,7 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
     old_prefix = ba.STATE["vv_prefix_visual"]
     old_tv_vv = ba.STATE["tv_guided_vv"]
     old_links = ba.STATE["decode_visual_links"]
+    old_binary = ba.STATE["binary_tv_pipeline"]
     old_regions = ba.STATE["prefill_region_max"], ba.STATE["decode_region_max"]
     precision = torch.get_float32_matmul_precision()
     try:
@@ -802,12 +820,19 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
         ba.STATE["vv_prefix_visual"] = old_prefix
         ba.STATE["tv_guided_vv"] = old_tv_vv
         ba.STATE["decode_visual_links"] = old_links
+        ba.STATE["binary_tv_pipeline"] = old_binary
         ba.STATE["prefill_region_max"], ba.STATE["decode_region_max"] = old_regions
         if args.jl_probe is not None or args.jl_sweep:
             torch.set_float32_matmul_precision(precision)
 
 
 def _attach_study(args, recorder):
+    if getattr(args, "binary_tv_pipeline", False):
+        if args.binary_tv_mode is not None:
+            ba.STATE["binary_tv_pipeline"] = BinaryTVPipeline(recorder.visual, ba.TILE,
+                                                               gate_vv=args.binary_tv_mode == "tv_vv")
+        ba.STATE["observer"] = ba.STATE["qkv_hook"] = None
+        return None
     if getattr(args, "decode_visual_link_study", False):
         if args.decode_visual_links:
             ba.STATE["decode_visual_links"] = DecodeVisualLinks(recorder.visual, ba.TILE)
@@ -887,6 +912,7 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
     ba.STATE["vv_prefix_visual"] = None
     ba.STATE["tv_guided_vv"] = None
     ba.STATE["decode_visual_links"] = None
+    ba.STATE["binary_tv_pipeline"] = None
     ba.STATE["prefill_region_max"] = ba.STATE["decode_region_max"] = None
     if args.demo:
         sweep = args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions or args.tv_vv_sweep
@@ -964,6 +990,10 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
     if args.score_distributions:
+        return metadata
+    if getattr(args, "binary_tv_pipeline", False):
+        if (binary := ba.STATE["binary_tv_pipeline"]) is not None:
+            metadata["binary_tv_pipeline"] = dict(binary.counts)
         return metadata
     if getattr(args, "decode_visual_link_study", False):
         if (links := ba.STATE["decode_visual_links"]) is not None:
