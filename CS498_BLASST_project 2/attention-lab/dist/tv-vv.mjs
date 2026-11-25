@@ -63,7 +63,8 @@ export function setupTVVVSweep(showView) {
     const rouge = data.answer_metric === 'ROUGE-L F1';
     const decodeLinks = data.decode_visual_link_study;
     const binary = data.binary_tv_pipeline;
-    $('bypass-header').textContent = binary ? 'QK token pairs bypassed' : decodeLinks ? 'Decode visual QK tiles bypassed' :
+    const queryStudy = data.prefill_visual_query_study;
+    $('bypass-header').textContent = binary || queryStudy ? 'QK token pairs bypassed' : decodeLinks ? 'Decode visual QK tiles bypassed' :
       data.token_top_k ? 'V→V QK token pairs bypassed' : 'Pure V→V QK tiles bypassed';
     const budgets = data.budget_calibration;
     $('budget-note').hidden = !budgets;
@@ -101,7 +102,9 @@ export function setupTVVVSweep(showView) {
         ` (${difference >= 0 ? '+' : ''}${difference.toFixed(1)} ${rouge ? 'pts' : 'pp'})`;
       const accuracy = rouge ? `${result.rouge_l.toFixed(1)}/100${delta}` : official ? `${result.vqa_accuracy.toFixed(1)}%${delta}` :
         fraction(result.reference_exact_matches ?? 0, result.answers_scored);
-      const bypassed = binary && result.prefill_tv_qk_pairs != null
+      const bypassed = queryStudy
+        ? ['vv', 'vt'].map(region => `${region === 'vv' ? 'V→V' : 'V→T'} ${fraction(result[`${region}_pairs_bypassed`], result[`${region}_pairs`])}`).join(' · ')
+        : binary && result.prefill_tv_qk_pairs != null
         ? ['prefill T→V', 'prefill V→V', 'decode T→V'].map((label, index) => {
           const key = ['prefill_tv', 'prefill_vv', 'decode_tv'][index];
           return `${label} ${fraction(result[`${key}_qk_pairs_bypassed`], result[`${key}_qk_pairs`])}`;

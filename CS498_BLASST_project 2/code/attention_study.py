@@ -24,7 +24,7 @@ from jl_gap_study import JLGapStudy, merge_sweeps
 from jl_region_study import JLRegionStudy, merge_region_audits
 from tile_layer_study import LayerReport, TileLayerRecorder
 from tile_calibration import add_threshold_arguments, selected_calibration, write_json
-from tv_guided_vv import SWEEP_SCHEMA as TV_VV_SCHEMA, TOKEN_GATE_COUNTS, TVGuidedVV
+from tv_guided_vv import SWEEP_SCHEMA as TV_VV_SCHEMA, TOKEN_GATE_COUNTS, VISUAL_QUERY_COUNTS, TVGuidedVV
 from region_max import RegionMax
 import vqa_shards
 
@@ -258,6 +258,8 @@ def main() -> None:
                        help="select the top percentage of individual visual query tokens")
     tv_vv.add_argument("--tv-vv-top-tile-percent", dest="tv_vv_top_percent", type=float, metavar="PERCENT",
                        help="select the top percentage of visual query tiles by previous-layer T→V votes")
+    tv_vv.add_argument("--prefill-visual-query-study", action="store_true",
+                       help="compare BLASST, V→V bypass, and whole visual query bypass with the same mask")
     tv_vv.add_argument("--tv-vv-sweep", metavar="FRACTIONS",
                        help="compare standard BLASST and comma-separated T→V relevance thresholds")
     tv_vv.add_argument("--decode-visual-links", action="store_true",
@@ -325,14 +327,18 @@ def main() -> None:
         args.vqa_accuracy = True
     binary_study = args.binary_tv_pipeline or args.binary_tv_phase_study
     decode_link_study = args.decode_visual_links or args.decode_visual_history_study
-    if decode_link_study or binary_study:
+    query_study = args.prefill_visual_query_study
+    if decode_link_study or binary_study or query_study:
         flag = "--decode-visual-links"
         if args.decode_visual_history_study:
             flag = "--decode-visual-history-study"
         if binary_study:
             flag = "--binary-tv-phase-study" if args.binary_tv_phase_study else "--binary-tv-pipeline"
-        if not args.manifest or args.demo or args.decode_tokens < 2:
-            parser.error(f"{flag} requires a benchmark manifest and at least two generated tokens")
+        if query_study:
+            flag = "--prefill-visual-query-study"
+        minimum = 1 if query_study else 2
+        if not args.manifest or args.demo or args.decode_tokens < minimum:
+            parser.error(f"{flag} requires a benchmark manifest and --decode-tokens of at least {minimum}")
         if (args.matched_region_study or args.gate_distribution or args.prefill_region_max
                 or args.decode_region_max or args.vv_prefix_attention or args.jl_dim is not None
                 or args.jl_sweep or args.jl_region_audit or args.tile_layer_study
@@ -364,7 +370,7 @@ def main() -> None:
     ):
         parser.error("The live region-max switches cannot be used with audits that compute their own running max")
     if args.vqa_accuracy and not (args.manifest and (args.tv_vv_sweep is not None or args.tv_vv_top_accuracy
-                                                    or decode_link_study or binary_study
+                                                    or decode_link_study or binary_study or query_study
                                                     or args.matched_region_study or args.gate_distribution)):
         parser.error("Answer scoring requires a compatible benchmark manifest and a paired study")
     args.vqa_shard = None
@@ -435,7 +441,7 @@ def main() -> None:
     paired_audit = (
         args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions
         or args.tv_vv_sweep or args.tv_vv_top_accuracy or args.matched_region_study or args.gate_distribution
-        or decode_link_study or binary_study
+        or decode_link_study or binary_study or query_study
     )
     if args.sample_count < 1:
         parser.error("--sample-count must be positive")
@@ -529,7 +535,7 @@ def main() -> None:
                 run(args, parser, samples, collect, _select_sample, ba.STATE, ba.TILE)
         except (ValueError, KeyError, OSError) as error:
             parser.error(str(error))
-    elif args.tv_vv_sweep or args.tv_vv_top_accuracy or decode_link_study or binary_study:
+    elif args.tv_vv_sweep or args.tv_vv_top_accuracy or decode_link_study or binary_study or query_study:
         _collect_tv_vv_sweep(args, parser, samples if args.manifest else [None] * args.sample_count)
     elif args.score_distributions:
         _collect_score_distributions(args, parser, samples if args.manifest else [None] * args.sample_count, calibration)
@@ -603,8 +609,11 @@ def _run_tv_vv_sweep(args, parser, samples):
     decode_links = getattr(args, "decode_visual_links", False) or extend_decode_links
     phase_study = getattr(args, "binary_tv_phase_study", False)
     binary = getattr(args, "binary_tv_pipeline", False) or phase_study
+    query_study = getattr(args, "prefill_visual_query_study", False)
     variants = [("baseline", None)]
-    if phase_study:
+    if query_study:
+        variants.extend((("visual_vv_only", "vv"), ("whole_visual_query", "whole")))
+    elif phase_study:
         variants.extend((("binary_tv_prefill", "prefill"), ("binary_tv_decode", "decode")))
     elif binary:
         variants.extend((("binary_tv", "tv"), ("binary_tv_vv", "tv_vv")))
@@ -627,7 +636,11 @@ def _run_tv_vv_sweep(args, parser, samples):
         report[f"{phase}_max_policies"] = {
             name: "shared" if threshold is None else "per_region" for name, threshold in variants
         }
-    if phase_study:
+    if query_study:
+        report["prefill_visual_query_study"] = True
+        report["variant_labels"] = {"baseline": "Original BLASST", "visual_vv_only": "Bypass V→V only",
+                                    "whole_visual_query": "Bypass whole visual query"}
+    elif phase_study:
         report["binary_tv_pipeline"] = True
         report["variant_labels"] = {"baseline": "Original BLASST", "binary_tv_prefill": "T→T-guided T→V in prefill",
                                     "binary_tv_decode": "T→T-guided T→V in decode"}
@@ -648,7 +661,7 @@ def _run_tv_vv_sweep(args, parser, samples):
             report["token_top_k"] = True
         for phase in ("prefill", "decode"):
             report[f"{phase}_max_policies"] = dict.fromkeys(dict(variants), "shared")
-    measured_phases = ("prefill", "decode") if has_top_k or decode_links or binary else region_phases
+    measured_phases = ("prefill", "decode") if has_top_k or decode_links or binary or query_study else region_phases
     if args.vqa_accuracy:
         report["answer_metric"] = protocol.metric
         if protocol is not VQAV2:
@@ -675,15 +688,18 @@ def _run_tv_vv_sweep(args, parser, samples):
             case["question_id"] = benchmark["question_id"]
             if not shard:
                 case.update(question=benchmark["question_text"], reference_answers=references)
+        query_gate = None
         for name, value in variants:
             # An ungated vote trace provides the baseline's causal V→V denominator.
-            threshold = value if not (has_top_k or decode_links or binary) else None
+            threshold = value if not (has_top_k or decode_links or binary or query_study) else None
             run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold,
                                             tv_vv_top_percent=value if top_percent is not None else None,
                                             tv_vv_token_percent=value if token_percent is not None else None,
                                             decode_visual_links=decode_links and name != "baseline",
                                             decode_visual_link_study=decode_links,
                                             extend_decode_links=name == "decode_links_growing",
+                                            token_gate=value if query_study else None,
+                                            gate_replay=query_gate if name == "whole_visual_query" else None,
                                             binary_tv_pipeline=binary,
                                             binary_tv_mode=value if binary else None))
             for phase in region_phases:
@@ -700,6 +716,13 @@ def _run_tv_vv_sweep(args, parser, samples):
                 trace = metadata.get("decode_visual_links", {})
             else:
                 trace = metadata["tv_guided_vv"]
+            if query_study and value is not None:
+                observed_gate = {layer["layer"]: layer["dropped_token_positions"] for layer in trace["layers"]}
+                if value == "vv":
+                    query_gate = observed_gate
+                elif observed_gate != query_gate:
+                    raise ValueError("The whole-query gate differs from the recorded V→V-only mask")
+                trace = {key: item for key, item in trace.items() if key != "layers"}
             answer = metadata.get("answer")
             normalized = _normalized_answer(answer) if answer is not None else None
             result = dict(answer=answer, **trace)
@@ -709,7 +732,7 @@ def _run_tv_vv_sweep(args, parser, samples):
                 after = ba.STATE["phase_stats"].get(phase, {})
                 result[f"{phase}_tiles"] = after.get("causal", 0) - before[phase].get("causal", 0)
                 result[f"{phase}_tiles_skipped"] = after.get("skipped", 0) - before[phase].get("skipped", 0)
-                if phase == "prefill" and has_top_k:
+                if phase == "prefill" and (has_top_k or query_study):
                     result["prefill_qk_bypassed"] = after.get("qk_bypassed", 0) - before[phase].get("qk_bypassed", 0)
             if args.vqa_accuracy:
                 result[protocol.case_score] = protocol.score(answer, references)
@@ -742,6 +765,8 @@ def _run_tv_vv_sweep(args, parser, samples):
             report["summary"] = vqa_shards.summarize(totals, protocol=protocol) if args.vqa_accuracy else totals
             write_json(args.output, report)
             policy = "binary pipeline" if binary else "decode visual links" if decode_links else "T→V-guided V→V"
+            if query_study:
+                policy = "visual-query gates"
             print(f"Compared {policy} for {done}/{len(samples)} cases", flush=True)
     print(f"Wrote paired attention report to {args.output}")
     if args.vqa_accuracy:
@@ -889,12 +914,13 @@ def _attach_study(args, recorder):
         ba.STATE["decode_region_max"] = regions if args.decode_region_max else None
     top_percent = getattr(args, "tv_vv_top_percent", None)
     token_percent = getattr(args, "tv_vv_token_percent", None)
-    paired = args.tv_vv_sweep or getattr(args, "tv_vv_top_accuracy", False)
+    paired = (args.tv_vv_sweep or getattr(args, "tv_vv_top_accuracy", False)
+              or getattr(args, "prefill_visual_query_study", False))
     if (args.tv_vv_threshold is not None or top_percent is not None or token_percent is not None or paired
             or args.matched_region_study or args.gate_distribution):
         ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold,
                                             replay=getattr(args, "gate_replay", None), top_percent=top_percent,
-                                            token_percent=token_percent)
+                                            token_percent=token_percent, token_gate=getattr(args, "token_gate", None))
         ba.STATE["qkv_hook"] = None
         if paired or args.matched_region_study or args.gate_distribution:
             ba.STATE["observer"] = None
@@ -1057,11 +1083,14 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
             metadata["tv_guided_vv"]["top_percent"] = policy.top_percent
         if policy.token_percent is not None:
             metadata["tv_guided_vv"]["top_token_percent"] = policy.token_percent
+        if policy.token_percent is not None or policy.token_gate is not None:
+            counts = (*TOKEN_GATE_COUNTS, *VISUAL_QUERY_COUNTS) if policy.token_gate else TOKEN_GATE_COUNTS
             metadata["tv_guided_vv"].update({key: sum(layer[key] for layer in policy.layers)
-                                              for key in TOKEN_GATE_COUNTS})
+                                              for key in counts})
         if args.gate_distribution:
             metadata["gate_distribution"] = policy.distribution()
         if (args.tv_vv_sweep or getattr(args, "tv_vv_top_accuracy", False)
+                or getattr(args, "prefill_visual_query_study", False)
                 or args.matched_region_study or args.gate_distribution):
             return metadata
     if args.vv_prefix_attention:

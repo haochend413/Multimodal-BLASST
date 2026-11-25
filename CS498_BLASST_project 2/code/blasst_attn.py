@@ -185,17 +185,19 @@ def mask_chunk(mask, start, end, query_len, key_len):
     return mask if mask.shape[-2] == 1 else mask[..., start:end, :]
 
 
-def token_gated_scores(query, key, dropped, visual_keys, scaling):
-    """Compute every key for ordinary rows and only text keys for dropped visual rows."""
+def token_gated_scores(query, key, dropped, visual_keys, scaling, *, skip_whole_query=False):
+    """Compute QK only on the query and key subsets admitted by the gate."""
     scores = query.new_full((*query.shape[:-1], key.shape[-2]), NEG_INF)
     kept_rows = (~dropped).nonzero().flatten()
-    dropped_rows = dropped.nonzero().flatten()
-    text_columns = (~visual_keys).nonzero().flatten()
-    scores[..., kept_rows, :] = query[..., kept_rows, :] @ key.transpose(-1, -2) * scaling
-    scores[..., dropped_rows[:, None], text_columns] = (
-        query[..., dropped_rows, :] @ key[..., text_columns, :].transpose(-1, -2) * scaling
-    )
-    return scores
+    if kept_rows.numel():
+        scores[..., kept_rows, :] = query[..., kept_rows, :] @ key.transpose(-1, -2) * scaling
+    if not skip_whole_query:
+        dropped_rows = dropped.nonzero().flatten()
+        text_columns = (~visual_keys).nonzero().flatten()
+        scores[..., dropped_rows[:, None], text_columns] = (
+            query[..., dropped_rows, :] @ key[..., text_columns, :].transpose(-1, -2) * scaling
+        )
+    return scores, kept_rows
 
 
 # ----------------------------------------------------------------------------- the kernel
@@ -325,6 +327,7 @@ def blasst_attention_forward(
         mask = mask_chunk(attention_mask, r0, r1, Sq, Skv)
         token_drops = tv_layer.token_drops[r0:r1] if tv_layer is not None and tv_layer.token_drops is not None else None
         token_bypass = token_drops is not None and bool(token_drops.any())
+        skip_whole_query = token_bypass and policy.token_gate == "whole"
         bypass = tv_layer.bypass_keys(query_tile) if tv_layer is not None else []
         if bypass:
             omitted = set(bypass)
@@ -342,7 +345,8 @@ def blasst_attention_forward(
             else:
                 tv_layer.bypassed[query_tile] = len(bypass)
         if token_bypass:
-            s = token_gated_scores(q32, key32, token_drops.to(query.device), policy.visual.to(query.device), scaling)
+            s, kept_rows = token_gated_scores(q32, key32, token_drops.to(query.device),
+                                             policy.visual.to(query.device), scaling, skip_whole_query=skip_whole_query)
             if mask is not None and mask.dtype != torch.bool:
                 s = s.masked_fill(mask <= torch.finfo(mask.dtype).min, NEG_INF)
             s_t = score_tiles(s, allowed, mask)
@@ -359,12 +363,13 @@ def blasst_attention_forward(
         skip = margin < ln_lam                                              # all rows far below running max
         fully_bypassed = bypass
         if token_bypass and bool(token_drops.all()):
-            fully_bypassed = [tile for tile in policy.pure_visual if tile <= query_tile]
+            fully_bypassed = (list(range(query_tile + 1)) if skip_whole_query
+                              else [tile for tile in policy.pure_visual if tile <= query_tile])
             skip[..., fully_bypassed] = True
         if tv_layer is not None:
             if token_drops is None:
                 tv_layer.observe_text(query_tile, row_margins, ln_lam)
-            else:
+            elif policy.replay is None or policy.token_gate is None:
                 tv_layer.observe_tokens(r0, s_t, ln_lam, mask)
             if bypass:
                 skip[..., bypass] = True
@@ -403,7 +408,14 @@ def blasst_attention_forward(
                 rec.append(margin.detach().float().cpu())
 
         s_t = s_t.masked_fill(skip[:, :, None, :, None], NEG_INF)
-        p = torch.softmax(s_t.view(B, Hq, r1 - r0, n_kt * TILE)[..., :Skv], dim=-1)
+        scores = s_t.flatten(-2)[..., :Skv]
+        if skip_whole_query:
+            out[:, :, r0:r1] = 0
+            if kept_rows.numel():
+                p = torch.softmax(scores[:, :, kept_rows], dim=-1).nan_to_num()
+                out[:, :, r0 + kept_rows] = torch.matmul(p.to(value.dtype), value)
+            continue
+        p = torch.softmax(scores, dim=-1)
         if token_bypass:
             p = p.nan_to_num()
         out[:, :, r0:r1] = torch.matmul(p.to(value.dtype), value)

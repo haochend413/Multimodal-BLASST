@@ -137,6 +137,43 @@ def test_top_token_percent_gates_individual_rows_even_in_mixed_tiles(monkeypatch
     assert chunks[1, 128][..., 1, 1:129].isfinite().all()
 
 
+def test_whole_visual_query_replays_vv_mask_and_keeps_visual_keys_readable(monkeypatch):
+    monkeypatch.setattr(ba, "TILE", 2)
+    monkeypatch.setitem(ba.STATE, "collect_stats", True)
+    monkeypatch.setitem(ba.STATE, "stats", {})
+    monkeypatch.setitem(ba.STATE, "phase_stats", {})
+    monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.1))
+    visual = torch.tensor([False, True, True, False, True, True])
+    q = torch.ones(1, 1, 6, 1)
+    k = torch.tensor([1., 8., 0., 1., 0., 0.]).view_as(q)
+    v = torch.tensor([10., 20., 30., 40., 50., 60.]).view_as(q)
+    vv = TVGuidedVV(visual, 2, None, token_gate="vv")
+    monkeypatch.setitem(ba.STATE, "tv_guided_vv", vv)
+    for layer in range(2):
+        vv_out, _ = ba.blasst_attention_forward(SimpleNamespace(layer_idx=layer), q, k, v, None)
+
+    replay = {layer["layer"]: layer["dropped_token_positions"] for layer in vv.layers}
+    assert replay == {0: [], 1: [2, 4, 5]}
+    before = ba.STATE["phase_stats"]["prefill"].get("qk_bypassed", 0)
+    whole = TVGuidedVV(visual, 2, None, token_gate="whole", replay=replay)
+    monkeypatch.setitem(ba.STATE, "tv_guided_vv", whole)
+    recorded = {}
+    monkeypatch.setitem(ba.STATE, "observer",
+                        lambda layer, q_start, scores, **_: recorded.update({(layer, q_start): scores}))
+    for layer in range(2):
+        whole_out, _ = ba.blasst_attention_forward(SimpleNamespace(layer_idx=layer), q, k, v, None)
+    assert whole.layers[1]["dropped_token_positions"] == replay[1]
+    assert whole.layers[1]["vv_pairs_bypassed"] == vv.layers[1]["vv_pairs_bypassed"] == 9
+    assert whole.layers[1]["vt_pairs_bypassed"] == 5
+    assert vv.layers[1]["vt_pairs_bypassed"] == 0
+    assert ba.STATE["phase_stats"]["prefill"]["qk_bypassed"] - before == 3
+    assert vv_out[:, replay[1]].ne(0).all()
+    assert whole_out[:, replay[1]].eq(0).all()
+    assert recorded[1, 2][..., 0, :].isneginf().all()
+    assert recorded[1, 2][..., 1, 2].isfinite().all()
+    assert whole_out.isfinite().all()
+
+
 def test_counting_votes_leaves_the_baseline_unchanged(monkeypatch):
     monkeypatch.setattr(ba, "TILE", 2)
     monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.5))

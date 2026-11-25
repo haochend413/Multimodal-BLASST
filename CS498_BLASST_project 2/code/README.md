@@ -271,6 +271,29 @@ Use the same benchmark selector with `--tv-vv-top-percent`,
 experiments. Select `--benchmark vqav2` with a VQA v2 manifest for the
 short-answer consensus scoring protocol.
 
+#### Prefill V→V gate versus a whole visual-query gate
+
+```bash
+python code/attention_study.py \
+  --benchmark vqav2 --manifest "$HOME/blasst-results/vqav2-random-val-1000-seed20261124.json" \
+  --sample-count 1000 --decode-tokens 16 --lambda 0.1 --decode-lambda 0.1 \
+  --prefill-visual-query-study \
+  --output "$HOME/blasst-results/vqav2-random1000-visual-query-gates.json"
+```
+
+The run compares original BLASST, V→V-only bypass, and whole visual-query
+bypass. Layer 0 warms up with BLASST. For later prefill layers, any text query
+and head that passes the T→V score test votes to keep that visual token's
+query. The V→V-only branch records the per-layer masks, and the whole-query
+branch replays exactly those masks. With whole-query bypass, each dropped
+row skips QK, softmax and PV and contributes zero to the attention update.
+Visual keys and values remain available to other queries. Decode uses
+ordinary BLASST in all three runs.
+
+The report counts causal V→V and V→T pairs bypassed separately and reports
+the whole-query score difference from the V→V-only branch. Use a
+`--sample-count` such as 100 for a shorter paired run.
+
 #### Decode with prefill text-to-vision links
 
 ```bash

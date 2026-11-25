@@ -11,12 +11,13 @@ from answer_benchmarks import ANSWER_BENCHMARKS, VQAV2
 from binary_tv_pipeline import BINARY_TV_COUNTS
 from decode_visual_links import DECODE_HISTORY_COUNTS, DECODE_LINK_COUNTS
 from tile_calibration import write_json
-from tv_guided_vv import TOKEN_GATE_COUNTS
+from tv_guided_vv import TOKEN_GATE_COUNTS, VISUAL_QUERY_COUNTS
 
 CHECKPOINT_INTERVAL = 25
 MAX_POLICIES = ("prefill_max_policies", "decode_max_policies")
 TILE_COUNTS = ("prefill_tiles", "prefill_tiles_skipped", "decode_tiles", "decode_tiles_skipped",
-               "prefill_qk_bypassed", *DECODE_LINK_COUNTS, *DECODE_HISTORY_COUNTS, *TOKEN_GATE_COUNTS, *BINARY_TV_COUNTS)
+               "prefill_qk_bypassed", *DECODE_LINK_COUNTS, *DECODE_HISTORY_COUNTS, *TOKEN_GATE_COUNTS,
+               *VISUAL_QUERY_COUNTS, *BINARY_TV_COUNTS)
 CASE_FIELDS = ("answer", "vqa_score", "rouge_l", "generated_tokens", "pure_vv_tiles", "vv_tiles_bypassed",
                "answer_changed", *TILE_COUNTS)
 PROTOCOLS_BY_METRIC = {protocol.metric: protocol for protocol in ANSWER_BENCHMARKS.values()}
@@ -98,6 +99,11 @@ def summarize(totals, *, reference="baseline", protocol=VQAV2):
             summary[name]["mean_decode_steps"] = totals_for_variant["decode_steps"] / observed
         if name != reference:
             summary[name][f"{protocol.prefix}_delta_pp"] = score - baseline
+    if "whole_visual_query" in summary and "visual_vv_only" in summary:
+        full = summary["whole_visual_query"]
+        full[f"{protocol.prefix}_delta_vs_vv_only_pp"] = (
+            full[protocol.summary_score] - summary["visual_vv_only"][protocol.summary_score]
+        )
     return summary
 
 
@@ -120,7 +126,8 @@ def merge(paths, output):
         if not shard:
             raise ValueError(f"{path} is not a VQA shard report")
         expected_config = {key: report[key] for key in config_keys}
-        for key in (*MAX_POLICIES, "benchmark", "variant_labels", "decode_visual_link_study", "token_top_k", "binary_tv_pipeline"):
+        for key in (*MAX_POLICIES, "benchmark", "variant_labels", "decode_visual_link_study", "token_top_k",
+                    "binary_tv_pipeline", "prefill_visual_query_study"):
             if key in report:
                 expected_config[key] = report[key]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}
