@@ -462,6 +462,33 @@ produce different QK budgets. The random arms report their score difference
 from the frequency arm at the same rate under `*_delta_vs_guided_pp`.
 Use `--vqa-shards 1 --vqa-shard-index 0` for a restartable single-process run.
 
+To vary prefill λ at a fixed drop rate, pass exactly one percentage to
+`--prefill-vv-drop-sweep`, a list to `--prefill-vv-lambda-sweep`, and a fixed
+`--decode-lambda`:
+
+```bash
+python code/attention_study.py \
+  --manifest "$manifests/vqav2-random-val-1000-seed20261124.json" \
+  --sample-count 100 --decode-tokens 16 --decode-lambda 0.1 \
+  --prefill-vv-drop-sweep 80 --prefill-vv-lambda-sweep 0.025,0.05,0.1,0.2 \
+  --random-seed 20261127 --vqa-shards 1 --vqa-shard-index 0 \
+  --output "$results/vqav2-prefill-vv-drop80-lambda-sweep-seed20261127.json"
+```
+
+Each λ gets a baseline and a guided and random arm on the same questions.
+The random masks are shared across λ values. The output groups summaries by
+prefill λ and lists the individual report files, which serve as checkpoints.
+
+Use `--prefill-vv-drop-highest` to flip the guided ranking in a drop-rate sweep.
+The existing rate and seed controls apply, including the same random masks
+for a given question, layer, rate, and seed.
+
+```bash
+run_binary vqav2 100 16 prefill-vv-drop-highest-screen-seed20261127 \
+  --prefill-vv-drop-sweep 5,10,20,35,50,75,80 --prefill-vv-drop-highest \
+  --random-seed 20261127 --vqa-shards 1 --vqa-shard-index 0
+```
+
 #### Decode T→V visual-key drop sweep
 
 The default sweep covers 5, 10, 20, 25, 35, 50, 60, 75, 80, 90, 95, 99, 99.5,

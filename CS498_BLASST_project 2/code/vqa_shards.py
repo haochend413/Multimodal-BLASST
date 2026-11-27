@@ -151,7 +151,8 @@ def merge(paths, output):
         expected_config = {key: report[key] for key in config_keys}
         for key in (*MAX_POLICIES, "benchmark", "variant_labels", "decode_visual_link_study", "token_top_k",
                     "binary_tv_pipeline", "prefill_visual_query_study", "binary_mask_study",
-                    "binary_tv_prefill_diagnostics", "prefill_vv_drop_sweep", "decode_tv_drop_sweep", "random_seed"):
+                    "binary_tv_prefill_diagnostics", "prefill_vv_drop_sweep", "prefill_vv_drop_order",
+                    "decode_tv_drop_sweep", "random_seed"):
             if key in report:
                 expected_config[key] = report[key]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}

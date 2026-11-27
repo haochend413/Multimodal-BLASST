@@ -265,6 +265,10 @@ def main() -> None:
                        help="compare BLASST, V→V bypass, and whole visual query bypass with the same mask")
     tv_vv.add_argument("--prefill-vv-drop-sweep", nargs="?", const="99.9,99.5,99,95,90,80,60,25",
                        metavar="PERCENTS", help="compare frequency and random V→V query-row drop rates")
+    parser.add_argument("--prefill-vv-lambda-sweep", metavar="LAMBDAS",
+                        help="sweep prefill lambdas at one --prefill-vv-drop-sweep percentage")
+    parser.add_argument("--prefill-vv-drop-highest", action="store_true",
+                        help="drop highest-frequency rows first in the prefill frequency arm")
     tv_vv.add_argument("--decode-tv-drop-sweep", nargs="?", const="5,10,20,25,35,50,60,75,80,90,95,99,99.5,99.9",
                        metavar="PERCENTS", help="compare guided and random decode T→V key drop rates")
     tv_vv.add_argument("--tv-vv-sweep", metavar="FRACTIONS",
@@ -360,6 +364,20 @@ def main() -> None:
         except ValueError:
             parser.error(f"--{option.replace('_', '-')} expects comma-separated drop percentages in (0, 100)")
         setattr(args, option, rates)
+    if args.prefill_vv_drop_highest and not drop_study:
+        parser.error("--prefill-vv-drop-highest requires --prefill-vv-drop-sweep")
+    if args.prefill_vv_lambda_sweep is not None:
+        if not drop_study or len(args.prefill_vv_drop_sweep) != 1:
+            parser.error("--prefill-vv-lambda-sweep requires one --prefill-vv-drop-sweep percentage")
+        if args.lam != 0 or args.decode_lambda is None or not 0 < args.decode_lambda <= 1:
+            parser.error("--prefill-vv-lambda-sweep requires a fixed --decode-lambda in (0, 1] and omits --lambda")
+        try:
+            lambdas = list(dict.fromkeys(float(value) for value in args.prefill_vv_lambda_sweep.split(",")))
+            if not all(0 < value <= 1 for value in lambdas):
+                raise ValueError
+        except ValueError:
+            parser.error("--prefill-vv-lambda-sweep expects comma-separated lambdas in (0, 1]")
+        args.prefill_vv_lambda_sweep = lambdas
     query_study = args.prefill_visual_query_study or args.binary_mask_study or drop_study
     if decode_link_study or binary_study or query_study:
         flag = "--decode-visual-links"
@@ -378,7 +396,8 @@ def main() -> None:
         if decode_drop_study:
             flag = "--decode-tv-drop-sweep"
         minimum = 1 if args.prefill_visual_query_study or drop_study else 2
-        if (args.binary_mask_study or args.binary_tv_prefill_diagnostics or drop_study or decode_drop_study) and (
+        needs_fixed_lambdas = args.binary_mask_study or args.binary_tv_prefill_diagnostics or drop_study or decode_drop_study
+        if needs_fixed_lambdas and not args.prefill_vv_lambda_sweep and (
             not 0 < args.lam <= 1 or not 0 < (args.lam if args.decode_lambda is None else args.decode_lambda) <= 1
         ):
             parser.error(f"{flag} requires positive prefill and decode lambdas in (0, 1]")
@@ -635,14 +654,41 @@ def _normalized_answer(answer):
 
 
 def _collect_tv_vv_sweep(args, parser, samples):
+    if getattr(args, "prefill_vv_lambda_sweep", None):
+        try:
+            with vqa_shards.claim(args.output):
+                _collect_prefill_lambda_sweep(args, parser, samples)
+        except ValueError as error:
+            parser.error(str(error))
+        return
     if getattr(args, "vqa_shard", None):
         try:
             with vqa_shards.claim(args.output):
-                _run_tv_vv_sweep(args, parser, samples)
+                return _run_tv_vv_sweep(args, parser, samples)
         except ValueError as error:
             parser.error(str(error))
-    else:
-        _run_tv_vv_sweep(args, parser, samples)
+    return _run_tv_vv_sweep(args, parser, samples)
+
+
+def _collect_prefill_lambda_sweep(args, parser, samples):
+    report = dict(
+        schema="blasst-prefill-vv-lambda-sweep-v1", benchmark=args.answer_protocol.name, model=args.model,
+        prefill_vv_lambda_sweep=args.prefill_vv_lambda_sweep,
+        prefill_vv_drop_percent=args.prefill_vv_drop_sweep[0],
+        prefill_vv_drop_order="highest" if args.prefill_vv_drop_highest else "lowest",
+        decode_lambda=args.decode_lambda, random_seed=args.random_seed, sample_index=args.sample_index,
+        pairs_requested=len(samples),
+        reports={}, summary={},
+    )
+    for lam in args.prefill_vv_lambda_sweep:
+        output = args.output.with_name(f"{args.output.stem}-lambda{lam}{args.output.suffix}")
+        print(f"Running prefill lambda {lam:g} (decode {args.decode_lambda:g})", flush=True)
+        run = argparse.Namespace(**dict(vars(args), lam=lam, output=output, prefill_vv_lambda_sweep=None))
+        child = _collect_tv_vv_sweep(run, parser, samples)
+        report["reports"][str(lam)] = output.name
+        report["summary"][str(lam)] = child["summary"]
+    write_json(args.output, report)
+    print(f"Wrote prefill lambda sweep summary to {args.output}")
 
 
 def _run_tv_vv_sweep(args, parser, samples):
@@ -661,6 +707,7 @@ def _run_tv_vv_sweep(args, parser, samples):
     matched_random = getattr(args, "matched_random", False)
     query_study = getattr(args, "prefill_visual_query_study", False)
     prefill_drop_rates = getattr(args, "prefill_vv_drop_sweep", None)
+    drop_highest = getattr(args, "prefill_vv_drop_highest", False)
     drop_rates = prefill_drop_rates or decode_drop_rates
     drop_phase = "decode" if decode_drop_rates else "prefill"
     variants = [("baseline", None)]
@@ -706,9 +753,13 @@ def _run_tv_vv_sweep(args, parser, samples):
         report.update(random_seed=args.random_seed, image_max_pixels=args.image_max_pixels,
                       max_prompt_tokens=args.max_tokens)
         report["decode_tv_drop_sweep" if decode_drop_rates else "prefill_vv_drop_sweep"] = drop_rates
+        if drop_highest:
+            report["prefill_vv_drop_order"] = "highest"
         report["variant_labels"] = {"baseline": "Original BLASST"}
         for name, rate in variants[1:]:
             method = "Random" if name.endswith("_random") else "T→V frequency"
+            if drop_highest and not name.endswith("_random"):
+                method = "Highest T→V frequency"
             report["variant_labels"][name] = f"{method} drop {rate:g}%"
     elif mask_study:
         report["binary_mask_study"] = True
@@ -944,8 +995,11 @@ def _run_tv_vv_sweep(args, parser, samples):
                 for name, _ in variants
             }
             vqa_shards.save_predictions(args.output, predictions)
-        for name, result in vqa_shards.summarize(totals, protocol=protocol).items():
+        if "summary" not in report:
+            report["summary"] = vqa_shards.summarize(totals, protocol=protocol)
+        for name, result in report["summary"].items():
             print(f"{name}: {protocol.format_score(result)} on {result['answers_scored']} questions")
+    return report
 
 
 def _collect_layer_study(args, parser, samples, calibration):
@@ -1116,6 +1170,7 @@ def _attach_study(args, recorder):
                                             token_percent=token_percent, token_gate=getattr(args, "token_gate", None),
                                             token_drop_percent=getattr(args, "token_drop_percent", None),
                                             random_drop=getattr(args, "random_drop", False),
+                                            drop_highest=getattr(args, "prefill_vv_drop_highest", False),
                                             drop_seed=f"{getattr(args, 'random_seed', 0)}:{getattr(args, 'sample_index', 0)}")
         ba.STATE["qkv_hook"] = None
         if paired or args.matched_region_study or args.gate_distribution:

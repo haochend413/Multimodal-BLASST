@@ -135,13 +135,60 @@ def test_prefill_drop_sweep_pairs_each_rate_and_scores_baseline(monkeypatch, tmp
     monkeypatch.setattr(study, "_select_sample", lambda *_: None)
     study._run_tv_vv_sweep(args, None, [sample])
     assert seen == [(0, True), (99.9, False), (99.9, True), (25.0, False), (25.0, True)]
-    import json
-
     report = json.loads(args.output.read_text())
     assert report["summary"]["baseline"]["prefill_visual_row_drop_pct"] == 0
     assert report["summary"]["prefill_drop_99.9"]["prefill_visual_row_drop_pct"] == 75
     assert report["summary"]["prefill_drop_99.9_random"]["prefill_vv_qk_bypass_pct"] == 30
     assert report["summary"]["prefill_drop_25_random"]["vqa_delta_vs_guided_pp"] == 0
+
+
+def test_prefill_co_design_cli_sweeps_lambdas_and_supports_highest_drop(monkeypatch, tmp_path):
+    manifest, output = tmp_path / "manifest.json", tmp_path / "sweep.json"
+    sample = {"id": "example", "benchmark": {"name": "VQA v2", "question_id": 1, "question_text": "Question?",
+                                           "reference_answers": ["yes"] * 10}}
+    manifest.write_text(json.dumps({"schema": "blasst-benchmark-manifest-v1", "samples": [sample]}))
+    seen = []
+
+    def collect(run, *_):
+        seen.append((run.lam, run.decode_lambda, run.token_drop_percent,
+                     run.random_drop, run.prefill_vv_drop_highest))
+        return {"answer": "yes", "generated_tokens": 2, "tv_guided_vv": {
+            "vv_pairs": 20, "vv_pairs_bypassed": int(20 * run.token_drop_percent / 100), "layers": [],
+        }}
+
+    monkeypatch.setattr(study, "collect", collect)
+    monkeypatch.setattr(study, "_select_sample", lambda *_: None)
+    monkeypatch.setattr(study.torch.cuda, "is_available", lambda: True)
+    common = [
+        "attention_study.py", "--manifest", str(manifest), "--decode-lambda", "0.1",
+        "--vqa-shards", "1", "--vqa-shard-index", "0",
+    ]
+    monkeypatch.setattr(sys, "argv", common + [
+        "--output", str(output), "--prefill-vv-drop-sweep", "80", "--prefill-vv-lambda-sweep", "0.05,0.2",
+    ])
+    study.main()
+    study.main()  # Completed child checkpoints are reusable by the sweep.
+    assert seen == [(lam, .1, drop, random, False)
+                    for lam in (.05, .2) for drop, random in ((0, True), (80, False), (80, True))]
+    report = json.loads(output.read_text())
+    assert set(report["summary"]) == {"0.05", "0.2"}
+    for lam, filename in report["reports"].items():
+        child = json.loads((tmp_path / filename).read_text())
+        assert child["blasst_lambda"] == float(lam)
+        assert child["summary"] == report["summary"][lam]
+
+    seen.clear()
+    reverse_output = tmp_path / "highest.json"
+    monkeypatch.setattr(sys, "argv", common + [
+        "--output", str(reverse_output), "--lambda", "0.1",
+        "--prefill-vv-drop-sweep", "5,80", "--prefill-vv-drop-highest",
+    ])
+    study.main()
+    assert seen == [(.1, .1, drop, random, True)
+                    for drop, random in ((0, True), (5, False), (5, True), (80, False), (80, True))]
+    highest = json.loads(reverse_output.read_text())
+    assert highest["prefill_vv_drop_order"] == "highest"
+    assert highest["variant_labels"]["prefill_drop_80"] == "Highest T→V frequency drop 80%"
 
 
 def test_decode_drop_sweep_pairs_each_rate_and_reports_realized_budget(monkeypatch, tmp_path):

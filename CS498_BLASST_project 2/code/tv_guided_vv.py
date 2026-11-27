@@ -17,7 +17,7 @@ class TVGuidedVV:
     """Own the votes for one prompt so each layer reads only its predecessor."""
 
     def __init__(self, visual, tile_size, threshold, *, replay=None, top_percent=None, token_percent=None,
-                 token_gate=None, token_drop_percent=None, random_drop=False, drop_seed=""):
+                 token_gate=None, token_drop_percent=None, random_drop=False, drop_seed="", drop_highest=False):
         self.visual = visual.cpu().bool()
         self.tile_size = tile_size
         self.threshold = threshold
@@ -27,6 +27,7 @@ class TVGuidedVV:
         self.token_drop_percent = token_drop_percent
         self.random_drop = random_drop
         self.drop_seed = drop_seed
+        self.drop_highest = drop_highest
         self.visual_prefix = self.visual.cumsum(0)
         self.text_prefix = (~self.visual).cumsum(0)
         self.replay = replay
@@ -118,7 +119,7 @@ class TVLayer:
                     # The same seeded order supplies the random mask and breaks frequency ties.
                     Random(f"{policy.drop_seed}:{layer}").shuffle(positions)
                     if not policy.random_drop:
-                        positions.sort(key=previous["token_relevance"].__getitem__)
+                        positions.sort(key=previous["token_relevance"].__getitem__, reverse=policy.drop_highest)
                     self.token_drops[positions[:count]] = True
             elif previous is not None and policy.token_gate is not None:
                 self.token_drops = policy.visual & ~previous["token_had_vote"]

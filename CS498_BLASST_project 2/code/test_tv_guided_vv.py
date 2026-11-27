@@ -201,9 +201,9 @@ def test_prefill_drop_sweep_matches_query_count_and_ranks_previous_tv(monkeypatc
     k = torch.tensor([1., 8., 0., 1., 8., 0., 1.]).view_as(q)
     for percent, count in ((50, 2), (99.9, 3)):
         random_masks = []
-        for random_drop in (False, True, True):
+        for random_drop, drop_highest in ((False, False), (False, True), (True, False), (True, True)):
             policy = TVGuidedVV(visual, 2, None, token_gate="vv", token_drop_percent=percent,
-                               random_drop=random_drop, drop_seed="fixture")
+                               random_drop=random_drop, drop_seed="fixture", drop_highest=drop_highest)
             monkeypatch.setitem(ba.STATE, "tv_guided_vv", policy)
             for layer in range(2):
                 out, _ = ba.blasst_attention_forward(SimpleNamespace(layer_idx=layer), q, k, q, None, scaling=1.)
@@ -220,5 +220,5 @@ def test_prefill_drop_sweep_matches_query_count_and_ranks_previous_tv(monkeypatc
             if random_drop:
                 random_masks.append(dropped)
             else:
-                assert {2, 5} <= set(dropped)
+                assert ({1, 4} if drop_highest else {2, 5}) <= set(dropped)
         assert random_masks[0] == random_masks[1]
