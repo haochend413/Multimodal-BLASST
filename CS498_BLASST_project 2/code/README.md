@@ -462,6 +462,34 @@ produce different QK budgets. The random arms report their score difference
 from the frequency arm at the same rate under `*_delta_vs_guided_pp`.
 Use `--vqa-shards 1 --vqa-shard-index 0` for a restartable single-process run.
 
+#### Decode T→V visual-key drop sweep
+
+The default sweep covers 5, 10, 20, 25, 35, 50, 60, 75, 80, 90, 95, 99, 99.5,
+and 99.9 percent. Run the baseline and both arms at each rate on the same
+100 questions:
+
+```bash
+run_binary vqav2 100 16 decode-tv-drop-screen-5-to-99.9-seed20261127 \
+  --decode-tv-drop-sweep --random-seed 20261127 \
+  --vqa-shards 1 --vqa-shard-index 0
+```
+
+Pass a comma-separated list after `--decode-tv-drop-sweep` to choose other
+rates. All arms use ordinary BLASST in prefill. At every decode layer, step,
+and head, both sweep arms bypass `floor(visible_visual_keys * rate / 100)`
+visual QK pairs. The guided arm ranks tiles by the number of retained text
+positions linked to each tile, including links from earlier decode steps.
+It uses the seeded random key order for ties and when there are no usable
+links. The random arm uses that order directly. The budget is counted in
+keys, so a boundary tile can be partially retained. Ordinary BLASST
+applies its skip rule to the available joint scores after the budget is applied.
+
+Compare `vqa_accuracy`, `decode_visual_key_drop_pct`, and `mean_decode_steps`
+in `.summary`. Rounding can keep at least one key per head at high drop rates,
+and the arms can have different total key counts if they generate different
+numbers of tokens. Prefill produces the first generated token, so an answer
+that ends at that token contributes no decode steps.
+
 #### Binary T→T → T→V → V→V pipeline
 
 ```bash

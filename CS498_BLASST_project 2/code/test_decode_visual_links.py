@@ -100,3 +100,54 @@ def test_generated_link_is_reused_only_for_a_kept_text_key(monkeypatch, keep_pre
     assert growing.counts["decode_generated_history_head_steps"] == (3 if keep_previous else 0)
     assert growing.counts["decode_visual_tiles_bypassed"] == (3 if keep_previous else 0)
     assert growing.counts["decode_link_fallback_heads"] == (3 if keep_previous else 6)
+
+
+def test_fixed_budget_matches_visible_key_counts_and_ranks_link_votes():
+    visual = torch.ones(5, dtype=torch.bool)
+    columns = torch.tensor([0, 0, 1, 1, 2])
+    allowed = torch.tensor([[True, True, True, True, False],
+                            [True, False, True, False, True],
+                            [False, False, False, False, False]])
+    links = torch.tensor([[[True, False, False], [True, True, False]]] * 3)
+    usable = torch.tensor([[True, True], [False, False], [True, True]])
+    guided = DecodeVisualLinks(visual, 2, drop_percent=50, drop_seed="12:0")
+    random = DecodeVisualLinks(visual, 2, drop_percent=50, random_drop=True, drop_seed="12:0")
+
+    def budget(policy):
+        return policy.budgeted_visual_keys(0, 1, allowed, columns, links, usable)
+
+    guided_keys, random_keys = budget(guided), budget(random)
+    for keys in (guided_keys, random_keys):
+        assert keys.sum(dim=1).tolist() == [2, 2, 0]
+        assert not (keys & ~allowed).any()
+    assert guided_keys[0].tolist() == [True, True, False, False, False]
+    assert guided_keys[1].equal(random_keys[1])
+    assert budget(random).equal(random_keys)
+
+
+@pytest.mark.parametrize("rate, expected_bypassed", [(5, 0), (99.9, 4)])
+def test_fixed_decode_sweep_preserves_prefill_and_counts_actual_bypass(monkeypatch, rate, expected_bypassed):
+    monkeypatch.setattr(ba, "TILE", 2)
+    monkeypatch.setitem(ba.STATE, "collect_stats", False)
+    monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.1))
+    monkeypatch.setitem(ba.STATE, "decode_override", False)
+    monkeypatch.setitem(ba.STATE, "decode_enabled", True)
+    module = SimpleNamespace(layer_idx=0)
+    q = torch.ones(1, 1, 7, 1)
+    k = torch.tensor([8., 0., 1., 5., 6., 3., 4., 0.]).view(1, 1, 8, 1)
+    v = torch.arange(8.).view(1, 1, 8, 1)
+    baseline, _ = ba.blasst_attention_forward(module, q, k[..., :7, :], v[..., :7, :], None, scaling=1.)
+    baseline_decode, _ = ba.blasst_attention_forward(module, q[..., :1, :], k, v, None, scaling=1.)
+    for random_drop in (False, True):
+        policy = DecodeVisualLinks(torch.tensor([False, True, True, True, True, True, False]),
+                                   2, extend_history=True, drop_percent=rate, random_drop=random_drop)
+        monkeypatch.setitem(ba.STATE, "decode_visual_links", policy)
+        prefill, _ = ba.blasst_attention_forward(module, q, k[..., :7, :], v[..., :7, :], None, scaling=1.)
+        torch.testing.assert_close(prefill, baseline)
+        output, _ = ba.blasst_attention_forward(module, q[..., :1, :], k, v, None, scaling=1.)
+        assert policy.counts["decode_visual_keys"] == 5
+        assert policy.counts["decode_visual_keys_bypassed"] == expected_bypassed
+        assert policy.counts["decode_link_fallback_heads"] == 0
+        assert policy.layers[0][0].shape[1] == 8
+        if expected_bypassed == 0:
+            torch.testing.assert_close(output, baseline_decode)

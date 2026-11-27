@@ -1,6 +1,8 @@
 from argparse import Namespace
 from itertools import combinations
+import json
 from random import Random
+import sys
 
 import torch
 
@@ -75,8 +77,6 @@ def test_phase_study_replays_budget_from_each_guided_variant(monkeypatch, tmp_pa
     study._run_tv_vv_sweep(args, None, [sample])
     assert seen == [(None, False), ("vv", False), (None, True), ("vv", True),
                     ("vv", False), (None, True), ("vv", True)]
-    import json
-
     report = json.loads(args.output.read_text())
     assert report["summary"]["combined_binary_random"]["vqa_delta_vs_guided_pp"] == 0
     assert report["summary"]["prefill_binary_random"]["vv_pairs_bypassed"] == 5
@@ -142,3 +142,39 @@ def test_prefill_drop_sweep_pairs_each_rate_and_scores_baseline(monkeypatch, tmp
     assert report["summary"]["prefill_drop_99.9"]["prefill_visual_row_drop_pct"] == 75
     assert report["summary"]["prefill_drop_99.9_random"]["prefill_vv_qk_bypass_pct"] == 30
     assert report["summary"]["prefill_drop_25_random"]["vqa_delta_vs_guided_pp"] == 0
+
+
+def test_decode_drop_sweep_pairs_each_rate_and_reports_realized_budget(monkeypatch, tmp_path):
+    manifest, output = tmp_path / "manifest.json", tmp_path / "sweep.json"
+    sample = {"id": "example", "benchmark": {"name": "VQA v2", "question_id": 1, "question_text": "Question?",
+                                           "reference_answers": ["yes"] * 10}}
+    manifest.write_text(json.dumps({"schema": "blasst-benchmark-manifest-v1", "samples": [sample]}))
+    seen = []
+
+    def collect(run, *_):
+        assert run.token_gate is None and run.decode_visual_link_study
+        seen.append((run.decode_drop_percent, run.random_decode_drop))
+        result = {"answer": "yes", "generated_tokens": 2}
+        assert run.decode_visual_links == (run.decode_drop_percent is not None)
+        if run.decode_visual_links:
+            assert run.extend_decode_links
+            result["decode_visual_links"] = {
+                "decode_visual_keys": 101, "decode_visual_keys_bypassed": int(run.decode_drop_percent * 101 / 100)
+            }
+        return result
+
+    monkeypatch.setattr(study, "collect", collect)
+    monkeypatch.setattr(study, "_select_sample", lambda *_: None)
+    monkeypatch.setattr(study.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(sys, "argv", [
+        "attention_study.py", "--manifest", str(manifest), "--output", str(output),
+        "--lambda", "0.1", "--decode-tv-drop-sweep", "5,99.9", "--vqa-shards", "1", "--vqa-shard-index", "0",
+    ])
+    study.main()
+    study.main()  # Resume a completed shard without collecting any more variants.
+    assert seen == [(None, False), (5, False), (5, True), (99.9, False), (99.9, True)]
+
+    report = json.loads(output.read_text())
+    assert report["decode_tv_drop_sweep"] == [5, 99.9]
+    assert report["summary"]["decode_drop_99.9"]["decode_visual_key_drop_pct"] == 100 * 100 / 101
+    assert report["summary"]["decode_drop_99.9_random"]["vqa_delta_vs_guided_pp"] == 0

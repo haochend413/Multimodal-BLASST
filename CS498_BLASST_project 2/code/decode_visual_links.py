@@ -1,5 +1,7 @@
 """Use prefill text-to-vision links to select visual keys during decode."""
 from collections import Counter
+from decimal import Decimal
+from random import Random
 
 import torch
 
@@ -16,12 +18,22 @@ DECODE_HISTORY_COUNTS = ("decode_generated_history_head_steps",)
 class DecodeVisualLinks:
     """Own per-prompt boolean masks indexed by layer, head, position, and visual tile."""
 
-    def __init__(self, visual, tile_size, *, extend_history=False, budgets=None, collect_counts=True):
+    def __init__(self, visual, tile_size, *, extend_history=False, budgets=None, collect_counts=True,
+                 drop_percent=None, random_drop=False, drop_seed=""):
         self.visual = visual.bool().cpu()
         self.tile_size = tile_size
         self.extend_history = extend_history
         self.budgets = budgets
         self.collect_counts = collect_counts
+        self.random_drop = random_drop
+        self.drop_seed = drop_seed
+        self.drop_counts = None
+        if drop_percent is not None:
+            numerator, denominator = Decimal(str(drop_percent)).as_integer_ratio()
+            self.drop_counts = torch.tensor([
+                count * numerator // (100 * denominator)
+                for count in range(int(self.visual.sum()) + 1)
+            ])
         self.layers = {}
         self.counts = Counter(dict.fromkeys(DECODE_LINK_COUNTS, 0))
         if extend_history:
@@ -57,6 +69,26 @@ class DecodeVisualLinks:
         end = start + scores.shape[-2]
         links[:, start:end] = valid & (visual_max - running >= ln_lambda)
         history[:, start:end] = valid.any(-1)
+
+    def budgeted_visual_keys(self, layer, step, allowed, columns, links, usable):
+        """Choose the same number of visible keys per head in both sweep arms."""
+        device = allowed.device
+        seed = Random(f"{self.drop_seed}:{layer}:{step}").getrandbits(63)
+        generator = torch.Generator(device=device).manual_seed(seed)
+        order = torch.rand(allowed.shape, device=device, dtype=torch.float64, generator=generator).argsort(-1)
+
+        # Rank by how many retained text positions link to each key's tile. The
+        # shuffle breaks ties and supplies the order for the random control.
+        priorities = torch.zeros_like(allowed, dtype=torch.int32)
+        if not self.random_drop:
+            votes = (links & usable.unsqueeze(-1)).sum(dim=1, dtype=torch.int32)
+            priorities = votes[:, columns]
+        priorities.masked_fill_(~allowed, -1)
+        ranked = order.gather(1, priorities.gather(1, order).argsort(dim=1, descending=True, stable=True))
+        eligible = allowed.sum(dim=1)
+        keep = eligible - self.drop_counts.to(device)[eligible]
+        selected = torch.arange(allowed.shape[1], device=device) < keep[:, None]
+        return torch.zeros_like(allowed).scatter_(1, ranked, selected)
 
     def decode(self, layer, query, key, value, mask, scaling, ln_lambda, score_tiles):
         """Return one joint attention output and the physical-tile skip mask."""
@@ -97,12 +129,19 @@ class DecodeVisualLinks:
         text_kept = torch.isfinite(text_max) & (row_tile_margins(text_max) >= ln_lambda)
         kept_keys = text_kept[:, positions // self.tile_size] & torch.isfinite(full)
         usable = kept_keys[:, :history_length] & history
-        fallback = ~usable.any(-1)
-        selected = (links & usable.unsqueeze(-1)).any(dim=1)
         visual_allowed = allowed[:, visual_positions]
-        if self.budgets is not None:
-            selected, fallback = self.budgets.select(layer, visual_allowed, visual_columns, selected, fallback)
-        compute = visual_allowed & (selected[:, visual_columns] | fallback[:, None])
+        if self.drop_counts is None:
+            fallback = ~usable.any(-1)
+            selected = (links & usable.unsqueeze(-1)).any(dim=1)
+            if self.budgets is not None:
+                selected, fallback = self.budgets.select(layer, visual_allowed, visual_columns, selected, fallback)
+            compute = visual_allowed & (selected[:, visual_columns] | fallback[:, None])
+        else:
+            # Falling back to all visual keys would exceed the sweep's budget.
+            fallback = torch.zeros(heads, dtype=torch.bool, device=device)
+            compute = self.budgeted_visual_keys(
+                layer, length - prompt_length, visual_allowed, visual_columns, links, usable,
+            )
         visual_heads, visual_keys = compute.nonzero(as_tuple=True)
         columns = visual_positions[visual_keys]
         visual_scores = (q[visual_heads] * k[visual_heads, columns].float().unsqueeze(1)).sum(-1).squeeze(1) * scaling
@@ -110,8 +149,13 @@ class DecodeVisualLinks:
 
         full_tiles = score_tiles(full, allowed_positions)
         ordinary_keep = row_tile_margins(full_tiles.amax(-1)) >= ln_lambda
-        visual_kept = compute & (~fallback[:, None] | ordinary_keep[:, visual_tiles[visual_columns]])
-        kept_keys[:, visual_positions] = visual_kept
+        if self.drop_counts is None:
+            visual_kept = compute & (~fallback[:, None] | ordinary_keep[:, visual_tiles[visual_columns]])
+            kept_keys[:, visual_positions] = visual_kept
+        else:
+            # Apply ordinary BLASST to the joint scores after budgeting visual QK.
+            kept_keys = ordinary_keep[:, positions // self.tile_size] & torch.isfinite(full)
+            visual_kept = kept_keys[:, visual_positions]
         scores = full.masked_fill(~kept_keys, -torch.inf)
         # Masked rows contribute zero, as in SDPA.
         probs = torch.softmax(scores, dim=-1).nan_to_num().unsqueeze(1)
@@ -124,7 +168,7 @@ class DecodeVisualLinks:
             flags.append(visual_kept & torch.isfinite(full[:, visual_positions]))
         if flags:
             source = torch.stack(flags).int()
-            tile_flags = torch.zeros((len(flags), *selected.shape), dtype=torch.int32, device=device)
+            tile_flags = torch.zeros((len(flags), heads, len(visual_tiles)), dtype=torch.int32, device=device)
             tile_flags.scatter_reduce_(2, visual_columns.expand_as(source), source, reduce="amax")
         if self.collect_counts:
             eligible_tiles, computed_tiles = tile_flags[:2].sum(dim=(1, 2)).tolist()
