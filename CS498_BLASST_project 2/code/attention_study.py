@@ -263,6 +263,8 @@ def main() -> None:
                        help="select the top percentage of visual query tiles by previous-layer T→V votes")
     tv_vv.add_argument("--prefill-visual-query-study", action="store_true",
                        help="compare BLASST, V→V bypass, and whole visual query bypass with the same mask")
+    tv_vv.add_argument("--prefill-vv-drop-sweep", nargs="?", const="99.9,99.5,99,95,90,80,60,25",
+                       metavar="PERCENTS", help="compare frequency and random V→V query-row drop rates")
     tv_vv.add_argument("--tv-vv-sweep", metavar="FRACTIONS",
                        help="compare standard BLASST and comma-separated T→V relevance thresholds")
     tv_vv.add_argument("--decode-visual-links", action="store_true",
@@ -345,7 +347,15 @@ def main() -> None:
     if args.time_modelopt and args.vqa_shards is not None:
         parser.error("run --time-modelopt as one process on one GPU")
     decode_link_study = args.decode_visual_links or args.decode_visual_history_study
-    query_study = args.prefill_visual_query_study or args.binary_mask_study
+    drop_study = args.prefill_vv_drop_sweep is not None
+    if drop_study:
+        try:
+            args.prefill_vv_drop_sweep = list(dict.fromkeys(float(rate) for rate in args.prefill_vv_drop_sweep.split(",")))
+            if not all(0 < rate < 100 for rate in args.prefill_vv_drop_sweep):
+                raise ValueError
+        except ValueError:
+            parser.error("--prefill-vv-drop-sweep expects comma-separated drop percentages in (0, 100)")
+    query_study = args.prefill_visual_query_study or args.binary_mask_study or drop_study
     if decode_link_study or binary_study or query_study:
         flag = "--decode-visual-links"
         if args.decode_visual_history_study:
@@ -358,8 +368,10 @@ def main() -> None:
             flag = "--binary-tv-prefill-diagnostics"
         if args.binary_mask_study:
             flag = "--binary-mask-study"
-        minimum = 1 if args.prefill_visual_query_study else 2
-        if (args.binary_mask_study or args.binary_tv_prefill_diagnostics) and (
+        if drop_study:
+            flag = "--prefill-vv-drop-sweep"
+        minimum = 1 if args.prefill_visual_query_study or drop_study else 2
+        if (args.binary_mask_study or args.binary_tv_prefill_diagnostics or drop_study) and (
             not 0 < args.lam <= 1 or not 0 < (args.lam if args.decode_lambda is None else args.decode_lambda) <= 1
         ):
             parser.error(f"{flag} requires positive prefill and decode lambdas in (0, 1]")
@@ -640,8 +652,13 @@ def _run_tv_vv_sweep(args, parser, samples):
     timing = getattr(args, "time_modelopt", False)
     matched_random = getattr(args, "matched_random", False)
     query_study = getattr(args, "prefill_visual_query_study", False)
+    drop_rates = getattr(args, "prefill_vv_drop_sweep", None)
     variants = [("baseline", None)]
-    if mask_study:
+    if drop_rates:
+        for rate in drop_rates:
+            name = f"prefill_drop_{str(rate).removesuffix('.0')}"
+            variants.extend(((name, rate), (f"{name}_random", rate)))
+    elif mask_study:
         variants.extend((("prefill_binary", "prefill"), ("decode_binary", "decode"),
                          ("combined_binary", "combined")))
         if matched_random:
@@ -675,7 +692,14 @@ def _run_tv_vv_sweep(args, parser, samples):
         report[f"{phase}_max_policies"] = {
             name: "shared" if threshold is None else "per_region" for name, threshold in variants
         }
-    if mask_study:
+    if drop_rates:
+        report.update(prefill_vv_drop_sweep=drop_rates, random_seed=args.random_seed,
+                      image_max_pixels=args.image_max_pixels, max_prompt_tokens=args.max_tokens)
+        report["variant_labels"] = {"baseline": "Original BLASST"}
+        for name, rate in variants[1:]:
+            method = "Random" if name.endswith("_random") else "T→V frequency"
+            report["variant_labels"][name] = f"{method} drop {rate:g}%"
+    elif mask_study:
         report["binary_mask_study"] = True
         report.update(image_max_pixels=args.image_max_pixels, max_prompt_tokens=args.max_tokens)
         report["variant_labels"] = {
@@ -725,10 +749,10 @@ def _run_tv_vv_sweep(args, parser, samples):
             report["token_top_k"] = True
         for phase in ("prefill", "decode"):
             report[f"{phase}_max_policies"] = dict.fromkeys(dict(variants), "shared")
-    measured_phases = ("prefill", "decode") if has_top_k or decode_links or binary or query_study or mask_study else region_phases
+    measured_phases = ("prefill", "decode") if has_top_k or decode_links or binary or query_study or mask_study or drop_rates else region_phases
     if args.vqa_accuracy:
         report["answer_metric"] = protocol.metric
-        if protocol is not VQAV2 or mask_study or diagnostics:
+        if protocol is not VQAV2 or mask_study or diagnostics or drop_rates:
             report["benchmark"] = protocol.name
         report["answer_protocol"] = dict(instruction=protocol.instruction,
                                          max_new_tokens=args.decode_tokens, min_new_tokens=args.decode_tokens if timing else 0)
@@ -756,7 +780,7 @@ def _run_tv_vv_sweep(args, parser, samples):
         guided_traces = {}
         for name, value in variants:
             # An ungated vote trace provides the baseline's causal V→V denominator.
-            threshold = value if not (has_top_k or decode_links or binary or query_study or mask_study) else None
+            threshold = value if not (has_top_k or decode_links or binary or query_study or mask_study or drop_rates) else None
             run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold,
                                             tv_vv_top_percent=value if top_percent is not None else None,
                                             tv_vv_token_percent=value if token_percent is not None else None,
@@ -767,6 +791,10 @@ def _run_tv_vv_sweep(args, parser, samples):
                                             gate_replay=query_gate if name == "whole_visual_query" else None,
                                             binary_tv_pipeline=binary,
                                             binary_tv_mode=value if binary else None))
+            if drop_rates:
+                run.token_gate = "vv"
+                run.token_drop_percent = value or 0
+                run.random_drop = value is None or name.endswith("_random")
             if mask_study:
                 prefill = value in ("prefill", "combined")
                 decode = value in ("decode", "combined")
@@ -793,7 +821,9 @@ def _run_tv_vv_sweep(args, parser, samples):
             if timing and index == args.sample_index:
                 collect(run, parser, benchmark, sample_id)
             metadata = collect(run, parser, benchmark, sample_id)
-            if mask_study:
+            if drop_rates:
+                trace = {key: item for key, item in metadata["tv_guided_vv"].items() if key != "layers"}
+            elif mask_study:
                 trace = metadata.get("timing", {}) if timing else {
                     **metadata.get("tv_guided_vv", {}), **metadata.get("decode_visual_links", {}),
                 }
@@ -840,7 +870,7 @@ def _run_tv_vv_sweep(args, parser, samples):
                 after = ba.STATE["phase_stats"].get(phase, {})
                 result[f"{phase}_tiles"] = after.get("causal", 0) - before[phase].get("causal", 0)
                 result[f"{phase}_tiles_skipped"] = after.get("skipped", 0) - before[phase].get("skipped", 0)
-                if phase == "prefill" and (has_top_k or query_study or mask_study):
+                if phase == "prefill" and (has_top_k or query_study or mask_study or drop_rates):
                     result["prefill_qk_bypassed"] = after.get("qk_bypassed", 0) - before[phase].get("qk_bypassed", 0)
             if args.vqa_accuracy:
                 result[protocol.case_score] = protocol.score(answer, references)
@@ -880,6 +910,8 @@ def _run_tv_vv_sweep(args, parser, samples):
                 policy = "visual-query gates"
             if mask_study:
                 policy = "binary prefill and decode gates"
+            if drop_rates:
+                policy = "frequency and random V→V query drops"
             print(f"Compared {policy} for {done}/{len(samples)} cases", flush=True)
     print(f"Wrote paired attention report to {args.output}")
     if timing:
@@ -1055,12 +1087,16 @@ def _attach_study(args, recorder):
     top_percent = getattr(args, "tv_vv_top_percent", None)
     token_percent = getattr(args, "tv_vv_token_percent", None)
     paired = (args.tv_vv_sweep or getattr(args, "tv_vv_top_accuracy", False)
-              or getattr(args, "prefill_visual_query_study", False))
+              or getattr(args, "prefill_visual_query_study", False)
+              or getattr(args, "prefill_vv_drop_sweep", None))
     if (args.tv_vv_threshold is not None or top_percent is not None or token_percent is not None or paired
             or args.matched_region_study or args.gate_distribution):
         ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold,
                                             replay=getattr(args, "gate_replay", None), top_percent=top_percent,
-                                            token_percent=token_percent, token_gate=getattr(args, "token_gate", None))
+                                            token_percent=token_percent, token_gate=getattr(args, "token_gate", None),
+                                            token_drop_percent=getattr(args, "token_drop_percent", None),
+                                            random_drop=getattr(args, "random_drop", False),
+                                            drop_seed=f"{getattr(args, 'random_seed', 0)}:{getattr(args, 'sample_index', 0)}")
         ba.STATE["qkv_hook"] = None
         if paired or args.matched_region_study or args.gate_distribution:
             ba.STATE["observer"] = None
@@ -1247,10 +1283,15 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
             counts = (*TOKEN_GATE_COUNTS, *VISUAL_QUERY_COUNTS) if policy.token_gate else TOKEN_GATE_COUNTS
             metadata["tv_guided_vv"].update({key: sum(layer[key] for layer in policy.layers)
                                               for key in counts})
+        if policy.token_drop_percent is not None:
+            metadata["tv_guided_vv"]["visual_query_tokens_gateable"] = sum(
+                layer["visual_query_tokens_gateable"] for layer in policy.layers
+            )
         if args.gate_distribution:
             metadata["gate_distribution"] = policy.distribution()
         if (args.tv_vv_sweep or getattr(args, "tv_vv_top_accuracy", False)
                 or getattr(args, "prefill_visual_query_study", False)
+                or getattr(args, "prefill_vv_drop_sweep", None)
                 or args.matched_region_study or args.gate_distribution):
             return metadata
     if args.vv_prefix_attention:

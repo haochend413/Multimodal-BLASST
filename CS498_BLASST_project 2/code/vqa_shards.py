@@ -16,7 +16,7 @@ from tv_guided_vv import TOKEN_GATE_COUNTS, VISUAL_QUERY_COUNTS
 CHECKPOINT_INTERVAL = 25
 MAX_POLICIES = ("prefill_max_policies", "decode_max_policies")
 TILE_COUNTS = ("prefill_tiles", "prefill_tiles_skipped", "decode_tiles", "decode_tiles_skipped",
-               "prefill_qk_bypassed", *DECODE_LINK_COUNTS, *DECODE_HISTORY_COUNTS, *TOKEN_GATE_COUNTS,
+               "prefill_qk_bypassed", "visual_query_tokens_gateable", *DECODE_LINK_COUNTS, *DECODE_HISTORY_COUNTS, *TOKEN_GATE_COUNTS,
                *VISUAL_QUERY_COUNTS, *BINARY_TV_COUNTS,
                "random_decode_unmatched_head_steps", "random_decode_guided_only_head_steps",
                "random_prefill_rows_reassigned", "random_decode_tiles_reassigned")
@@ -107,6 +107,11 @@ def summarize(totals, *, reference="baseline", protocol=VQAV2):
     for name, totals_for_variant in totals.items():
         score = totals_for_variant[score_field] / totals_for_variant["answers_scored"]
         summary[name] = dict(totals_for_variant, **{protocol.summary_score: score})
+        if gateable := totals_for_variant.get("visual_query_tokens_gateable"):
+            dropped = totals_for_variant["visual_query_tokens"] - totals_for_variant["visual_query_tokens_selected"]
+            summary[name]["prefill_visual_row_drop_pct"] = 100 * dropped / gateable
+        if vv_pairs := totals_for_variant.get("vv_pairs"):
+            summary[name]["prefill_vv_qk_bypass_pct"] = 100 * totals_for_variant["vv_pairs_bypassed"] / vv_pairs
         if observed := totals_for_variant.get("generation_lengths_recorded"):
             summary[name]["mean_generated_tokens"] = totals_for_variant["generated_tokens"] / observed
             summary[name]["mean_decode_steps"] = totals_for_variant["decode_steps"] / observed
@@ -144,7 +149,7 @@ def merge(paths, output):
         expected_config = {key: report[key] for key in config_keys}
         for key in (*MAX_POLICIES, "benchmark", "variant_labels", "decode_visual_link_study", "token_top_k",
                     "binary_tv_pipeline", "prefill_visual_query_study", "binary_mask_study",
-                    "binary_tv_prefill_diagnostics", "random_seed"):
+                    "binary_tv_prefill_diagnostics", "prefill_vv_drop_sweep", "random_seed"):
             if key in report:
                 expected_config[key] = report[key]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}

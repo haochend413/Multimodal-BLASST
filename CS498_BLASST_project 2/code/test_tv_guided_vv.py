@@ -190,3 +190,35 @@ def test_counting_votes_leaves_the_baseline_unchanged(monkeypatch):
     torch.testing.assert_close(actual, expected)
     assert policy.layers[1]["vote_layer"] == 0
     assert policy.layers[1]["votes"][0]["eligible"] == 2
+
+
+def test_prefill_drop_sweep_matches_query_count_and_ranks_previous_tv(monkeypatch):
+    monkeypatch.setattr(ba, "TILE", 2)
+    monkeypatch.setitem(ba.STATE, "collect_stats", False)
+    monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.1))
+    visual = torch.tensor([False, True, True, False, True, True, False])
+    q = torch.ones(1, 1, len(visual), 1)
+    k = torch.tensor([1., 8., 0., 1., 8., 0., 1.]).view_as(q)
+    for percent, count in ((50, 2), (99.9, 3)):
+        random_masks = []
+        for random_drop in (False, True, True):
+            policy = TVGuidedVV(visual, 2, None, token_gate="vv", token_drop_percent=percent,
+                               random_drop=random_drop, drop_seed="fixture")
+            monkeypatch.setitem(ba.STATE, "tv_guided_vv", policy)
+            for layer in range(2):
+                out, _ = ba.blasst_attention_forward(SimpleNamespace(layer_idx=layer), q, k, q, None, scaling=1.)
+                assert out.isfinite().all()
+            assert policy.layers[0]["dropped_token_positions"] == []
+            assert policy.layers[0]["visual_query_tokens_gateable"] == 0
+            gated = policy.layers[1]
+            dropped = gated["dropped_token_positions"]
+            assert len(dropped) == count
+            assert visual[dropped].all()
+            assert gated["visual_query_tokens_gateable"] == 4
+            assert gated["vt_pairs_bypassed"] == 0
+            assert gated["vv_pairs_bypassed"] == int(visual.cumsum(0)[dropped].sum())
+            if random_drop:
+                random_masks.append(dropped)
+            else:
+                assert {2, 5} <= set(dropped)
+        assert random_masks[0] == random_masks[1]

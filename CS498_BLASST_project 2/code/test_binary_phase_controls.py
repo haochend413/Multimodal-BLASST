@@ -110,3 +110,35 @@ def test_fixed_length_timing_separates_first_token_and_decode(monkeypatch):
     assert output.shape == (1, 7)
     assert timing == {"first_token_seconds": 2, "decode_seconds": 5, "generation_seconds": 7}
     assert not model._forward_pre_hooks
+
+
+def test_prefill_drop_sweep_pairs_each_rate_and_scores_baseline(monkeypatch, tmp_path):
+    args = Namespace(
+        answer_protocol=study.VQAV2, model="test", demo=False, lam=.1, decode_lambda=.1,
+        sample_index=0, decode_tokens=16, vqa_accuracy=True, output=tmp_path / "sweep.json",
+        prefill_vv_drop_sweep=[99.9, 25.0], random_seed=12, image_max_pixels=3136, max_tokens=128,
+    )
+    sample = {"id": "example", "benchmark": {"question_id": 1, "question_text": "Question?",
+                                           "reference_answers": ["yes"] * 10}}
+    seen = []
+
+    def collect(run, *_):
+        assert run.token_gate == "vv" and not run.decode_visual_links
+        seen.append((run.token_drop_percent, run.random_drop))
+        dropped = int(run.token_drop_percent * 4 / 100)
+        return {"answer": "yes", "generated_tokens": 2, "tv_guided_vv": {
+            "visual_query_tokens_gateable": 4, "visual_query_tokens": 8, "visual_query_tokens_selected": 8 - dropped,
+            "vv_pairs": 20, "vv_pairs_bypassed": dropped * 2, "layers": [],
+        }}
+
+    monkeypatch.setattr(study, "collect", collect)
+    monkeypatch.setattr(study, "_select_sample", lambda *_: None)
+    study._run_tv_vv_sweep(args, None, [sample])
+    assert seen == [(0, True), (99.9, False), (99.9, True), (25.0, False), (25.0, True)]
+    import json
+
+    report = json.loads(args.output.read_text())
+    assert report["summary"]["baseline"]["prefill_visual_row_drop_pct"] == 0
+    assert report["summary"]["prefill_drop_99.9"]["prefill_visual_row_drop_pct"] == 75
+    assert report["summary"]["prefill_drop_99.9_random"]["prefill_vv_qk_bypass_pct"] == 30
+    assert report["summary"]["prefill_drop_25_random"]["vqa_delta_vs_guided_pp"] == 0

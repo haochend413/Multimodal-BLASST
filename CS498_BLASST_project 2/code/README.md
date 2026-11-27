@@ -430,6 +430,38 @@ staged softmax mass on excluded visual keys. The per-layer audit also counts
 text head/query rows with usable history but an empty candidate union
 (`empty_link_rows`). The shadow scores do not participate in generation.
 
+#### Prefill V→V query-row drop sweep
+
+After defining `run_binary` above, run the frequency and random arms on the
+same questions:
+
+```bash
+run_binary vqav2 1000 16 prefill-vv-drop-sweep --prefill-vv-drop-sweep
+run_binary vizwiz-lf 600 128 prefill-vv-drop-sweep --prefill-vv-drop-sweep
+```
+
+The default percentages are 99.9, 99.5, 99, 95, 90, 80, 60, and 25. Pass a
+comma-separated list, such as `--prefill-vv-drop-sweep 99.9,90,25`, to select
+rates. Each question runs ordinary BLASST once plus two variants per rate.
+Starting at layer 1, each arm drops `floor(visual_query_rows * rate / 100)`
+visual query rows from V→V QK. V→T retains its usual computation and the
+visual keys and values stay available. All arms use ordinary BLASST in decode.
+
+The frequency arm ranks visual tokens by the fraction of eligible text
+query/head votes that kept the token as a visual key in the previous layer.
+Tokens with no eligible vote rank below measured frequencies. The random arm
+chooses rows using a seeded shuffle, and the same order breaks frequency
+ties. Set `--random-seed` for another draw. The random order is shared
+across the rates for a given question and layer.
+
+Read `.summary` for the paired answer scores,
+`prefill_visual_row_drop_pct` over layers where the gate runs, and
+`prefill_vv_qk_bypass_pct` over all prefill layers, including layer 0.
+Later visual queries have more causal keys, so matching row counts can
+produce different QK budgets. The random arms report their score difference
+from the frequency arm at the same rate under `*_delta_vs_guided_pp`.
+Use `--vqa-shards 1 --vqa-shard-index 0` for a restartable single-process run.
+
 #### Binary T→T → T→V → V→V pipeline
 
 ```bash
