@@ -266,7 +266,7 @@ def main() -> None:
     tv_vv.add_argument("--prefill-vv-drop-sweep", nargs="?", const="99.9,99.5,99,95,90,80,60,25",
                        metavar="PERCENTS", help="compare frequency and random V→V query-row drop rates")
     parser.add_argument("--prefill-vv-lambda-sweep", metavar="LAMBDAS",
-                        help="sweep prefill lambdas at one --prefill-vv-drop-sweep percentage")
+                        help="sweep prefill lambdas across all --prefill-vv-drop-sweep percentages")
     parser.add_argument("--prefill-vv-drop-highest", action="store_true",
                         help="drop highest-frequency rows first in the prefill frequency arm")
     tv_vv.add_argument("--decode-tv-drop-sweep", nargs="?", const="5,10,20,25,35,50,60,75,80,90,95,99,99.5,99.9",
@@ -367,8 +367,8 @@ def main() -> None:
     if args.prefill_vv_drop_highest and not drop_study:
         parser.error("--prefill-vv-drop-highest requires --prefill-vv-drop-sweep")
     if args.prefill_vv_lambda_sweep is not None:
-        if not drop_study or len(args.prefill_vv_drop_sweep) != 1:
-            parser.error("--prefill-vv-lambda-sweep requires one --prefill-vv-drop-sweep percentage")
+        if not drop_study:
+            parser.error("--prefill-vv-lambda-sweep requires --prefill-vv-drop-sweep")
         if args.lam != 0 or args.decode_lambda is None or not 0 < args.decode_lambda <= 1:
             parser.error("--prefill-vv-lambda-sweep requires a fixed --decode-lambda in (0, 1] and omits --lambda")
         try:
@@ -674,12 +674,14 @@ def _collect_prefill_lambda_sweep(args, parser, samples):
     report = dict(
         schema="blasst-prefill-vv-lambda-sweep-v1", benchmark=args.answer_protocol.name, model=args.model,
         prefill_vv_lambda_sweep=args.prefill_vv_lambda_sweep,
-        prefill_vv_drop_percent=args.prefill_vv_drop_sweep[0],
+        prefill_vv_drop_sweep=args.prefill_vv_drop_sweep,
         prefill_vv_drop_order="highest" if args.prefill_vv_drop_highest else "lowest",
         decode_lambda=args.decode_lambda, random_seed=args.random_seed, sample_index=args.sample_index,
         pairs_requested=len(samples),
         reports={}, summary={},
     )
+    if len(args.prefill_vv_drop_sweep) == 1:
+        report["prefill_vv_drop_percent"] = args.prefill_vv_drop_sweep[0]
     for lam in args.prefill_vv_lambda_sweep:
         output = args.output.with_name(f"{args.output.stem}-lambda{lam}{args.output.suffix}")
         print(f"Running prefill lambda {lam:g} (decode {args.decode_lambda:g})", flush=True)

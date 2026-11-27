@@ -164,17 +164,20 @@ def test_prefill_co_design_cli_sweeps_lambdas_and_supports_highest_drop(monkeypa
         "--vqa-shards", "1", "--vqa-shard-index", "0",
     ]
     monkeypatch.setattr(sys, "argv", common + [
-        "--output", str(output), "--prefill-vv-drop-sweep", "80", "--prefill-vv-lambda-sweep", "0.05,0.2",
+        "--output", str(output), "--prefill-vv-drop-sweep", "5,80", "--prefill-vv-lambda-sweep", "0.05,0.2",
     ])
     study.main()
     study.main()  # Completed child checkpoints are reusable by the sweep.
-    assert seen == [(lam, .1, drop, random, False)
-                    for lam in (.05, .2) for drop, random in ((0, True), (80, False), (80, True))]
+    assert seen == [(lam, .1, drop, random, False) for lam in (.05, .2)
+                    for drop, random in ((0, True), (5, False), (5, True), (80, False), (80, True))]
     report = json.loads(output.read_text())
+    assert report["prefill_vv_drop_sweep"] == [5, 80]
+    assert report["prefill_vv_drop_order"] == "lowest"
     assert set(report["summary"]) == {"0.05", "0.2"}
     for lam, filename in report["reports"].items():
         child = json.loads((tmp_path / filename).read_text())
         assert child["blasst_lambda"] == float(lam)
+        assert child["prefill_vv_drop_sweep"] == [5, 80]
         assert child["summary"] == report["summary"][lam]
 
     seen.clear()
