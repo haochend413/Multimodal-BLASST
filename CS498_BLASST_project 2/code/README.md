@@ -540,6 +540,22 @@ and the arms can have different total key counts if they generate different
 numbers of tokens. Prefill produces the first generated token, so an answer
 that ends at that token contributes no decode steps.
 
+#### Decode-only lambda experiment
+
+Run the decode T→V drop sweep on the same 50 VQA v2 questions with decode λ
+values 0.001, 0.01, 0.1, 0.6, and 1. Every arm uses ordinary BLASST prefill
+at λ = 1. The guided arm records T→V links during prefill for use in decode.
+The prefill V→V gate is disabled.
+
+```bash
+bash code/vqav2_decode_tv_lambda_sweep.sh
+```
+
+Pass decode λ values as separate arguments to run a custom sweep, for
+example `bash code/vqav2_decode_tv_lambda_sweep.sh 0.1 0.9 1`.
+Each λ writes a report and checkpoint under
+`$HOME/blasst-results/decode-lambda-experiments/prefill-lambda-1/`.
+
 #### Binary T→T → T→V → V→V pipeline
 
 ```bash
