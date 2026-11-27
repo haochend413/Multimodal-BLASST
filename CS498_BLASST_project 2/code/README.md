@@ -491,6 +491,27 @@ run_binary vqav2 100 16 prefill-vv-drop-highest-screen-seed20261127 \
   --random-seed 20261127 --vqa-shards 1 --vqa-shard-index 0
 ```
 
+#### Prefill tile-size experiment
+
+Run the 32×32 and 64×64 VQA v2 sweeps at prefill λ = 1 from the project
+directory. Decode uses 1×128 tiles and λ = 0.1 for both runs.
+
+```bash
+bash code/vqav2_prefill_tile_size_sweep.sh
+```
+
+Pass a tile size to run only that geometry. For 256×256, run:
+
+```bash
+bash code/vqav2_prefill_tile_size_sweep.sh 256
+```
+
+Results and checkpoints go in `$HOME/blasst-results/prefill-tile-size-experiments/`
+under the corresponding size directory, such as `256x256/`. Use `--prefill-tile-size` with
+`--prefill-vv-drop-sweep` to run a single square geometry. The default is
+128×128. The lambda sweep summary records both tile sizes. In each per-λ
+report, `tile_size` is the prefill tile size.
+
 #### Decode T→V visual-key drop sweep
 
 The default sweep covers 5, 10, 20, 25, 35, 50, 60, 75, 80, 90, 95, 99, 99.5,

@@ -222,3 +222,26 @@ def test_prefill_drop_sweep_matches_query_count_and_ranks_previous_tv(monkeypatc
             else:
                 assert ({1, 4} if drop_highest else {2, 5}) <= set(dropped)
         assert random_masks[0] == random_masks[1]
+
+
+def test_prefill_tile_size_changes_both_axes_and_preserves_decode_tiles(monkeypatch):
+    monkeypatch.setitem(ba.STATE, "stats", {})
+    monkeypatch.setitem(ba.STATE, "collect_stats", True)
+    monkeypatch.setitem(ba.STATE, "ln_lam", 0.)
+    visual = torch.arange(257) < 96
+    q = torch.zeros(1, 1, len(visual), 1)
+
+    for size, expected_tiles in ((32, 45), (64, 15), (128, 6), (256, 3)):
+        monkeypatch.setitem(ba.STATE, "phase_stats", {})
+        policy = TVGuidedVV(visual, size, None, token_gate="vv", token_drop_percent=50)
+        monkeypatch.setitem(ba.STATE, "tv_guided_vv", policy)
+        for layer in range(2):
+            module = SimpleNamespace(layer_idx=layer)
+            output, _ = ba.blasst_attention_forward(module, q, q, q, None)
+            assert output.isfinite().all()
+        assert ba.STATE["phase_stats"]["prefill"]["causal"] == 2 * expected_tiles
+        assert policy.layers[0]["visual_query_tokens_selected"] == 96
+        assert policy.layers[1]["visual_query_tokens_selected"] == 48
+
+        ba.blasst_attention_forward(module, q[:, :, :1], q, q, None)
+        assert ba.STATE["phase_stats"]["decode"]["causal"] == 3

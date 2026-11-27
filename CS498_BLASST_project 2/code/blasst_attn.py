@@ -5,9 +5,9 @@ BLASST skip-softmax attention, simulated in PyTorch and registered with
 Hugging Face transformers' AttentionInterface under the name "blasst".
 
 What it does (prefill, i.e. more than one query token):
-  * take 128 query rows at a time ("chunk"),
+  * take one tile of query rows at a time (128 by default),
   * compute their scaled scores against ALL keys, apply the causal mask,
-  * split the key axis into 128-wide tiles and take each tile's row maxima,
+  * split the key axis into tiles of the same size and take each tile's row maxima,
   * walk the tiles left to right keeping a running row max (cummax, which
     includes the current tile, exactly as BLASST's online softmax does),
   * skip a tile only if EVERY row in the chunk is below its running max by
@@ -33,7 +33,7 @@ Threshold control (module-level STATE, see set_threshold):
 
 Recording (for teammates B and C):
   * STATE["record"] = True saves, per layer, the tile MARGIN
-        margin[h, q_tile, k_tile] = max over the 128 rows of (tile_max - running_max)
+        margin[h, q_tile, k_tile] = max over the query rows of (tile_max - running_max)
     a tile is skipped at threshold lambda  <=>  margin < ln(lambda).
     The margin does not depend on lambda, so ONE forward pass with skipping off
     gives the skip mask for EVERY lambda offline (see masks_from_margins).
@@ -159,18 +159,19 @@ def causal_tiles(Sq: int, Skv: int, offset: int) -> torch.Tensor:
     return k_first[None, :] <= q_last[:, None]
 
 
-def score_tiles(scores, allowed, mask=None):
+def score_tiles(scores, allowed, mask=None, *, tile_size=None):
     """Apply the attention masks and partition scores along the key axis."""
+    tile_size = TILE if tile_size is None else tile_size
     scores = scores.masked_fill(~allowed, NEG_INF)
     if mask is not None:
         if mask.dtype == torch.bool:
             scores = scores.masked_fill(~mask, NEG_INF)
         else:
             scores = scores + mask.to(torch.float32)
-    pad = -scores.shape[-1] % TILE
+    pad = -scores.shape[-1] % tile_size
     if pad:
         scores = F.pad(scores, (0, pad), value=NEG_INF)
-    return scores.unflatten(-1, (-1, TILE))
+    return scores.unflatten(-1, (-1, tile_size))
 
 
 def tile_margins(tiles):
@@ -255,7 +256,6 @@ def blasst_attention_forward(
     # when L is short (e.g. a = 1000, L = 650).
     ln_lam = min(ln_lam, 0.0)
     offset = Skv - Sq                 # queries are the LAST Sq positions of the key axis
-    n_kt = math.ceil(Skv / TILE)
     binary = STATE["binary_tv_pipeline"]
     if binary is not None and phase == "decode" and not binary.guide_decode:
         binary = None
@@ -294,6 +294,8 @@ def blasst_attention_forward(
     out = torch.empty_like(query)
     vv_prefix = STATE["vv_prefix_visual"] if phase == "prefill" else None
     policy = STATE["tv_guided_vv"] if phase == "prefill" else None
+    tile_size = policy.tile_size if policy is not None else TILE
+    n_kt = math.ceil(Skv / tile_size)
     regions = STATE["prefill_region_max"] if phase == "prefill" else STATE["decode_region_max"]
     tv_layer = None
     if policy is not None:
@@ -306,7 +308,7 @@ def blasst_attention_forward(
         if B != 1 or Sq != Skv or vv_prefix.shape != (Skv,):
             raise ValueError("V→V prefix attention requires one unpadded, uncached prompt")
         visual = vv_prefix.to(device=query.device, dtype=torch.bool)
-        pure_visual_tiles = F.pad(visual, (0, -Skv % TILE), value=True).reshape(-1, TILE).all(-1)
+        pure_visual_tiles = F.pad(visual, (0, -Skv % tile_size), value=True).reshape(-1, tile_size).all(-1)
 
     stats = STATE["stats"].setdefault(layer_idx, {
         "skipped": torch.zeros(Hq, dtype=torch.long), "causal": torch.zeros(Hq, dtype=torch.long)})
@@ -315,15 +317,15 @@ def blasst_attention_forward(
     if STATE["record"] and phase == "prefill":
         STATE["record_meta"][layer_idx] = {"Sq": Sq, "Skv": Skv, "offset": offset}
 
-    for r0 in range(0, Sq, TILE):
-        r1 = min(r0 + TILE, Sq)
+    for r0 in range(0, Sq, tile_size):
+        r1 = min(r0 + tile_size, Sq)
         q32 = query[:, :, r0:r1].to(torch.float32)
         qpos = torch.arange(r0, r1, device=query.device) + offset
         allowed = kpos[None, :] <= qpos[:, None]                            # [r, Skv] causal
         if vv_prefix is not None:
-            full_vv = pure_visual_tiles[r0 // TILE] & pure_visual_tiles
-            allowed = allowed | full_vv.repeat_interleave(TILE)[:Skv]
-        query_tile = r0 // TILE
+            full_vv = pure_visual_tiles[r0 // tile_size] & pure_visual_tiles
+            allowed = allowed | full_vv.repeat_interleave(tile_size)[:Skv]
+        query_tile = r0 // tile_size
         mask = mask_chunk(attention_mask, r0, r1, Sq, Skv)
         token_drops = tv_layer.token_drops[r0:r1] if tv_layer is not None and tv_layer.token_drops is not None else None
         token_bypass = token_drops is not None and bool(token_drops.any())
@@ -331,13 +333,13 @@ def blasst_attention_forward(
         bypass = tv_layer.bypass_keys(query_tile) if tv_layer is not None else []
         if bypass:
             omitted = set(bypass)
-            columns = torch.cat([kpos[index * TILE:(index + 1) * TILE]
+            columns = torch.cat([kpos[index * tile_size:(index + 1) * tile_size]
                                  for index in range(query_tile + 1) if index not in omitted])
             retained = key32.index_select(-2, columns)
             computed = torch.matmul(q32, retained.transpose(-1, -2)) * scaling
             s = computed.new_full((B, Hq, r1 - r0, Skv), NEG_INF)
             s.index_copy_(-1, columns, computed)
-            s_t = score_tiles(s, allowed, mask)
+            s_t = score_tiles(s, allowed, mask, tile_size=tile_size)
             if mask is not None and not s_t.isfinite().flatten(-2).any(-1).all():
                 # An extra mask can hide the protected key. Revert this query tile.
                 bypass = []
@@ -349,10 +351,10 @@ def blasst_attention_forward(
                                              policy.visual.to(query.device), scaling, skip_whole_query=skip_whole_query)
             if mask is not None and mask.dtype != torch.bool:
                 s = s.masked_fill(mask <= torch.finfo(mask.dtype).min, NEG_INF)
-            s_t = score_tiles(s, allowed, mask)
+            s_t = score_tiles(s, allowed, mask, tile_size=tile_size)
         elif not bypass:
             s = torch.matmul(q32, key32.transpose(-1, -2)) * scaling      # [B, H, r, Skv] fp32
-            s_t = score_tiles(s, allowed, mask)
+            s_t = score_tiles(s, allowed, mask, tile_size=tile_size)
         row_margins = (regions.row_margins(s_t, Skv) if regions is not None
                        else row_tile_margins(s_t.amax(-1)))
         if links is not None:
@@ -389,7 +391,7 @@ def blasst_attention_forward(
 
         # bookkeeping (causal tiles only; fully-masked tiles are not "skipped", they do not exist)
         if STATE["collect_stats"] or rec is not None:
-            k_first = torch.arange(n_kt, device=query.device) * TILE
+            k_first = torch.arange(n_kt, device=query.device) * tile_size
             causal = (k_first <= (r1 - 1 + offset))                         # [n_kt]
             if vv_prefix is not None:
                 # The historical stats field includes the newly reachable tiles.

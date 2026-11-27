@@ -151,7 +151,7 @@ def test_prefill_co_design_cli_sweeps_lambdas_and_supports_highest_drop(monkeypa
 
     def collect(run, *_):
         seen.append((run.lam, run.decode_lambda, run.token_drop_percent,
-                     run.random_drop, run.prefill_vv_drop_highest))
+                     run.random_drop, run.prefill_vv_drop_highest, run.prefill_tile_size))
         return {"answer": "yes", "generated_tokens": 2, "tv_guided_vv": {
             "vv_pairs": 20, "vv_pairs_bypassed": int(20 * run.token_drop_percent / 100), "layers": [],
         }}
@@ -165,18 +165,21 @@ def test_prefill_co_design_cli_sweeps_lambdas_and_supports_highest_drop(monkeypa
     ]
     monkeypatch.setattr(sys, "argv", common + [
         "--output", str(output), "--prefill-vv-drop-sweep", "5,80", "--prefill-vv-lambda-sweep", "0.05,0.2",
+        "--prefill-tile-size", "256",
     ])
     study.main()
     study.main()  # Completed child checkpoints are reusable by the sweep.
-    assert seen == [(lam, .1, drop, random, False) for lam in (.05, .2)
+    assert seen == [(lam, .1, drop, random, False, 256) for lam in (.05, .2)
                     for drop, random in ((0, True), (5, False), (5, True), (80, False), (80, True))]
     report = json.loads(output.read_text())
     assert report["prefill_vv_drop_sweep"] == [5, 80]
     assert report["prefill_vv_drop_order"] == "lowest"
+    assert (report["prefill_tile_size"], report["decode_tile_size"]) == (256, 128)
     assert set(report["summary"]) == {"0.05", "0.2"}
     for lam, filename in report["reports"].items():
         child = json.loads((tmp_path / filename).read_text())
         assert child["blasst_lambda"] == float(lam)
+        assert child["tile_size"] == 256
         assert child["prefill_vv_drop_sweep"] == [5, 80]
         assert child["summary"] == report["summary"][lam]
 
@@ -187,10 +190,11 @@ def test_prefill_co_design_cli_sweeps_lambdas_and_supports_highest_drop(monkeypa
         "--prefill-vv-drop-sweep", "5,80", "--prefill-vv-drop-highest",
     ])
     study.main()
-    assert seen == [(.1, .1, drop, random, True)
+    assert seen == [(.1, .1, drop, random, True, None)
                     for drop, random in ((0, True), (5, False), (5, True), (80, False), (80, True))]
     highest = json.loads(reverse_output.read_text())
     assert highest["prefill_vv_drop_order"] == "highest"
+    assert highest["tile_size"] == 128
     assert highest["variant_labels"]["prefill_drop_80"] == "Highest T→V frequency drop 80%"
 
 

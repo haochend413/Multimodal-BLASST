@@ -267,6 +267,8 @@ def main() -> None:
                        metavar="PERCENTS", help="compare frequency and random V→V query-row drop rates")
     parser.add_argument("--prefill-vv-lambda-sweep", metavar="LAMBDAS",
                         help="sweep prefill lambdas across all --prefill-vv-drop-sweep percentages")
+    parser.add_argument("--prefill-tile-size", type=int, choices=(32, 64, 128, 256),
+                        help="square prefill tile size for --prefill-vv-drop-sweep (default: 128)")
     parser.add_argument("--prefill-vv-drop-highest", action="store_true",
                         help="drop highest-frequency rows first in the prefill frequency arm")
     tv_vv.add_argument("--decode-tv-drop-sweep", nargs="?", const="5,10,20,25,35,50,60,75,80,90,95,99,99.5,99.9",
@@ -355,6 +357,8 @@ def main() -> None:
     decode_drop_study = args.decode_tv_drop_sweep is not None
     decode_link_study = args.decode_visual_links or args.decode_visual_history_study or decode_drop_study
     drop_study = args.prefill_vv_drop_sweep is not None
+    if args.prefill_tile_size is not None and not drop_study:
+        parser.error("--prefill-tile-size requires --prefill-vv-drop-sweep")
     if drop_study or decode_drop_study:
         option = "decode_tv_drop_sweep" if decode_drop_study else "prefill_vv_drop_sweep"
         try:
@@ -676,6 +680,7 @@ def _collect_prefill_lambda_sweep(args, parser, samples):
         prefill_vv_lambda_sweep=args.prefill_vv_lambda_sweep,
         prefill_vv_drop_sweep=args.prefill_vv_drop_sweep,
         prefill_vv_drop_order="highest" if args.prefill_vv_drop_highest else "lowest",
+        prefill_tile_size=args.prefill_tile_size or ba.TILE, decode_tile_size=ba.TILE,
         decode_lambda=args.decode_lambda, random_seed=args.random_seed, sample_index=args.sample_index,
         pairs_requested=len(samples),
         reports={}, summary={},
@@ -742,7 +747,8 @@ def _run_tv_vv_sweep(args, parser, samples):
         variants.extend((str(value), value) for value in args.tv_vv_sweep)
     else:
         variants.append((f"top_{top_percent:g}", top_percent))
-    report = dict(schema=TV_VV_SCHEMA, model=args.model, synthetic=args.demo, tile_size=ba.TILE,
+    report = dict(schema=TV_VV_SCHEMA, model=args.model, synthetic=args.demo,
+                  tile_size=getattr(args, "prefill_tile_size", None) or ba.TILE,
                   blasst_lambda=args.lam, decode_lambda=args.decode_lambda, pairs_requested=len(samples),
                   answer_metric="normalized full-response exact match to any supplied reference",
                   variants=dict(variants), cases=[])
@@ -1167,7 +1173,8 @@ def _attach_study(args, recorder):
               or getattr(args, "prefill_vv_drop_sweep", None))
     if (args.tv_vv_threshold is not None or top_percent is not None or token_percent is not None or paired
             or args.matched_region_study or args.gate_distribution):
-        ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, ba.TILE, args.tv_vv_threshold,
+        tile_size = getattr(args, "prefill_tile_size", None) or ba.TILE
+        ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, tile_size, args.tv_vv_threshold,
                                             replay=getattr(args, "gate_replay", None), top_percent=top_percent,
                                             token_percent=token_percent, token_gate=getattr(args, "token_gate", None),
                                             token_drop_percent=getattr(args, "token_drop_percent", None),
