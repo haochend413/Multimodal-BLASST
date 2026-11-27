@@ -16,10 +16,12 @@ DECODE_HISTORY_COUNTS = ("decode_generated_history_head_steps",)
 class DecodeVisualLinks:
     """Own per-prompt boolean masks indexed by layer, head, position, and visual tile."""
 
-    def __init__(self, visual, tile_size, *, extend_history=False):
+    def __init__(self, visual, tile_size, *, extend_history=False, budgets=None, collect_counts=True):
         self.visual = visual.bool().cpu()
         self.tile_size = tile_size
         self.extend_history = extend_history
+        self.budgets = budgets
+        self.collect_counts = collect_counts
         self.layers = {}
         self.counts = Counter(dict.fromkeys(DECODE_LINK_COUNTS, 0))
         if extend_history:
@@ -61,7 +63,6 @@ class DecodeVisualLinks:
         heads, length = query.shape[1], key.shape[-2]
         device = query.device
         prompt_length = len(self.visual)
-        n_tiles = (length + self.tile_size - 1) // self.tile_size
         links, history, visual_positions, visual_tiles, visual_columns = self.layers[layer]
         history_length = history.shape[1]
         if self.extend_history and history_length != length - 1:
@@ -99,6 +100,8 @@ class DecodeVisualLinks:
         fallback = ~usable.any(-1)
         selected = (links & usable.unsqueeze(-1)).any(dim=1)
         visual_allowed = allowed[:, visual_positions]
+        if self.budgets is not None:
+            selected, fallback = self.budgets.select(layer, visual_allowed, visual_columns, selected, fallback)
         compute = visual_allowed & (selected[:, visual_columns] | fallback[:, None])
         visual_heads, visual_keys = compute.nonzero(as_tuple=True)
         columns = visual_positions[visual_keys]
@@ -116,25 +119,28 @@ class DecodeVisualLinks:
 
         pair_tiles = score_tiles(scores, allowed_positions)
         skip = ~torch.isfinite(pair_tiles.amax(-1))
-        flags = [visual_allowed, compute]
+        flags = [visual_allowed, compute] if self.collect_counts else []
         if self.extend_history:
             flags.append(visual_kept & torch.isfinite(full[:, visual_positions]))
-        source = torch.stack(flags).int()
-        tile_flags = torch.zeros((len(flags), heads, n_tiles), dtype=torch.int32, device=device)
-        tile_flags.scatter_reduce_(2, visual_tiles[visual_columns].expand_as(source), source, reduce="amax")
-        eligible_tiles, computed_tiles = tile_flags[:2].sum(dim=(1, 2)).tolist()
-        eligible_keys = int(visual_allowed.sum())
-        self.counts.update(dict(zip(DECODE_LINK_COUNTS, (
-            heads, int(fallback.sum()), eligible_tiles, eligible_tiles - computed_tiles,
-            eligible_keys, eligible_keys - len(columns),
-        ))))
+        if flags:
+            source = torch.stack(flags).int()
+            tile_flags = torch.zeros((len(flags), *selected.shape), dtype=torch.int32, device=device)
+            tile_flags.scatter_reduce_(2, visual_columns.expand_as(source), source, reduce="amax")
+        if self.collect_counts:
+            eligible_tiles, computed_tiles = tile_flags[:2].sum(dim=(1, 2)).tolist()
+            eligible_keys = int(visual_allowed.sum())
+            self.counts.update(dict(zip(DECODE_LINK_COUNTS, (
+                heads, int(fallback.sum()), eligible_tiles, eligible_tiles - computed_tiles,
+                eligible_keys, eligible_keys - len(columns),
+            ))))
         if self.extend_history:
             # Save the final visual decisions at this query's KV-cache position.
-            current_links = tile_flags[2].index_select(-1, visual_tiles).bool()
+            current_links = tile_flags[-1].bool()
             self.layers[layer] = (
                 torch.cat((links, current_links.unsqueeze(1)), dim=1),
                 torch.cat((history, visual_allowed.any(-1, keepdim=True)), dim=1),
                 visual_positions, visual_tiles, visual_columns,
             )
-            self.counts["decode_generated_history_head_steps"] += int(usable[:, prompt_length:].any(-1).sum())
+            if self.collect_counts:
+                self.counts["decode_generated_history_head_steps"] += int(usable[:, prompt_length:].any(-1).sum())
         return output.unsqueeze(0), skip

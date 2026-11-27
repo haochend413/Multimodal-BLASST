@@ -106,3 +106,30 @@ def test_binary_phase_study_uses_ordinary_blasst_in_the_other_phase(monkeypatch,
         assert pipeline.counts["prefill_tv_qk_pairs_bypassed"] == 0
         assert pipeline.counts["decode_tv_qk_pairs_bypassed"] > 0
     assert pipeline.counts["prefill_vv_qk_pairs_bypassed"] == 0
+
+
+def test_prefill_diagnostics_detect_newly_important_visual_tile(monkeypatch):
+    monkeypatch.setattr(ba, "TILE", 2)
+    monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.1))
+    monkeypatch.setitem(ba.STATE, "collect_stats", False)
+    visual = torch.tensor([False, False, True, True, True, True, False, False])
+    q = torch.ones(1, 1, 8, 1)
+    v = torch.arange(8.).view_as(q)
+    first_k = torch.tensor([1., 1., 8., 8., 1., 1., 1., 1.]).view_as(q)
+    next_k = torch.tensor([1., 1., 8., 8., 20., 20., 1., 1.]).view_as(q)
+    outputs = []
+    for all_candidates in (False, True):
+        pipeline = BinaryTVPipeline(visual, 2, gate_vv=False, guide_decode=False,
+                                    all_candidates=all_candidates, audit_candidates=not all_candidates)
+        monkeypatch.setitem(ba.STATE, "binary_tv_pipeline", pipeline)
+        ba.blasst_attention_forward(SimpleNamespace(layer_idx=0), q, first_k, v, None, scaling=1.)
+        result, _ = ba.blasst_attention_forward(SimpleNamespace(layer_idx=1), q, next_k, v, None, scaling=1.)
+        outputs.append(result)
+        if not all_candidates:
+            audit = pipeline.candidate_audit[1]
+            assert audit["full_candidate_tv_keeps"] == 4
+            assert audit["missed_tv_keeps"] == 2
+            assert audit["lost_attention_mass"] > 1.9
+        else:
+            assert pipeline.counts["prefill_tv_qk_pairs_bypassed"] == 0
+    assert not torch.allclose(outputs[0][:, -2:], outputs[1][:, -2:])

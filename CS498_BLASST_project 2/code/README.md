@@ -340,6 +340,96 @@ bypass, fallback, and how often at least one generated text key contributed its
 stored history (`decode_generated_history_head_steps`). Omit
 `--sample-count 50` to use all 600 questions.
 
+#### Binary prefill/decode, matched random, and ModelOpt timing
+
+From the project directory on a CUDA node, define a runner for the two existing manifests:
+
+```bash
+manifests="$HOME/blasst-results"
+results="$manifests/binary-mask-experiments"
+mkdir -p "$results"
+run_binary() {
+  local benchmark="$1" cases="$2" tokens="$3" report="$4" manifest
+  shift 4
+  case "$benchmark" in
+    vqav2) manifest="$manifests/vqav2-random-val-1000-seed20261124.json" ;;
+    vizwiz-lf) manifest="$manifests/vizwiz-lf-600.json" ;;
+    *) return 2 ;;
+  esac
+  python code/attention_study.py --benchmark "$benchmark" --manifest "$manifest" \
+    --sample-count "$cases" --decode-tokens "$tokens" --lambda 0.1 --decode-lambda 0.1 \
+    --output "$results/$benchmark-$report.json" "$@"
+}
+
+run_binary vqav2 1000 16 binary-random --binary-mask-study --matched-random
+run_binary vizwiz-lf 600 128 binary-random --binary-mask-study --matched-random
+```
+
+Each report compares original BLASST, binary prefill V→V query gating, growing-history
+decode T→V gating, and both gates together. Prefill keeps a visual query for V→V
+if any text query kept its visual key in the preceding layer. Decode uses
+T→T to select cached text keys and takes the union of their binary visual masks,
+including masks appended during earlier decode steps. Omit `--matched-random` for
+the four guided/baseline variants alone, or change `--random-seed` to replicate the
+random control. VQA uses official consensus scoring and VizWiz-LF uses ROUGE-L.
+
+The random controls record the guided budgets on each question, then replay a
+random assignment in the same variant. Prefill matches the number of dropped
+visual query rows and the causal V→V pairs they cover per layer. The constrained
+draw is allowed to repeat the guided mask and is not uniform over all feasible
+masks. Decode preserves the number of visual tiles and individual visual keys
+computed per layer, head, and decode step by sampling within equal-width tiles,
+with the guided fallback pattern held fixed. A longer random rollout reuses the
+last guided budget or uses ordinary decode fallback if guided generated only
+one token. The report counts unmatched head steps in both directions, since
+different answers can stop at different lengths. The report also counts how
+many row and tile positions were actually reassigned by randomization. Read the random arms'
+`*_delta_vs_guided_pp` fields along with their QK budgets and generated lengths.
+For restartable accuracy runs, pass both `--vqa-shards` and `--vqa-shard-index`
+with a unique output name per shard.
+
+For batch-one GPU timing, install the ModelOpt simulator in the CUDA environment
+and run a separate fixed-length pass on the same manifests:
+
+```bash
+python -m pip install 'nvidia-modelopt[hf]==0.47.0'
+run_binary vqav2 20 16 binary-timing --binary-mask-study --time-modelopt
+run_binary vizwiz-lf 20 128 binary-timing --binary-mask-study --time-modelopt
+jq '.latency' "$results/vizwiz-lf-binary-timing.json"
+```
+
+The timing pass compares the same four attention variants plus ModelOpt's
+PyTorch FlashSkipSoftmax simulator, applied to the same model's language
+attention at the same phase lambdas. It measures synchronized
+`model.generate` wall time on one GPU after one warm-up per variant. Time to
+first token includes the vision encoder and the first-token prediction, and
+excludes input preprocessing. The JSON reports p50/p95 first-token, decode,
+and total latency, plus aggregate batch-one output and decode tokens per
+second. Fixed output lengths isolate timing from EOS and are used for timing
+only. ModelOpt computes dense QK before masking, and the repository variants
+are PyTorch implementations with mask construction and gathering overhead.
+The measurements characterize these implementations on the recorded GPU.
+
+To diagnose cross-layer T→T → T→V in prefill, run:
+
+```bash
+run_binary vqav2 100 16 tv-prefill-diagnostics --binary-tv-prefill-diagnostics
+run_binary vizwiz-lf 100 128 tv-prefill-diagnostics --binary-tv-prefill-diagnostics
+jq '.summary' "$results/vqav2-tv-prefill-diagnostics.json"
+```
+
+All three diagnostic variants use ordinary BLASST in decode. Compare original
+BLASST, linked prefill, and the same staged prefill computation with all causal
+visual candidates admitted to the T→V score test. The last contrast isolates
+candidate filtering; the comparison with original BLASST includes the change to
+the staged decision rule. The linked variant also computes a shadow reference
+on the same Q/K activations. Read `missed_tv_keeps / full_candidate_tv_keeps` for
+visual links excluded before the score test, and
+`lost_attention_mass / text_query_head_rows_with_vision` for the mean share of
+staged softmax mass on excluded visual keys. The per-layer audit also counts
+text head/query rows with usable history but an empty candidate union
+(`empty_link_rows`). The shadow scores do not participate in generation.
+
 #### Binary T→T → T→V → V→V pipeline
 
 ```bash

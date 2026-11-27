@@ -18,6 +18,9 @@ import torch
 import blasst_attn as ba
 from answer_benchmarks import ANSWER_BENCHMARKS, VQAV2
 from binary_tv_pipeline import BinaryTVPipeline
+from binary_phase_controls import (
+    DecodeBudgets, case_rng, latency_summary, modelopt_attention, random_prefill_gate, timed_generation,
+)
 from decode_visual_links import DecodeVisualLinks
 from jl_blasst import JLPrecheck, JLStudy, ProjectedJLStudy, VISUAL_KEY_QUERY_SPLIT
 from jl_gap_study import JLGapStudy, merge_sweeps
@@ -270,6 +273,15 @@ def main() -> None:
                        help="compare BLASST, binary T→T-guided T→V, and the full T→V-guided V→V pipeline")
     tv_vv.add_argument("--binary-tv-phase-study", action="store_true",
                        help="compare BLASST with prefill-only and decode-only binary T→T-guided T→V")
+    tv_vv.add_argument("--binary-mask-study", action="store_true",
+                       help="compare binary prefill V→V, growing decode T→V, and their combination")
+    tv_vv.add_argument("--binary-tv-prefill-diagnostics", action="store_true",
+                       help="compare linked and all-candidate staged T→V prefill")
+    parser.add_argument("--matched-random", action="store_true",
+                        help="add seeded random masks matched to guided QK budgets")
+    parser.add_argument("--random-seed", type=int, default=20261126)
+    parser.add_argument("--time-modelopt", action="store_true",
+                        help="benchmark fixed-length generation against ModelOpt's PyTorch simulator")
     parser.add_argument("--vqa-accuracy", "--score-answers", action="store_true",
                         help="score paired predictions using the selected benchmark's metric")
     parser.add_argument("--matched-region-study", action="store_true",
@@ -325,9 +337,15 @@ def main() -> None:
         args.decode_tokens = args.answer_protocol.decode_tokens
     if args.answer_protocol is not VQAV2:
         args.vqa_accuracy = True
-    binary_study = args.binary_tv_pipeline or args.binary_tv_phase_study
+    binary_study = args.binary_tv_pipeline or args.binary_tv_phase_study or args.binary_tv_prefill_diagnostics
+    if (args.matched_random or args.time_modelopt) and not args.binary_mask_study:
+        parser.error("--matched-random and --time-modelopt require --binary-mask-study")
+    if args.matched_random and args.time_modelopt:
+        parser.error("run matched random accuracy and fixed-length timing separately")
+    if args.time_modelopt and args.vqa_shards is not None:
+        parser.error("run --time-modelopt as one process on one GPU")
     decode_link_study = args.decode_visual_links or args.decode_visual_history_study
-    query_study = args.prefill_visual_query_study
+    query_study = args.prefill_visual_query_study or args.binary_mask_study
     if decode_link_study or binary_study or query_study:
         flag = "--decode-visual-links"
         if args.decode_visual_history_study:
@@ -336,7 +354,15 @@ def main() -> None:
             flag = "--binary-tv-phase-study" if args.binary_tv_phase_study else "--binary-tv-pipeline"
         if query_study:
             flag = "--prefill-visual-query-study"
-        minimum = 1 if query_study else 2
+        if args.binary_tv_prefill_diagnostics:
+            flag = "--binary-tv-prefill-diagnostics"
+        if args.binary_mask_study:
+            flag = "--binary-mask-study"
+        minimum = 1 if args.prefill_visual_query_study else 2
+        if (args.binary_mask_study or args.binary_tv_prefill_diagnostics) and (
+            not 0 < args.lam <= 1 or not 0 < (args.lam if args.decode_lambda is None else args.decode_lambda) <= 1
+        ):
+            parser.error(f"{flag} requires positive prefill and decode lambdas in (0, 1]")
         if not args.manifest or args.demo or args.decode_tokens < minimum:
             parser.error(f"{flag} requires a benchmark manifest and --decode-tokens of at least {minimum}")
         if (args.matched_region_study or args.gate_distribution or args.prefill_region_max
@@ -608,10 +634,23 @@ def _run_tv_vv_sweep(args, parser, samples):
     extend_decode_links = getattr(args, "decode_visual_history_study", False)
     decode_links = getattr(args, "decode_visual_links", False) or extend_decode_links
     phase_study = getattr(args, "binary_tv_phase_study", False)
-    binary = getattr(args, "binary_tv_pipeline", False) or phase_study
+    diagnostics = getattr(args, "binary_tv_prefill_diagnostics", False)
+    binary = getattr(args, "binary_tv_pipeline", False) or phase_study or diagnostics
+    mask_study = getattr(args, "binary_mask_study", False)
+    timing = getattr(args, "time_modelopt", False)
+    matched_random = getattr(args, "matched_random", False)
     query_study = getattr(args, "prefill_visual_query_study", False)
     variants = [("baseline", None)]
-    if query_study:
+    if mask_study:
+        variants.extend((("prefill_binary", "prefill"), ("decode_binary", "decode"),
+                         ("combined_binary", "combined")))
+        if matched_random:
+            variants.extend((f"{name}_random", phase) for name, phase in tuple(variants[1:]))
+        if timing:
+            variants.append(("modelopt_simulator", None))
+    elif diagnostics:
+        variants.extend((("linked_prefill", "prefill"), ("all_candidate_prefill", "all_candidate")))
+    elif query_study:
         variants.extend((("visual_vv_only", "vv"), ("whole_visual_query", "whole")))
     elif phase_study:
         variants.extend((("binary_tv_prefill", "prefill"), ("binary_tv_decode", "decode")))
@@ -636,7 +675,32 @@ def _run_tv_vv_sweep(args, parser, samples):
         report[f"{phase}_max_policies"] = {
             name: "shared" if threshold is None else "per_region" for name, threshold in variants
         }
-    if query_study:
+    if mask_study:
+        report["binary_mask_study"] = True
+        report.update(image_max_pixels=args.image_max_pixels, max_prompt_tokens=args.max_tokens)
+        report["variant_labels"] = {
+            "baseline": "Original BLASST", "prefill_binary": "Binary V→V prefill only",
+            "decode_binary": "Growing T→V decode only", "combined_binary": "Binary prefill and decode",
+        }
+        if matched_random:
+            report["random_seed"] = args.random_seed
+            report["variant_labels"].update({name: f"Matched random ({phase})"
+                                             for name, phase in variants if name.endswith("_random")})
+        if timing:
+            from importlib.metadata import version
+
+            modelopt_attention(args.lam, args.decode_lambda or args.lam, ba.TILE)
+            report["variant_labels"]["modelopt_simulator"] = "ModelOpt PyTorch simulator"
+            report["timing"] = dict(batch_size=1, warmup_requests_per_variant=1,
+                                    forced_new_tokens=args.decode_tokens, gpu=torch.cuda.get_device_name(),
+                                    torch=torch.__version__, modelopt=version("nvidia-modelopt"))
+    elif diagnostics:
+        report["binary_tv_pipeline"] = True
+        report["binary_tv_prefill_diagnostics"] = True
+        report.update(image_max_pixels=args.image_max_pixels, max_prompt_tokens=args.max_tokens)
+        report["variant_labels"] = {"baseline": "Original BLASST", "linked_prefill": "Linked T→V prefill",
+                                    "all_candidate_prefill": "Staged prefill with all visual candidates"}
+    elif query_study:
         report["prefill_visual_query_study"] = True
         report["variant_labels"] = {"baseline": "Original BLASST", "visual_vv_only": "Bypass V→V only",
                                     "whole_visual_query": "Bypass whole visual query"}
@@ -661,13 +725,13 @@ def _run_tv_vv_sweep(args, parser, samples):
             report["token_top_k"] = True
         for phase in ("prefill", "decode"):
             report[f"{phase}_max_policies"] = dict.fromkeys(dict(variants), "shared")
-    measured_phases = ("prefill", "decode") if has_top_k or decode_links or binary or query_study else region_phases
+    measured_phases = ("prefill", "decode") if has_top_k or decode_links or binary or query_study or mask_study else region_phases
     if args.vqa_accuracy:
         report["answer_metric"] = protocol.metric
-        if protocol is not VQAV2:
+        if protocol is not VQAV2 or mask_study or diagnostics:
             report["benchmark"] = protocol.name
         report["answer_protocol"] = dict(instruction=protocol.instruction,
-                                         max_new_tokens=args.decode_tokens, min_new_tokens=0)
+                                         max_new_tokens=args.decode_tokens, min_new_tokens=args.decode_tokens if timing else 0)
     shard = getattr(args, "vqa_shard", None)
     if shard:
         report.update(vqa_shard=shard, image_max_pixels=args.image_max_pixels, max_prompt_tokens=args.max_tokens)
@@ -689,9 +753,10 @@ def _run_tv_vv_sweep(args, parser, samples):
             if not shard:
                 case.update(question=benchmark["question_text"], reference_answers=references)
         query_gate = None
+        guided_traces = {}
         for name, value in variants:
             # An ungated vote trace provides the baseline's causal V→V denominator.
-            threshold = value if not (has_top_k or decode_links or binary or query_study) else None
+            threshold = value if not (has_top_k or decode_links or binary or query_study or mask_study) else None
             run = argparse.Namespace(**dict(vars(args), sample_index=index, tv_vv_threshold=threshold,
                                             tv_vv_top_percent=value if top_percent is not None else None,
                                             tv_vv_token_percent=value if token_percent is not None else None,
@@ -702,6 +767,22 @@ def _run_tv_vv_sweep(args, parser, samples):
                                             gate_replay=query_gate if name == "whole_visual_query" else None,
                                             binary_tv_pipeline=binary,
                                             binary_tv_mode=value if binary else None))
+            if mask_study:
+                prefill = value in ("prefill", "combined")
+                decode = value in ("decode", "combined")
+                run.token_gate = "vv" if prefill else None
+                run.pipeline_decode_links = decode
+                run.use_modelopt = name == "modelopt_simulator"
+                run.decode_budgets = None
+                if matched_random and not name.endswith("_random") and decode:
+                    run.decode_budgets = DecodeBudgets()
+                if name.endswith("_random"):
+                    guided = guided_traces[name.removesuffix("_random")]
+                    rng = case_rng(args.random_seed, index, name)
+                    if prefill:
+                        run.gate_replay = random_prefill_gate(guided["visual_positions"], guided["prefill_gate"], rng)
+                    if decode:
+                        run.decode_budgets = DecodeBudgets(rng, guided["decode_budgets"])
             for phase in region_phases:
                 setattr(run, f"{phase}_region_max", threshold is not None)
             if sample:
@@ -709,9 +790,33 @@ def _run_tv_vv_sweep(args, parser, samples):
             if args.vqa_accuracy:
                 run.question = f"{benchmark['question_text']}\n{protocol.instruction}"
             before = {phase: ba.STATE["phase_stats"].get(phase, {}).copy() for phase in measured_phases}
+            if timing and index == args.sample_index:
+                collect(run, parser, benchmark, sample_id)
             metadata = collect(run, parser, benchmark, sample_id)
-            if binary:
+            if mask_study:
+                trace = metadata.get("timing", {}) if timing else {
+                    **metadata.get("tv_guided_vv", {}), **metadata.get("decode_visual_links", {}),
+                }
+                trace.update(metadata.get("timing", {}))
+                if matched_random and value and not name.endswith("_random"):
+                    guided_traces[name] = metadata
+                if name.endswith("_random") and run.gate_replay is not None:
+                    trace["random_prefill_rows_reassigned"] = sum(
+                        len(set(dropped) - set(guided["prefill_gate"][layer]))
+                        for layer, dropped in run.gate_replay.items()
+                    )
+                if name.endswith("_random") and run.decode_budgets is not None:
+                    trace["random_decode_tiles_reassigned"] = run.decode_budgets.tiles_reassigned
+                    trace["random_decode_unmatched_head_steps"] = run.decode_budgets.tail_head_steps
+                    trace["random_decode_guided_only_head_steps"] = sum(
+                        (len(rows) - len(run.decode_budgets.steps[layer])) * len(rows[0][0])
+                        for layer, rows in run.decode_budgets.source.steps.items()
+                        if len(rows) > len(run.decode_budgets.steps[layer])
+                    )
+            elif binary:
                 trace = metadata.get("binary_tv_pipeline", {})
+                if diagnostics and "candidate_audit" in metadata:
+                    trace["candidate_audit"] = metadata["candidate_audit"]
             elif decode_links:
                 trace = metadata.get("decode_visual_links", {})
             else:
@@ -723,6 +828,9 @@ def _run_tv_vv_sweep(args, parser, samples):
                 elif observed_gate != query_gate:
                     raise ValueError("The whole-query gate differs from the recorded V→V-only mask")
                 trace = {key: item for key, item in trace.items() if key != "layers"}
+            if timing:
+                case["results"][name] = dict(trace, generated_tokens=metadata["generated_tokens"])
+                continue
             answer = metadata.get("answer")
             normalized = _normalized_answer(answer) if answer is not None else None
             result = dict(answer=answer, **trace)
@@ -732,7 +840,7 @@ def _run_tv_vv_sweep(args, parser, samples):
                 after = ba.STATE["phase_stats"].get(phase, {})
                 result[f"{phase}_tiles"] = after.get("causal", 0) - before[phase].get("causal", 0)
                 result[f"{phase}_tiles_skipped"] = after.get("skipped", 0) - before[phase].get("skipped", 0)
-                if phase == "prefill" and (has_top_k or query_study):
+                if phase == "prefill" and (has_top_k or query_study or mask_study):
                     result["prefill_qk_bypassed"] = after.get("qk_bypassed", 0) - before[phase].get("qk_bypassed", 0)
             if args.vqa_accuracy:
                 result[protocol.case_score] = protocol.score(answer, references)
@@ -757,18 +865,29 @@ def _run_tv_vv_sweep(args, parser, samples):
                     for suffix in ("tiles", "tiles_skipped"):
                         key = f"{phase}_{suffix}"
                         totals[name][key] += result[key]
-        if args.vqa_accuracy:
+        if args.vqa_accuracy and not timing:
             vqa_shards.accumulate(totals, case, protocol=protocol)
         report["cases"].append(case)
         done = len(report["cases"])
         if not shard or done % vqa_shards.CHECKPOINT_INTERVAL == 0 or done == len(samples):
-            report["summary"] = vqa_shards.summarize(totals, protocol=protocol) if args.vqa_accuracy else totals
+            if timing:
+                report["latency"] = latency_summary(report["cases"], dict(variants))
+            else:
+                report["summary"] = vqa_shards.summarize(totals, protocol=protocol) if args.vqa_accuracy else totals
             write_json(args.output, report)
             policy = "binary pipeline" if binary else "decode visual links" if decode_links else "T→V-guided V→V"
             if query_study:
                 policy = "visual-query gates"
+            if mask_study:
+                policy = "binary prefill and decode gates"
             print(f"Compared {policy} for {done}/{len(samples)} cases", flush=True)
     print(f"Wrote paired attention report to {args.output}")
+    if timing:
+        for name, stats in report["latency"].items():
+            print(f"{name}: median first token {stats['first_token_seconds_p50'] * 1000:.1f} ms · "
+                  f"median request {stats['generation_seconds_p50'] * 1000:.1f} ms · "
+                  f"decode {stats['decode_tokens_per_second']:.2f} tokens/s")
+        return
     if args.vqa_accuracy:
         if not shard:
             predictions = {
@@ -878,11 +997,15 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
     old_binary = ba.STATE["binary_tv_pipeline"]
     old_regions = ba.STATE["prefill_region_max"], ba.STATE["decode_region_max"]
     precision = torch.get_float32_matmul_precision()
+    old_collect_stats = ba.STATE["collect_stats"]
     try:
+        if getattr(args, "time_modelopt", False):
+            ba.STATE["collect_stats"] = False
         if args.jl_probe is not None or args.jl_sweep:
             torch.set_float32_matmul_precision("highest")
         return _collect(args, parser, benchmark, sample_id, score_stream)
     finally:
+        ba.STATE["collect_stats"] = old_collect_stats
         ba.STATE["observer"], ba.STATE["qkv_hook"] = old_observers
         ba.STATE["vv_prefix_visual"] = old_prefix
         ba.STATE["tv_guided_vv"] = old_tv_vv
@@ -894,12 +1017,29 @@ def collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None = 
 
 
 def _attach_study(args, recorder):
+    if getattr(args, "binary_mask_study", False):
+        ba.STATE["observer"] = ba.STATE["qkv_hook"] = None
+        if args.use_modelopt:
+            ba.STATE["qkv_hook"] = modelopt_attention(args.lam, args.decode_lambda or args.lam, ba.TILE)
+        if args.token_gate:
+            ba.STATE["tv_guided_vv"] = TVGuidedVV(
+                recorder.visual, ba.TILE, None, replay=args.gate_replay, token_gate=args.token_gate,
+            )
+        if args.pipeline_decode_links:
+            ba.STATE["decode_visual_links"] = DecodeVisualLinks(
+                recorder.visual, ba.TILE, extend_history=True, budgets=args.decode_budgets,
+                collect_counts=not args.time_modelopt,
+            )
+        return None
     if getattr(args, "binary_tv_pipeline", False):
         if args.binary_tv_mode is not None:
-            ba.STATE["binary_tv_pipeline"] = BinaryTVPipeline(recorder.visual, ba.TILE,
-                                                               gate_vv=args.binary_tv_mode == "tv_vv",
-                                                               guide_prefill=args.binary_tv_mode != "decode",
-                                                               guide_decode=args.binary_tv_mode != "prefill")
+            mode = args.binary_tv_mode
+            ba.STATE["binary_tv_pipeline"] = BinaryTVPipeline(
+                recorder.visual, ba.TILE, gate_vv=mode == "tv_vv",
+                guide_prefill=mode != "decode", guide_decode=mode not in ("prefill", "all_candidate"),
+                all_candidates=mode == "all_candidate",
+                audit_candidates=mode == "prefill" and getattr(args, "binary_tv_prefill_diagnostics", False),
+            )
         ba.STATE["observer"] = ba.STATE["qkv_hook"] = None
         return None
     if getattr(args, "decode_visual_link_study", False):
@@ -1050,8 +1190,11 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
             ba.STATE["vv_prefix_visual"] = visual.to(inputs.input_ids.device)
         ba.STATE["observer"] = None if args.jl_live else recorder.observe
         jl_study = _attach_study(args, recorder)
+        timing = {}
         with torch.inference_mode():
-            if args.vqa_accuracy:
+            if getattr(args, "time_modelopt", False):
+                generated, timing = timed_generation(model, inputs, args.decode_tokens)
+            elif args.vqa_accuracy:
                 generated = model.generate(**inputs, max_new_tokens=args.decode_tokens,
                                            min_new_tokens=0, do_sample=False)
             else:
@@ -1061,11 +1204,28 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
                     "generated_tokens": generated.shape[-1] - length,
                     **media_metadata,
                     "answer": processor.tokenizer.decode(generated[0, length:], skip_special_tokens=True)}
+    if getattr(args, "binary_mask_study", False):
+        metadata["timing"] = timing
+        if args.time_modelopt:
+            return metadata
+        if (policy := ba.STATE["tv_guided_vv"]) is not None:
+            metadata["tv_guided_vv"] = {
+                key: sum(layer[key] for layer in policy.layers) for key in TOKEN_GATE_COUNTS
+            }
+            if args.matched_random and args.gate_replay is None:
+                metadata["visual_positions"] = visual.nonzero().flatten().tolist()
+                metadata["prefill_gate"] = {row["layer"]: row["dropped_token_positions"] for row in policy.layers}
+        if (links := ba.STATE["decode_visual_links"]) is not None:
+            metadata["decode_visual_links"] = dict(links.counts)
+            metadata["decode_budgets"] = args.decode_budgets
+        return metadata
     if args.score_distributions:
         return metadata
     if getattr(args, "binary_tv_pipeline", False):
         if (binary := ba.STATE["binary_tv_pipeline"]) is not None:
             metadata["binary_tv_pipeline"] = dict(binary.counts)
+            if binary.candidate_audit:
+                metadata["candidate_audit"] = binary.candidate_audit
         return metadata
     if getattr(args, "decode_visual_link_study", False):
         if (links := ba.STATE["decode_visual_links"]) is not None:

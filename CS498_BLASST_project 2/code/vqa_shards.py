@@ -17,9 +17,11 @@ CHECKPOINT_INTERVAL = 25
 MAX_POLICIES = ("prefill_max_policies", "decode_max_policies")
 TILE_COUNTS = ("prefill_tiles", "prefill_tiles_skipped", "decode_tiles", "decode_tiles_skipped",
                "prefill_qk_bypassed", *DECODE_LINK_COUNTS, *DECODE_HISTORY_COUNTS, *TOKEN_GATE_COUNTS,
-               *VISUAL_QUERY_COUNTS, *BINARY_TV_COUNTS)
+               *VISUAL_QUERY_COUNTS, *BINARY_TV_COUNTS,
+               "random_decode_unmatched_head_steps", "random_decode_guided_only_head_steps",
+               "random_prefill_rows_reassigned", "random_decode_tiles_reassigned")
 CASE_FIELDS = ("answer", "vqa_score", "rouge_l", "generated_tokens", "pure_vv_tiles", "vv_tiles_bypassed",
-               "answer_changed", *TILE_COUNTS)
+               "answer_changed", "candidate_audit", *TILE_COUNTS)
 PROTOCOLS_BY_METRIC = {protocol.metric: protocol for protocol in ANSWER_BENCHMARKS.values()}
 
 
@@ -77,6 +79,17 @@ def accumulate(totals, case, *, reference="baseline", protocol=VQAV2):
         for key in ("pure_vv_tiles", "vv_tiles_bypassed", *TILE_COUNTS):
             if key in result:
                 counts[key] += result[key]
+        if audit := result.get("candidate_audit"):
+            by_layer = counts.setdefault("candidate_audit", {})
+            for layer, data in audit.items():
+                layer_totals = by_layer.setdefault(str(layer), defaultdict(int))
+                for key, value in data.items():
+                    layer_totals[key] += value
+        if name.endswith("_random") and name.removesuffix("_random") in case["results"]:
+            guided_score = case["results"][name.removesuffix("_random")][protocol.case_score]
+            counts[f"{protocol.prefix}_guided_score_sum"] += guided_score
+            counts[f"{protocol.prefix}_better_than_guided"] += score > guided_score
+            counts[f"{protocol.prefix}_worse_than_guided"] += score < guided_score
         if "generated_tokens" in result:
             counts["generated_tokens"] += result["generated_tokens"]
             counts["generation_lengths_recorded"] += 1
@@ -97,6 +110,9 @@ def summarize(totals, *, reference="baseline", protocol=VQAV2):
         if observed := totals_for_variant.get("generation_lengths_recorded"):
             summary[name]["mean_generated_tokens"] = totals_for_variant["generated_tokens"] / observed
             summary[name]["mean_decode_steps"] = totals_for_variant["decode_steps"] / observed
+        if f"{protocol.prefix}_guided_score_sum" in totals_for_variant:
+            guided_score = totals_for_variant[f"{protocol.prefix}_guided_score_sum"] / totals_for_variant["answers_scored"]
+            summary[name][f"{protocol.prefix}_delta_vs_guided_pp"] = score - guided_score
         if name != reference:
             summary[name][f"{protocol.prefix}_delta_pp"] = score - baseline
     if "whole_visual_query" in summary and "visual_vv_only" in summary:
@@ -127,7 +143,8 @@ def merge(paths, output):
             raise ValueError(f"{path} is not a VQA shard report")
         expected_config = {key: report[key] for key in config_keys}
         for key in (*MAX_POLICIES, "benchmark", "variant_labels", "decode_visual_link_study", "token_top_k",
-                    "binary_tv_pipeline", "prefill_visual_query_study"):
+                    "binary_tv_pipeline", "prefill_visual_query_study", "binary_mask_study",
+                    "binary_tv_prefill_diagnostics", "random_seed"):
             if key in report:
                 expected_config[key] = report[key]
         expected_manifest = {key: shard[key] for key in ("count", "manifest_questions", "manifest_sha256")}

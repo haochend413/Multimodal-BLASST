@@ -1,0 +1,112 @@
+from argparse import Namespace
+from itertools import combinations
+from random import Random
+
+import torch
+
+import attention_study as study
+from binary_phase_controls import DecodeBudgets, random_prefill_gate
+
+
+def test_random_prefill_preserves_exact_row_and_pair_budgets():
+    visual_positions = [3, 4, 5, 6, 8, 9]
+    ranks = {position: i for i, position in enumerate(visual_positions, 1)}
+    rng = Random(10)
+    guided = {i: rows for i, rows in enumerate(
+        rows for count in range(7) for rows in combinations(visual_positions, count)
+    )}
+    random = random_prefill_gate(visual_positions, guided, rng)
+    for layer, dropped in random.items():
+        assert len(set(dropped)) == len(guided[layer])
+        assert sum(map(ranks.get, dropped)) == sum(map(ranks.get, guided[layer]))
+    assert any(set(rows) != set(guided[layer]) for layer, rows in random.items())
+
+
+def test_random_decode_preserves_tiles_pairs_and_fallback_and_reports_extra_steps():
+    reference = DecodeBudgets()
+    allowed = torch.ones((2, 5), dtype=torch.bool)
+    columns = torch.tensor([0, 1, 1, 2, 2])
+    chosen = torch.tensor([[True, False, True], [False, False, False]])
+    fallback = torch.tensor([False, True])
+    reference.select(2, allowed, columns, chosen, fallback)
+    replay = DecodeBudgets(Random(10), reference)
+    for _ in range(2):
+        kept, used_fallback = replay.select(2, allowed, columns, ~chosen, ~fallback)
+        assert used_fallback.equal(fallback)
+        assert kept[0, 0]
+        assert kept[0, 1:].sum() == 1
+        assert kept[1].all()
+        assert (kept[:, columns] | used_fallback[:, None]).sum().item() == 8
+    assert replay.tail_head_steps == 2
+    full, used_fallback = replay.select(3, allowed, columns, chosen, fallback)
+    assert full.all() and used_fallback.all()
+    assert replay.tail_head_steps == 4
+
+
+def test_phase_study_replays_budget_from_each_guided_variant(monkeypatch, tmp_path):
+    args = Namespace(
+        answer_protocol=study.VQAV2, model="test", demo=False, lam=.1, decode_lambda=.1,
+        sample_index=0, decode_tokens=16, vqa_accuracy=True, output=tmp_path / "study.json",
+        binary_mask_study=True, matched_random=True, random_seed=12, image_max_pixels=3136, max_tokens=128,
+    )
+    sample = {"id": "example", "benchmark": {"question_id": 1, "question_text": "Question?",
+                                           "reference_answers": ["yes"] * 10}}
+    seen = []
+
+    def collect(run, *_):
+        seen.append((run.token_gate, run.pipeline_decode_links))
+        result = {"answer": "yes", "generated_tokens": 2}
+        if run.token_gate:
+            gate = run.gate_replay or {0: [], 1: [1, 4]}
+            result.update(visual_positions=[1, 2, 3, 4], prefill_gate=gate,
+                          tv_guided_vv={"vv_pairs_bypassed": sum(sum(row) for row in gate.values())})
+        if run.pipeline_decode_links:
+            assert run.decode_budgets is not None
+            allowed = torch.ones(1, 2, dtype=torch.bool)
+            columns = torch.tensor([0, 1])
+            chosen = torch.tensor([[True, False]])
+            fall = torch.tensor([False])
+            run.decode_budgets.select(0, allowed, columns, chosen, fall)
+            result["decode_budgets"] = run.decode_budgets
+        return result
+
+    monkeypatch.setattr(study, "collect", collect)
+    monkeypatch.setattr(study, "_select_sample", lambda *_: None)
+    study._run_tv_vv_sweep(args, None, [sample])
+    assert seen == [(None, False), ("vv", False), (None, True), ("vv", True),
+                    ("vv", False), (None, True), ("vv", True)]
+    import json
+
+    report = json.loads(args.output.read_text())
+    assert report["summary"]["combined_binary_random"]["vqa_delta_vs_guided_pp"] == 0
+    assert report["summary"]["prefill_binary_random"]["vv_pairs_bypassed"] == 5
+    assert report["summary"]["combined_binary_random"]["random_decode_unmatched_head_steps"] == 0
+
+
+def test_fixed_length_timing_separates_first_token_and_decode(monkeypatch):
+    from binary_phase_controls import timed_generation
+
+    class FakeGeneration(torch.nn.Module):
+        def forward(self):
+            return None
+
+        def generate(self, input_ids, *, min_new_tokens, max_new_tokens, do_sample):
+            assert min_new_tokens == max_new_tokens == 3
+            assert not do_sample
+            for _ in range(max_new_tokens):
+                self()
+            return torch.cat((input_ids, torch.ones(1, max_new_tokens, dtype=torch.long)), dim=1)
+
+    class Inputs(dict):
+        @property
+        def input_ids(self):
+            return self["input_ids"]
+
+    times = iter([10, 12, 17])
+    monkeypatch.setattr("binary_phase_controls.perf_counter", lambda: next(times))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+    model = FakeGeneration()
+    output, timing = timed_generation(model, Inputs(input_ids=torch.arange(4).unsqueeze(0)), 3)
+    assert output.shape == (1, 7)
+    assert timing == {"first_token_seconds": 2, "decode_seconds": 5, "generation_seconds": 7}
+    assert not model._forward_pre_hooks

@@ -37,12 +37,16 @@ def visible_keys(mask, rows, length, heads):
 class BinaryTVPipeline:
     """Run staged BLASST and keep device-local masks for cached text positions."""
 
-    def __init__(self, visual, tile_size, *, gate_vv, guide_prefill=True, guide_decode=True):
+    def __init__(self, visual, tile_size, *, gate_vv, guide_prefill=True, guide_decode=True,
+                 all_candidates=False, audit_candidates=False):
         self.visual = visual.bool().cpu()
         self.tile_size = tile_size
         self.gate_vv = gate_vv
         self.guide_prefill = guide_prefill
         self.guide_decode = guide_decode
+        self.all_candidates = all_candidates
+        self.audit_candidates = audit_candidates
+        self.candidate_audit = {}
         self.visual_groups = [(start // tile_size, tile.nonzero().flatten() + start)
                               for start, tile in zip(range(0, len(visual), tile_size), self.visual.split(tile_size))
                               if tile.any()]
@@ -144,6 +148,9 @@ class BinaryTVPipeline:
             physical_kept[:, query_tile] |= tile_max(scores, self.tile_size).isfinite().any(1)
 
         counts = torch.zeros(6, dtype=torch.long, device=device)
+        if self.audit_candidates:
+            audit_counts = torch.zeros(4, dtype=torch.long, device=device)
+            lost_mass = q.new_zeros(())
         for start in range(0, rows, self.tile_size):
             local = is_text_query[start:start + self.tile_size].nonzero().flatten() + start
             for indices in local.split(32):
@@ -155,8 +162,25 @@ class BinaryTVPipeline:
                 fallback = ~usable.any(-1)
                 candidates = (usable.float() @ prev_links) > 0
                 candidates |= fallback.unsqueeze(-1)
+                if self.all_candidates:
+                    candidates.fill_(True)
                 tv_allowed = allowed & visual
                 scores.masked_fill_(~retained, -torch.inf)
+                if self.audit_candidates:
+                    shadow = scores.clone()
+                    compute_visual(shadow, qs, tv_allowed, torch.ones_like(candidates), bias)
+                    shadow_max = tile_max(shadow.masked_fill(~visual, -torch.inf), self.tile_size)[..., tile_ids]
+                    shadow_running = tile_max(shadow, self.tile_size).cummax(-1).values[..., tile_ids]
+                    shadow_keep = shadow_max.isfinite() & (shadow_max - shadow_running >= cutoff)
+                    excluded = ~candidates
+                    missing = tv_allowed.clone()
+                    for j, (_, cols) in enumerate(groups):
+                        missing[..., cols] &= excluded[..., j, None]
+                    audit_counts[0] += shadow_keep.sum()
+                    audit_counts[1] += (shadow_keep & excluded).sum()
+                    audit_counts[2] += (~fallback & ~candidates.any(-1) & tv_allowed.any(-1)).sum()
+                    audit_counts[3] += tv_allowed.any(-1).sum()
+                    lost_mass += shadow.softmax(-1).nan_to_num().masked_fill(~missing, 0).sum()
                 compute_visual(scores, qs, tv_allowed, candidates, bias)
                 visual_max = tile_max(scores.masked_fill(~visual, -torch.inf), self.tile_size)[..., tile_ids]
                 running = tile_max(scores, self.tile_size).cummax(-1).values[..., tile_ids]
@@ -201,4 +225,9 @@ class BinaryTVPipeline:
                 save_output(local, start // self.tile_size, scores.masked_fill(~keep[:, None, :], -torch.inf))
 
         self.counts.update({f"{phase}_{name}": amount for name, amount in zip(BINARY_METRICS, counts.tolist())})
+        if self.audit_candidates:
+            self.candidate_audit[layer] = dict(zip(
+                ("full_candidate_tv_keeps", "missed_tv_keeps", "empty_link_rows", "text_query_head_rows_with_vision"),
+                audit_counts.tolist(),
+            ), lost_attention_mass=float(lost_mass))
         return out.transpose(0, 1).unsqueeze(0).contiguous(), physical_kept
