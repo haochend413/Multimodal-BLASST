@@ -57,7 +57,7 @@ def resume(report, output, samples, start):
     saved = json.loads(output.read_text())
     expected = {key: value for key, value in report.items() if key != "cases"}
     if (any(saved.get(key) != value for key, value in expected.items())
-            or any(saved.get(key) != report.get(key) for key in MAX_POLICIES)):
+            or any(saved.get(key) != report.get(key) for key in (*MAX_POLICIES, "prefill_vv_start_layer"))):
         raise ValueError("checkpoint settings differ from this run")
     cases = saved["cases"]
     if len(cases) > len(samples) or any(
@@ -150,6 +150,7 @@ def merge(paths, output):
             raise ValueError(f"{path} is not a VQA shard report")
         expected_config = {key: report[key] for key in config_keys}
         for key in (*MAX_POLICIES, "benchmark", "variant_labels", "decode_visual_link_study", "token_top_k",
+                    "prefill_vv_start_layer",
                     "binary_tv_pipeline", "prefill_visual_query_study", "binary_mask_study",
                     "binary_tv_prefill_diagnostics", "prefill_vv_drop_sweep", "prefill_vv_drop_order",
                     "decode_tv_drop_sweep", "random_seed"):

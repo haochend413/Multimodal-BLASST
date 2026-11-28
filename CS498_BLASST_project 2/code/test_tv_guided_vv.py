@@ -2,6 +2,7 @@
 import math
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import blasst_attn as ba
@@ -108,11 +109,12 @@ def test_top_percent_selected_rows_still_use_blasst(monkeypatch):
     assert policy.layers[1]["vv_tiles_bypassed"] == 0
 
 
-def test_top_token_percent_gates_individual_rows_even_in_mixed_tiles(monkeypatch):
+@pytest.mark.parametrize("start_layer", [1, 2])
+def test_top_token_percent_gates_individual_rows_even_in_mixed_tiles(monkeypatch, start_layer):
     monkeypatch.setitem(ba.STATE, "collect_stats", False)
-    monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.1))
+    monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.9))
     visual = torch.tensor([False, *([True] * 128), False])
-    policy = TVGuidedVV(visual, 128, None, token_percent=2)
+    policy = TVGuidedVV(visual, 128, None, token_percent=20, start_layer=start_layer)
     monkeypatch.setitem(ba.STATE, "tv_guided_vv", policy)
     q = torch.ones(1, 1, len(visual), 1)
     k = torch.zeros_like(q)
@@ -123,18 +125,23 @@ def test_top_token_percent_gates_individual_rows_even_in_mixed_tiles(monkeypatch
         chunks[layer, q_start] = scores
 
     monkeypatch.setitem(ba.STATE, "observer", observe)
-    for layer in range(2):
+    for layer in range(start_layer + 1):
         out, _ = ba.blasst_attention_forward(SimpleNamespace(layer_idx=layer), q, k, q, None)
         assert out.isfinite().all()
-    warmup, gated = policy.layers
-    assert warmup["visual_query_tokens_selected"] == 128
-    assert gated["visual_query_tokens_selected"] == 3
-    assert gated["dropped_token_positions"] == list(range(1, 126))
-    assert gated["vv_pairs_bypassed"] == sum(range(1, 126))
-    assert chunks[1, 0][..., 1:126, 1:129].isneginf().all()
-    assert chunks[1, 0][..., 1:126, 0].isfinite().all()
-    assert chunks[1, 128][..., 0, 1:129].isfinite().all()
-    assert chunks[1, 128][..., 1, 1:129].isfinite().all()
+    for early in policy.layers[:start_layer]:
+        assert early["visual_query_tokens_selected"] == 128
+        assert early["vv_pairs_bypassed"] == 0
+        assert torch.equal(chunks[early["layer"], 0], chunks[0, 0])
+    gated = policy.layers[start_layer]
+    dropped = list(range(24, 126))
+    assert gated["vote_layer"] == start_layer - 1
+    assert gated["visual_query_tokens_selected"] == 26
+    assert gated["dropped_token_positions"] == dropped
+    assert gated["vv_pairs_bypassed"] == sum(dropped)
+    assert chunks[start_layer, 0][..., dropped, 1:129].isneginf().all()
+    assert chunks[start_layer, 0][..., dropped, 0].isfinite().all()
+    assert chunks[start_layer, 128][..., 0, 1:129].isfinite().all()
+    assert chunks[start_layer, 128][..., 1, 1:129].isfinite().all()
 
 
 def test_whole_visual_query_replays_vv_mask_and_keeps_visual_keys_readable(monkeypatch):

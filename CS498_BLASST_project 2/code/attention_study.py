@@ -259,6 +259,8 @@ def main() -> None:
                        help="gate causal V→V query tiles using the preceding layer's T→V keep fraction")
     tv_vv.add_argument("--tv-vv-top-percent", dest="tv_vv_token_percent", type=float, metavar="PERCENT",
                        help="select the top percentage of individual visual query tokens")
+    parser.add_argument("--prefill-vv-start-layer", type=int, metavar="INDEX",
+                        help="first zero-based layer to apply --tv-vv-top-percent (default: 1)")
     tv_vv.add_argument("--tv-vv-top-tile-percent", dest="tv_vv_top_percent", type=float, metavar="PERCENT",
                        help="select the top percentage of visual query tiles by previous-layer T→V votes")
     tv_vv.add_argument("--prefill-visual-query-study", action="store_true",
@@ -414,6 +416,11 @@ def main() -> None:
             parser.error(f"{flag} compares against causal BLASST with shared running maxima")
         args.vqa_accuracy = True
     has_top_k = args.tv_vv_token_percent is not None or args.tv_vv_top_percent is not None
+    if args.prefill_vv_start_layer is not None:
+        if args.prefill_vv_start_layer < 1:
+            parser.error("--prefill-vv-start-layer must be at least 1 to allow a preceding vote layer")
+        if args.tv_vv_token_percent is None or args.matched_region_study or args.gate_distribution:
+            parser.error("--prefill-vv-start-layer requires live --tv-vv-top-percent")
     args.tv_vv_top_accuracy = (args.vqa_accuracy and has_top_k
                                and not (args.matched_region_study or args.gate_distribution))
     if args.tv_vv_top_accuracy and (args.prefill_region_max or args.decode_region_max):
@@ -815,6 +822,9 @@ def _run_tv_vv_sweep(args, parser, samples):
     elif has_top_k:
         amount, unit = ((token_percent, "tokens") if token_percent is not None else (top_percent, "tile rows"))
         report["variant_labels"] = {"baseline": "Original BLASST", variants[1][0]: f"Top {amount:g}% visual {unit}"}
+        if (start_layer := getattr(args, "prefill_vv_start_layer", None)) is not None:
+            report["prefill_vv_start_layer"] = start_layer
+            report["variant_labels"][variants[1][0]] += f" from layer {start_layer}"
         if token_percent is not None:
             report["token_top_k"] = True
         for phase in ("prefill", "decode"):
@@ -1177,6 +1187,7 @@ def _attach_study(args, recorder):
         ba.STATE["tv_guided_vv"] = TVGuidedVV(recorder.visual, tile_size, args.tv_vv_threshold,
                                             replay=getattr(args, "gate_replay", None), top_percent=top_percent,
                                             token_percent=token_percent, token_gate=getattr(args, "token_gate", None),
+                                            start_layer=getattr(args, "prefill_vv_start_layer", None) or 1,
                                             token_drop_percent=getattr(args, "token_drop_percent", None),
                                             random_drop=getattr(args, "random_drop", False),
                                             drop_highest=getattr(args, "prefill_vv_drop_highest", False),
@@ -1246,6 +1257,9 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
     ba.STATE["binary_tv_pipeline"] = None
     ba.STATE["prefill_region_max"] = ba.STATE["decode_region_max"] = None
     if args.demo:
+        start_layer = getattr(args, "prefill_vv_start_layer", None)
+        if start_layer is not None and start_layer >= 3:
+            parser.error("--prefill-vv-start-layer is outside the three-layer demo")
         sweep = args.jl_sweep or args.jl_region_audit or args.tile_layer_study or args.score_distributions or args.tv_vv_sweep
         torch.manual_seed(98 + args.sample_index if sweep else 98)
         length = 640
@@ -1292,6 +1306,9 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
             parser.error(f"Prompt has {length} tokens, exceeds --max-tokens; reduce --frames or --image-max-pixels")
         model = _load_model(args.model)
         config = model.config.text_config
+        start_layer = getattr(args, "prefill_vv_start_layer", None)
+        if start_layer is not None and start_layer >= config.num_hidden_layers:
+            parser.error("--prefill-vv-start-layer is outside the language model")
         selected_layers = (set(range(config.num_hidden_layers))
                            if args.tile_layer_study and args.layers == "all" else _indices(args.layers))
         selected_heads = _indices(args.heads)
@@ -1363,6 +1380,8 @@ def _collect(args, parser, benchmark, sample_id, score_stream: BinaryIO | None) 
             metadata["tv_guided_vv"]["top_percent"] = policy.top_percent
         if policy.token_percent is not None:
             metadata["tv_guided_vv"]["top_token_percent"] = policy.token_percent
+            if getattr(args, "prefill_vv_start_layer", None) is not None:
+                metadata["tv_guided_vv"]["prefill_vv_start_layer"] = policy.first_gated_layer
         if policy.token_percent is not None or policy.token_gate is not None:
             counts = (*TOKEN_GATE_COUNTS, *VISUAL_QUERY_COUNTS) if policy.token_gate else TOKEN_GATE_COUNTS
             metadata["tv_guided_vv"].update({key: sum(layer[key] for layer in policy.layers)

@@ -17,12 +17,14 @@ class TVGuidedVV:
     """Own the votes for one prompt so each layer reads only its predecessor."""
 
     def __init__(self, visual, tile_size, threshold, *, replay=None, top_percent=None, token_percent=None,
-                 token_gate=None, token_drop_percent=None, random_drop=False, drop_seed="", drop_highest=False):
+                 token_gate=None, token_drop_percent=None, random_drop=False, drop_seed="", drop_highest=False,
+                 start_layer=1):
         self.visual = visual.cpu().bool()
         self.tile_size = tile_size
         self.threshold = threshold
         self.top_percent = top_percent
         self.token_percent = token_percent
+        self.first_gated_layer = start_layer
         self.token_gate = token_gate
         self.token_drop_percent = token_drop_percent
         self.random_drop = random_drop
@@ -123,7 +125,7 @@ class TVLayer:
                     self.token_drops[positions[:count]] = True
             elif previous is not None and policy.token_gate is not None:
                 self.token_drops = policy.visual & ~previous["token_had_vote"]
-            elif previous is not None:
+            elif previous is not None and layer >= policy.first_gated_layer:
                 quota = math.ceil(int(policy.visual.sum()) * policy.token_percent / 100)
                 ranked = sorted(policy.visual.nonzero().flatten().tolist(),
                                 key=lambda pos: (-previous["token_relevance"][pos], pos))
