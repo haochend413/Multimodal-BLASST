@@ -199,25 +199,31 @@ def test_counting_votes_leaves_the_baseline_unchanged(monkeypatch):
     assert policy.layers[1]["votes"][0]["eligible"] == 2
 
 
-def test_prefill_drop_sweep_matches_query_count_and_ranks_previous_tv(monkeypatch):
+@pytest.mark.parametrize("start_layer", [1, 2])
+def test_prefill_drop_sweep_matches_query_count_and_ranks_previous_tv(monkeypatch, start_layer):
     monkeypatch.setattr(ba, "TILE", 2)
     monkeypatch.setitem(ba.STATE, "collect_stats", False)
     monkeypatch.setitem(ba.STATE, "ln_lam", math.log(.1))
     visual = torch.tensor([False, True, True, False, True, True, False])
     q = torch.ones(1, 1, len(visual), 1)
     k = torch.tensor([1., 8., 0., 1., 8., 0., 1.]).view_as(q)
-    for percent, count in ((50, 2), (99.9, 3)):
+    for percent, count in ((50, 2), (80, 3), (99.9, 3)):
         random_masks = []
         for random_drop, drop_highest in ((False, False), (False, True), (True, False), (True, True)):
             policy = TVGuidedVV(visual, 2, None, token_gate="vv", token_drop_percent=percent,
-                               random_drop=random_drop, drop_seed="fixture", drop_highest=drop_highest)
+                               random_drop=random_drop, drop_seed="fixture", drop_highest=drop_highest,
+                               start_layer=start_layer)
             monkeypatch.setitem(ba.STATE, "tv_guided_vv", policy)
-            for layer in range(2):
+            for layer in range(start_layer + 2):
                 out, _ = ba.blasst_attention_forward(SimpleNamespace(layer_idx=layer), q, k, q, None, scaling=1.)
                 assert out.isfinite().all()
-            assert policy.layers[0]["dropped_token_positions"] == []
-            assert policy.layers[0]["visual_query_tokens_gateable"] == 0
-            gated = policy.layers[1]
+            for early in policy.layers[:start_layer]:
+                assert early["dropped_token_positions"] == []
+                assert early["vv_pairs_bypassed"] == 0
+                assert early["visual_query_tokens_gateable"] == 0
+            assert [row["visual_query_tokens_selected"] for row in policy.layers[start_layer:]] == [4 - count] * 2
+            gated = policy.layers[start_layer]
+            assert gated["vote_layer"] == start_layer - 1
             dropped = gated["dropped_token_positions"]
             assert len(dropped) == count
             assert visual[dropped].all()

@@ -151,7 +151,8 @@ def test_prefill_co_design_cli_sweeps_lambdas_and_supports_highest_drop(monkeypa
 
     def collect(run, *_):
         seen.append((run.lam, run.decode_lambda, run.token_drop_percent,
-                     run.random_drop, run.prefill_vv_drop_highest, run.prefill_tile_size))
+                     run.random_drop, run.prefill_vv_drop_highest, run.prefill_tile_size,
+                     run.prefill_vv_start_layer))
         return {"answer": "yes", "generated_tokens": 2, "tv_guided_vv": {
             "vv_pairs": 20, "vv_pairs_bypassed": int(20 * run.token_drop_percent / 100), "layers": [],
         }}
@@ -169,7 +170,7 @@ def test_prefill_co_design_cli_sweeps_lambdas_and_supports_highest_drop(monkeypa
     ])
     study.main()
     study.main()  # Completed child checkpoints are reusable by the sweep.
-    assert seen == [(lam, .1, drop, random, False, 256) for lam in (.05, .2)
+    assert seen == [(lam, .1, drop, random, False, 256, None) for lam in (.05, .2)
                     for drop, random in ((0, True), (5, False), (5, True), (80, False), (80, True))]
     report = json.loads(output.read_text())
     assert report["prefill_vv_drop_sweep"] == [5, 80]
@@ -190,12 +191,25 @@ def test_prefill_co_design_cli_sweeps_lambdas_and_supports_highest_drop(monkeypa
         "--prefill-vv-drop-sweep", "5,80", "--prefill-vv-drop-highest",
     ])
     study.main()
-    assert seen == [(.1, .1, drop, random, True, None)
+    assert seen == [(.1, .1, drop, random, True, None, None)
                     for drop, random in ((0, True), (5, False), (5, True), (80, False), (80, True))]
     highest = json.loads(reverse_output.read_text())
     assert highest["prefill_vv_drop_order"] == "highest"
     assert highest["tile_size"] == 128
     assert highest["variant_labels"]["prefill_drop_80"] == "Highest T→V frequency drop 80%"
+
+    seen.clear()
+    late_output = tmp_path / "late.json"
+    monkeypatch.setattr(sys, "argv", common + [
+        "--output", str(late_output), "--lambda", "0.9",
+        "--prefill-vv-drop-sweep", "80", "--prefill-vv-start-layer", "14",
+    ])
+    study.main()
+    assert seen == [(.9, .1, drop, random, False, None, 14)
+                    for drop, random in ((0, True), (80, False), (80, True))]
+    late = json.loads(late_output.read_text())
+    assert late["prefill_vv_start_layer"] == 14
+    assert set(late["summary"]) == {"baseline", "prefill_drop_80", "prefill_drop_80_random"}
 
 
 def test_decode_drop_sweep_pairs_each_rate_and_reports_realized_budget(monkeypatch, tmp_path):

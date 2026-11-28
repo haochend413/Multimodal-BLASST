@@ -260,7 +260,7 @@ def main() -> None:
     tv_vv.add_argument("--tv-vv-top-percent", dest="tv_vv_token_percent", type=float, metavar="PERCENT",
                        help="select the top percentage of individual visual query tokens")
     parser.add_argument("--prefill-vv-start-layer", type=int, metavar="INDEX",
-                        help="first zero-based layer to apply --tv-vv-top-percent (default: 1)")
+                        help="first zero-based layer for the visual query quota (default: 1)")
     tv_vv.add_argument("--tv-vv-top-tile-percent", dest="tv_vv_top_percent", type=float, metavar="PERCENT",
                        help="select the top percentage of visual query tiles by previous-layer T→V votes")
     tv_vv.add_argument("--prefill-visual-query-study", action="store_true",
@@ -419,8 +419,9 @@ def main() -> None:
     if args.prefill_vv_start_layer is not None:
         if args.prefill_vv_start_layer < 1:
             parser.error("--prefill-vv-start-layer must be at least 1 to allow a preceding vote layer")
-        if args.tv_vv_token_percent is None or args.matched_region_study or args.gate_distribution:
-            parser.error("--prefill-vv-start-layer requires live --tv-vv-top-percent")
+        if ((args.tv_vv_token_percent is None and not drop_study)
+                or args.matched_region_study or args.gate_distribution):
+            parser.error("--prefill-vv-start-layer requires live --tv-vv-top-percent or --prefill-vv-drop-sweep")
     args.tv_vv_top_accuracy = (args.vqa_accuracy and has_top_k
                                and not (args.matched_region_study or args.gate_distribution))
     if args.tv_vv_top_accuracy and (args.prefill_region_max or args.decode_region_max):
@@ -694,6 +695,8 @@ def _collect_prefill_lambda_sweep(args, parser, samples):
     )
     if len(args.prefill_vv_drop_sweep) == 1:
         report["prefill_vv_drop_percent"] = args.prefill_vv_drop_sweep[0]
+    if (start_layer := getattr(args, "prefill_vv_start_layer", None)) is not None:
+        report["prefill_vv_start_layer"] = start_layer
     for lam in args.prefill_vv_lambda_sweep:
         output = args.output.with_name(f"{args.output.stem}-lambda{lam}{args.output.suffix}")
         print(f"Running prefill lambda {lam:g} (decode {args.decode_lambda:g})", flush=True)
@@ -759,6 +762,9 @@ def _run_tv_vv_sweep(args, parser, samples):
                   blasst_lambda=args.lam, decode_lambda=args.decode_lambda, pairs_requested=len(samples),
                   answer_metric="normalized full-response exact match to any supplied reference",
                   variants=dict(variants), cases=[])
+    start_layer = getattr(args, "prefill_vv_start_layer", None)
+    if start_layer is not None:
+        report["prefill_vv_start_layer"] = start_layer
     region_phases = [phase for phase in ("prefill", "decode") if getattr(args, f"{phase}_region_max", False)]
     for phase in region_phases:
         report[f"{phase}_max_policies"] = {
@@ -822,13 +828,13 @@ def _run_tv_vv_sweep(args, parser, samples):
     elif has_top_k:
         amount, unit = ((token_percent, "tokens") if token_percent is not None else (top_percent, "tile rows"))
         report["variant_labels"] = {"baseline": "Original BLASST", variants[1][0]: f"Top {amount:g}% visual {unit}"}
-        if (start_layer := getattr(args, "prefill_vv_start_layer", None)) is not None:
-            report["prefill_vv_start_layer"] = start_layer
-            report["variant_labels"][variants[1][0]] += f" from layer {start_layer}"
         if token_percent is not None:
             report["token_top_k"] = True
         for phase in ("prefill", "decode"):
             report[f"{phase}_max_policies"] = dict.fromkeys(dict(variants), "shared")
+    if start_layer is not None:
+        for name, _ in variants[1:]:
+            report["variant_labels"][name] += f" from layer {start_layer}"
     measured_phases = ("prefill", "decode") if has_top_k or decode_links or binary or query_study or mask_study or drop_rates else region_phases
     if args.vqa_accuracy:
         report["answer_metric"] = protocol.metric

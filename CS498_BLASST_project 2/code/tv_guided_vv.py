@@ -96,6 +96,7 @@ class TVLayer:
         self.policy = policy
         self.layer = layer
         self.previous = previous
+        self.can_gate_tokens = previous is not None and layer >= policy.first_gated_layer
         self.kept = torch.zeros(len(policy.text_rows), dtype=torch.long, device=device)
         self.eligible = torch.zeros_like(self.kept)
         self.bypassed = {}
@@ -114,7 +115,7 @@ class TVLayer:
                 if any(pos < 0 or pos >= len(policy.visual) for pos in positions) or not policy.visual[positions].all():
                     raise ValueError(f"Token gate replay contains a nonvisual position at layer {layer}")
                 self.token_drops[positions] = True
-            elif previous is not None and policy.token_drop_percent is not None:
+            elif self.can_gate_tokens and policy.token_drop_percent is not None:
                 positions = policy.visual.nonzero().flatten().tolist()
                 count = int(len(positions) * Decimal(str(policy.token_drop_percent)) / 100)
                 if count:
@@ -123,9 +124,9 @@ class TVLayer:
                     if not policy.random_drop:
                         positions.sort(key=previous["token_relevance"].__getitem__, reverse=policy.drop_highest)
                     self.token_drops[positions[:count]] = True
-            elif previous is not None and policy.token_gate is not None:
+            elif self.can_gate_tokens and policy.token_gate is not None:
                 self.token_drops = policy.visual & ~previous["token_had_vote"]
-            elif previous is not None and layer >= policy.first_gated_layer:
+            elif self.can_gate_tokens:
                 quota = math.ceil(int(policy.visual.sum()) * policy.token_percent / 100)
                 ranked = sorted(policy.visual.nonzero().flatten().tolist(),
                                 key=lambda pos: (-previous["token_relevance"][pos], pos))
@@ -205,7 +206,7 @@ class TVLayer:
                     int(policy.text_prefix[self.token_drops].sum()) if policy.token_gate == "whole" else 0
                 )
             if policy.token_drop_percent is not None:
-                record["visual_query_tokens_gateable"] = visual_tokens if self.previous is not None else 0
+                record["visual_query_tokens_gateable"] = visual_tokens if self.can_gate_tokens else 0
             if policy.random_drop:
                 policy.previous = record
             elif policy.token_gate is not None and policy.token_drop_percent is None:

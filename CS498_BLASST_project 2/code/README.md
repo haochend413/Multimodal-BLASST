@@ -243,23 +243,28 @@ a zero attention contribution. The report counts causal V→V token pairs
 bypassed before QK. The separate `--gate-lambda` applies to the pass that
 records the gate in a matched study or gate distribution audit.
 
-To test the gate in the second half of Qwen2.5-VL-7B, keep the top 20% of
-visual query tokens starting at layer 14 (zero-based). Layers 0–13 use
-ordinary BLASST, and layer 13 supplies the votes for the first gated layer.
-Both arms use prefill λ = 0.9 and decode λ = 0.1.
+#### Late-layer V→V gate with a random control
+
+Compare standard BLASST, the top 20% of visual query rows by T→V vote
+frequency, and the same number of randomly selected visual query rows on
+the same questions. The two gates bypass V→V QK for the other rows
+starting at layer 14 (zero-based). Layers 0–13 use ordinary BLASST, and
+layer 13 supplies the first T→V votes. All three arms use prefill λ = 0.9
+and decode λ = 0.1.
 
 ```bash
 python code/attention_study.py \
   --manifest "$HOME/blasst-results/vqav2-random-val-1000-seed20261124.json" \
   --sample-count 50 --decode-tokens 16 --lambda 0.9 --decode-lambda 0.1 \
-  --tv-vv-top-percent 20 --prefill-vv-start-layer 14 --vqa-accuracy \
-  --vqa-shards 1 --vqa-shard-index 0 \
-  --output "$HOME/blasst-results/vqav2-50-prefill-top20-from-layer14-lambda0.9.json"
+  --prefill-vv-drop-sweep 80 --prefill-vv-start-layer 14 \
+  --random-seed 7 --vqa-shards 1 --vqa-shard-index 0 \
+  --output "$HOME/blasst-results/vqav2-50-prefill-top20-vs-random-from-layer14-lambda0.9.json"
 ```
 
-The report gives paired VQA accuracy and the V→V QK bypass rate across all
-prefill layers. For an earlier-start comparison on the same questions, use
-`--prefill-vv-start-layer 1` and a separate output path.
+The report gives each arm's VQA accuracy and V→V QK bypass rate across
+all prefill layers. Compare `prefill_drop_80` and `prefill_drop_80_random`
+in `.summary`. The random arm's `vqa_delta_vs_guided_pp` is its accuracy
+minus the guided accuracy in percentage points.
 
 #### VizWiz-LF long-answer benchmark
 
