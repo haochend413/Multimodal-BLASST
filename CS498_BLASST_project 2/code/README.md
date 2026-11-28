@@ -257,9 +257,13 @@ python code/attention_study.py \
   --manifest "$HOME/blasst-results/vqav2-random-val-1000-seed20261124.json" \
   --sample-count 50 --decode-tokens 16 --lambda 0.9 --decode-lambda 0.1 \
   --prefill-vv-drop-sweep 80 --prefill-vv-start-layer 14 \
-  --random-seed 7 --vqa-shards 1 --vqa-shard-index 0 \
-  --output "$HOME/blasst-results/vqav2-50-prefill-top20-vs-random-from-layer14-lambda0.9.json"
+  --random-seed 7 --vqa-shards 1 --vqa-shard-index 0
 ```
+
+The runner prints the generated report path in `$HOME/blasst-results`. Its
+name includes the drop rate, first gated layer, seed, lambdas, and a short
+fingerprint of the settings and manifest. Repeating the command uses the
+same checkpoint. Set `--output` to choose a specific path.
 
 The report gives each arm's VQA accuracy and V→V QK bypass rate across
 all prefill layers. Compare `prefill_drop_80` and `prefill_drop_80_random`

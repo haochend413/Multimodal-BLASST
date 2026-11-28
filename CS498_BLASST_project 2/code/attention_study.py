@@ -227,9 +227,43 @@ def _select_sample(args, parser, sample):
         parser.error(f"Missing input media: {path}")
 
 
+def _default_output(args, manifest_sha256):
+    settings = {name: value for name, value in vars(args).items()
+                if name not in ("output", "answer_protocol", "jl_probe")}
+    settings["manifest_sha256"] = manifest_sha256
+    encoded = json.dumps(settings, sort_keys=True, default=str).encode()
+    fingerprint = hashlib.sha256(encoded).hexdigest()[:12]
+
+    source = args.benchmark if args.manifest else "demo" if args.demo else "media"
+    parts = [source, f"n{args.sample_count}", f"from{args.sample_index}"]
+    if args.prefill_vv_drop_sweep:
+        rates = "_".join(f"{rate:g}" for rate in args.prefill_vv_drop_sweep)
+        parts.extend(("prefill-vv", f"drop{rates[:24]}", f"layer{args.prefill_vv_start_layer or 1}",
+                      f"seed{args.random_seed}"))
+    elif args.tv_vv_token_percent is not None:
+        parts.extend(("prefill-vv", f"keep{args.tv_vv_token_percent:g}",
+                      f"layer{args.prefill_vv_start_layer or 1}"))
+    elif args.decode_tv_drop_sweep:
+        rates = "_".join(f"{rate:g}" for rate in args.decode_tv_drop_sweep)
+        parts.extend(("decode-tv", f"drop{rates[:24]}", f"seed{args.random_seed}"))
+    else:
+        parts.append("attention")
+    if args.prefill_vv_lambda_sweep:
+        parts.append("lambda-sweep")
+    else:
+        parts.append(f"lambda{args.lam:g}")
+    decode_lambda = args.lam if args.decode_lambda is None else args.decode_lambda
+    parts.append(f"decode{decode_lambda:g}")
+    if args.vqa_shard:
+        parts.append(f"shard{args.vqa_shard['index']}-of-{args.vqa_shard['count']}")
+    stem = "-".join(parts)[:160]
+    return Path.home() / "blasst-results" / f"{stem}-{fingerprint}.json"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path,
+                        help="JSON report path (default: generated from settings under ~/blasst-results)")
     parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--video", type=Path)
     parser.add_argument("--image", type=Path)
@@ -529,10 +563,12 @@ def main() -> None:
         parser.error("use a single sample when exporting raw scores")
     benchmark = None
     sample_id = None
+    manifest_sha256 = None
     if args.manifest is not None:
         if args.demo or args.video is not None or args.image is not None:
             parser.error("--manifest cannot be combined with --demo, --video or --image")
         manifest_bytes = args.manifest.read_bytes()
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
         manifest = json.loads(manifest_bytes)
         if manifest.get("schema") != "blasst-benchmark-manifest-v1":
             parser.error("unsupported benchmark manifest schema")
@@ -543,10 +579,10 @@ def main() -> None:
             if args.sample_count < 1:
                 parser.error("No questions remain after the selected offset and calibration range")
         if args.matched_region_study:
-            args.budget_manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+            args.budget_manifest_sha = manifest_sha256
         if args.vqa_shards is not None:
             args.vqa_shard = dict(index=args.vqa_shard_index, count=args.vqa_shards, manifest_questions=len(samples),
-                                  manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest())
+                                  manifest_sha256=manifest_sha256)
             selected = len(samples) - args.sample_index if requested_sample_count is None else requested_sample_count
             if args.sample_index or selected != len(samples):
                 args.vqa_shard.update(selection_start=args.sample_index, selection_count=selected)
@@ -603,6 +639,9 @@ def main() -> None:
                 parser.error(f"Missing input media: {media_path}")
         if not torch.cuda.is_available():
             parser.error("Real model collection requires CUDA; use --demo for CPU verification")
+    if args.output is None:
+        args.output = _default_output(args, manifest_sha256)
+        print(f"Output: {args.output}", flush=True)
     if args.matched_region_study or args.gate_distribution:
         from matched_region_study import run
 

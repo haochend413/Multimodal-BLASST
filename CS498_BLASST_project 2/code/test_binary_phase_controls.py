@@ -199,17 +199,26 @@ def test_prefill_co_design_cli_sweeps_lambdas_and_supports_highest_drop(monkeypa
     assert highest["variant_labels"]["prefill_drop_80"] == "Highest T→V frequency drop 80%"
 
     seen.clear()
-    late_output = tmp_path / "late.json"
-    monkeypatch.setattr(sys, "argv", common + [
-        "--output", str(late_output), "--lambda", "0.9",
+    monkeypatch.setenv("HOME", str(tmp_path))
+    late_args = common + [
+        "--lambda", "0.9",
         "--prefill-vv-drop-sweep", "80", "--prefill-vv-start-layer", "14",
-    ])
+    ]
+    monkeypatch.setattr(sys, "argv", late_args + ["--random-seed", "7"])
+    study.main()
     study.main()
     assert seen == [(.9, .1, drop, random, False, None, 14)
                     for drop, random in ((0, True), (80, False), (80, True))]
+    output_dir = tmp_path / "blasst-results"
+    (late_output,) = output_dir.glob(
+        "vqav2-n1-from0-prefill-vv-drop80-layer14-seed7-lambda0.9-decode0.1-shard0-of-1-*.json"
+    )
     late = json.loads(late_output.read_text())
     assert late["prefill_vv_start_layer"] == 14
     assert set(late["summary"]) == {"baseline", "prefill_drop_80", "prefill_drop_80_random"}
+    monkeypatch.setattr(sys, "argv", late_args + ["--random-seed", "8"])
+    study.main()
+    assert len(list(output_dir.glob("*.json"))) == 2
 
 
 def test_decode_drop_sweep_pairs_each_rate_and_reports_realized_budget(monkeypatch, tmp_path):
