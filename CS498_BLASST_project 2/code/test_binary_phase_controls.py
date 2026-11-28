@@ -112,7 +112,7 @@ def test_fixed_length_timing_separates_first_token_and_decode(monkeypatch):
     assert not model._forward_pre_hooks
 
 
-def test_prefill_drop_sweep_pairs_each_rate_and_scores_baseline(monkeypatch, tmp_path):
+def test_prefill_drop_sweep_pairs_each_rate_and_scores_baseline(monkeypatch, tmp_path, capsys):
     args = Namespace(
         answer_protocol=study.VQAV2, model="test", demo=False, lam=.1, decode_lambda=.1,
         sample_index=0, decode_tokens=16, vqa_accuracy=True, output=tmp_path / "sweep.json",
@@ -126,7 +126,8 @@ def test_prefill_drop_sweep_pairs_each_rate_and_scores_baseline(monkeypatch, tmp
         assert run.token_gate == "vv" and not run.decode_visual_links
         seen.append((run.token_drop_percent, run.random_drop))
         dropped = int(run.token_drop_percent * 4 / 100)
-        return {"answer": "yes", "generated_tokens": 2, "tv_guided_vv": {
+        answer = "no" if run.token_drop_percent == 99.9 and run.random_drop else "yes"
+        return {"answer": answer, "generated_tokens": 2, "tv_guided_vv": {
             "visual_query_tokens_gateable": 4, "visual_query_tokens": 8, "visual_query_tokens_selected": 8 - dropped,
             "vv_pairs": 20, "vv_pairs_bypassed": dropped * 2, "layers": [],
         }}
@@ -140,6 +141,10 @@ def test_prefill_drop_sweep_pairs_each_rate_and_scores_baseline(monkeypatch, tmp
     assert report["summary"]["prefill_drop_99.9"]["prefill_visual_row_drop_pct"] == 75
     assert report["summary"]["prefill_drop_99.9_random"]["prefill_vv_qk_bypass_pct"] == 30
     assert report["summary"]["prefill_drop_25_random"]["vqa_delta_vs_guided_pp"] == 0
+    terminal = capsys.readouterr().out
+    assert "vs baseline: wins 0 / losses 0 / ties 1" in terminal
+    assert "vs baseline: wins 0 / losses 1 / ties 0" in terminal
+    assert "vs prefill_drop_99.9: wins 0 / losses 1 / ties 0" in terminal
 
 
 def test_prefill_co_design_cli_sweeps_lambdas_and_supports_highest_drop(monkeypatch, tmp_path):

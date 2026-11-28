@@ -130,6 +130,21 @@ def summarize(totals, *, reference="baseline", protocol=VQAV2):
     return summary
 
 
+def print_score_summary(summary, *, protocol=VQAV2):
+    for name, result in summary.items():
+        scored = result["answers_scored"]
+        print(f"{name}: {protocol.format_score(result)} on {scored} questions")
+        if name == "baseline":
+            continue
+        comparisons = [("baseline", "")]
+        if f"{protocol.prefix}_better_than_guided" in result:
+            comparisons.append((name.removesuffix("_random"), "_than_guided"))
+        for reference, suffix in comparisons:
+            wins = result[f"{protocol.prefix}_better{suffix}"]
+            losses = result[f"{protocol.prefix}_worse{suffix}"]
+            print(f"  vs {reference}: wins {wins} / losses {losses} / ties {scored - wins - losses}")
+
+
 def save_predictions(output, predictions):
     for name, rows in predictions.items():
         write_json(output.with_name(f"{output.stem}-{name}-predictions.json"), rows)
@@ -205,8 +220,7 @@ def main():
     except (ValueError, KeyError, OSError) as error:
         parser.error(str(error))
     protocol = PROTOCOLS_BY_METRIC[report["answer_metric"]]
-    for policy, values in report["summary"].items():
-        print(f"{policy}: {protocol.format_score(values)} on {values['answers_scored']} questions")
+    print_score_summary(report["summary"], protocol=protocol)
     print(f"Wrote merged VQA report to {args.output}")
 
 

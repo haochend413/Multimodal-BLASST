@@ -1060,8 +1060,7 @@ def _run_tv_vv_sweep(args, parser, samples):
             vqa_shards.save_predictions(args.output, predictions)
         if "summary" not in report:
             report["summary"] = vqa_shards.summarize(totals, protocol=protocol)
-        for name, result in report["summary"].items():
-            print(f"{name}: {protocol.format_score(result)} on {result['answers_scored']} questions")
+        vqa_shards.print_score_summary(report["summary"], protocol=protocol)
     return report
 
 
